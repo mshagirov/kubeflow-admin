@@ -1,0 +1,37 @@
+# SITE TEMPLATE: deliberately NOT applied by base. Applying selects the app for
+# egress isolation. Replace CIDRs/ports with actual post/pre-DNAT behavior of your
+# CNI: API Service + endpoints, DNS, issuer discovery/token/JWKS endpoints and any
+# redirects. Also allow the OIDC provider's actual HTTPS dependencies. Plain
+# NetworkPolicy cannot express DNS hostnames. Prove this in staging before use.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kubeflow-admin-egress
+  namespace: kubeflow-admin
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kubeflow-admin
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock:
+            cidr: REPLACE_WITH_API_DESTINATION_CIDR
+      ports:
+        - {protocol: TCP, port: 6443}
+        - {protocol: TCP, port: 443}
+    - to:
+        - ipBlock:
+            cidr: REPLACE_WITH_OIDC_DESTINATION_CIDR
+      ports:
+        - {protocol: TCP, port: 443}

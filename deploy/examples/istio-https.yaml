@@ -1,0 +1,41 @@
+# SITE TEMPLATE, not included in base. Configure every REPLACE value.
+# Check the installed Istio API versions, selector, TLS and auth policies first.
+# This does NOT provision DNS or a certificate. The referenced Secret must already
+# hold a trusted certificate/key for the exact dedicated hostname in the ingress
+# gateway's namespace (normally istio-system), under Istio's credential rules.
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: kubeflow-admin
+  namespace: kubeflow-admin
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 443
+        name: https-kubeflow-admin
+        protocol: HTTPS
+      hosts: [REPLACE_WITH_DEDICATED_ADMIN_HOST]
+      tls:
+        mode: SIMPLE
+        credentialName: REPLACE_WITH_EXISTING_ADMIN_TLS_SECRET
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: kubeflow-admin
+  namespace: kubeflow-admin
+spec:
+  hosts: [REPLACE_WITH_DEDICATED_ADMIN_HOST]
+  gateways: [kubeflow-admin]
+  http:
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: kubeflow-admin.kubeflow-admin.svc.cluster.local
+            port:
+              number: 80
+      timeout: 30s

@@ -1,0 +1,33 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflow-admin-read
+rules:
+  - apiGroups: [kubeflow.org]
+    resources: [profiles, notebooks]
+    verbs: [get, list]
+  - apiGroups: ['']
+    resources: [namespaces, persistentvolumes, persistentvolumeclaims, pods, events, resourcequotas, limitranges, nodes]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [get, list]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeflow-admin-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeflow-admin-read
+subjects:
+  - kind: ServiceAccount
+    name: kubeflow-admin
+    namespace: kubeflow-admin

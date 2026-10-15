@@ -1,0 +1,39 @@
+# Configure real site values before applying. Unknown fields are rejected.
+server:
+  listen: ':8080'
+  publicURL: https://kubeflow-admin.example.invalid
+auth:
+  issuerURL: https://identity.example.invalid/dex
+  clientID: kubeflow-admin
+  clientSecretFile: /var/run/app-secrets/oidc-client-secret
+  adminGroups: [REPLACE_WITH_EXACT_ADMIN_GROUP]
+  adminSubjects: []
+  scopes: [openid, profile, email, groups]
+  sessionMinutes: 15
+kubernetes:
+  kubeconfig: ''
+  requestTimeoutSeconds: 15
+policy:
+  protectedNamespaces: [default, kube-system, kube-public, kube-node-lease, kubeflow, kubeflow-system, istio-system, auth, oauth2-proxy, cert-manager, gpu-operator, knative-serving, knative-eventing, kubeflow-admin]
+  allowedNamespaces: []
+storage:
+  # User-volume choices; database placement is configured independently.
+  # Replace with your approved classes and review access modes, isolation,
+  # reclaim policy and driver support before enabling writes.
+  allowedStorageClasses: [REPLACE_WITH_APPROVED_CLASS]
+  nfsTemplates: []
+  csiTemplates: []
+notebooks:
+  controllerContractConfirmed: false
+  gpuPresets: []
+  allowedImages: []
+  protectedMountPaths: [/home/jovyan, /home/jovyan/work]
+database:
+  # For verified BeeGFS, set journalMode: delete and
+  # allowUnverifiedFilesystem: true only after the storage operator confirms
+  # global file locking and remote fsync; see docs/database.md.
+  path: /var/lib/kubeflow-admin/admin.db
+features:
+  writesEnabled: false
+  staticStorage: false
+  pvcExpansion: false

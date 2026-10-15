@@ -1,0 +1,27 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflow-admin-writes
+rules:
+  - apiGroups: [kubeflow.org]
+    resources: [profiles]
+    verbs: [create, patch]
+  - apiGroups: [kubeflow.org]
+    resources: [notebooks]
+    verbs: [patch]
+  - apiGroups: ['']
+    resources: [persistentvolumeclaims]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeflow-admin-writes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeflow-admin-writes
+subjects:
+  - kind: ServiceAccount
+    name: kubeflow-admin
+    namespace: kubeflow-admin

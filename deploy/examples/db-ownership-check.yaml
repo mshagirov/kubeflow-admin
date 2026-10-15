@@ -1,0 +1,127 @@
+# SITE TEMPLATE — not included in base. One-time ownership test for a network
+# filesystem class (BeeGFS): proves that exclusive locks propagate between
+# nodes, which the application cannot verify itself.
+#
+# 1. Find the generated ConfigMap name:
+#      kubectl -n kubeflow-admin get configmap -l app.kubernetes.io/name=kubeflow-admin
+# 2. Replace every REPLACE_ value: ConfigMap name, image digest, database
+#    StorageClass, two DIFFERENT node hostnames, and a hold duration.
+# 3. Apply, then wait for the holder to report "database check passed; holding
+#    exclusive ownership". The holder pod keeps the lock for the hold duration:
+#      kubectl -n kubeflow-admin logs pod/kubeflow-admin-db-check-holder
+#      kubectl -n kubeflow-admin wait --for=condition=Ready pod/kubeflow-admin-db-check-holder
+#    The attempt pod MUST exit with code 3 (already owned):
+#      kubectl -n kubeflow-admin get pod kubeflow-admin-db-check-attempt \
+#        -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}{"\n"}'
+# 4. If the attempt pod instead logs "database check passed" and exits 0,
+#    global locking is NOT effective on this StorageClass: do not use it for
+#    the application database (or use the node-local PV overlay).
+# 5. Cleanup (the disposable claim is never used by the application):
+#      kubectl -n kubeflow-admin delete pod kubeflow-admin-db-check-holder \
+#        kubeflow-admin-db-check-attempt --ignore-not-found
+#      kubectl -n kubeflow-admin delete pvc kubeflow-admin-db-check --ignore-not-found
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kubeflow-admin-db-check
+  namespace: kubeflow-admin
+spec:
+  # Disposable claim only, so both pods can mount it from different nodes.
+  # The application claim itself stays ReadWriteOnce.
+  accessModes: [ReadWriteMany]
+  storageClassName: REPLACE_WITH_DB_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kubeflow-admin-db-check-holder
+  namespace: kubeflow-admin
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: REPLACE_WITH_NODE_A
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: check
+      image: muratshagirov/kubeflow-admin@sha256:REPLACE_WITH_PINNED_INDEX_DIGEST
+      imagePullPolicy: IfNotPresent
+      args: ['-config', '/etc/kubeflow-admin/config.yaml', '-check-db', '-hold', '20m']
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: config
+          mountPath: /etc/kubeflow-admin
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/kubeflow-admin
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: config
+      configMap:
+        name: REPLACE_WITH_GENERATED_CONFIGMAP
+    - name: data
+      persistentVolumeClaim:
+        claimName: kubeflow-admin-db-check
+    - name: tmp
+      emptyDir:
+        sizeLimit: 16Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kubeflow-admin-db-check-attempt
+  namespace: kubeflow-admin
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: REPLACE_WITH_NODE_B
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: check
+      image: muratshagirov/kubeflow-admin@sha256:REPLACE_WITH_PINNED_INDEX_DIGEST
+      imagePullPolicy: IfNotPresent
+      args: ['-config', '/etc/kubeflow-admin/config.yaml', '-check-db']
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: config
+          mountPath: /etc/kubeflow-admin
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/kubeflow-admin
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: config
+      configMap:
+        name: REPLACE_WITH_GENERATED_CONFIGMAP
+    - name: data
+      persistentVolumeClaim:
+        claimName: kubeflow-admin-db-check
+    - name: tmp
+      emptyDir:
+        sizeLimit: 16Mi

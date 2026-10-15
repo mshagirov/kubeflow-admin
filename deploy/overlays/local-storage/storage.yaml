@@ -1,0 +1,34 @@
+# Configure the exact node hostname label and prepare this dedicated directory
+# locally BEFORE apply. This is only for the app DB, not a user PV template.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: kubeflow-admin-local
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kubeflow-admin-local-db
+spec:
+  capacity:
+    storage: 5Gi
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: kubeflow-admin-local
+  claimRef:
+    namespace: kubeflow-admin
+    name: kubeflow-admin-data
+  local:
+    path: /var/lib/kubeflow-admin-db
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [REPLACE_WITH_PREPARED_NODE_HOSTNAME_LABEL]

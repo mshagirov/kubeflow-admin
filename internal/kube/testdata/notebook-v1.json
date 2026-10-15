@@ -1,0 +1,14 @@
+{
+ "apiVersion":"kubeflow.org/v1","kind":"Notebook",
+ "metadata":{"name":"research","namespace":"alice","uid":"notebook-1","resourceVersion":"10","labels":{"user-label":"retain"},"annotations":{"user.example/note":"retain"}},
+ "spec":{"futureNotebookField":{"retain":true},"template":{"metadata":{"labels":{"template-label":"retain"}},"spec":{
+  "serviceAccountName":"default-editor","securityContext":{"fsGroup":1000},"imagePullSecrets":[{"name":"private-pull"}],
+  "containers":[
+   {"name":"research","image":"approved:v1","command":["start"],"args":["--retain"],"env":[{"name":"SENSITIVE_FIXTURE","value":"DO_NOT_PERSIST_LITERAL"}],"futureContainerField":{"retain":true},"resources":{"requests":{"cpu":"1","memory":"1Gi"},"limits":{"cpu":"2","memory":"2Gi"}},"volumeMounts":[{"name":"home","mountPath":"/home/jovyan"},{"name":"scratch","mountPath":"/scratch","futureMountField":"retain"}],"readinessProbe":{"httpGet":{"path":"/ready","port":8888}},"securityContext":{"runAsUser":1000}},
+   {"name":"sidecar","image":"sidecar:fixed","resources":{"requests":{"cpu":"100m"}},"volumeMounts":[{"name":"scratch","mountPath":"/data"}]}
+  ],
+  "initContainers":[{"name":"init","image":"init:fixed","volumeMounts":[{"name":"scratch","mountPath":"/init-data"}]}],
+  "volumes":[{"name":"home","persistentVolumeClaim":{"claimName":"home"}},{"name":"scratch","persistentVolumeClaim":{"claimName":"scratch"},"futureVolumeField":"retain"},{"name":"unknown-volume","emptyDir":{},"futureVolumeField":"retain"}],
+  "nodeSelector":{"independent.example/pool":"research"},"tolerations":[{"key":"independent","operator":"Exists","effect":"NoSchedule"}],"futurePodField":{"retain":true}
+ }}}
+}

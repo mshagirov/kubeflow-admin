@@ -1,0 +1,15 @@
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+# Never include local configuration, credentials, databases, discovery, or builds.
+**/*.db
+**/*.db-*
+**/*.sqlite*
+**/*.pem
+**/*.key
+**/.env*
+**/secrets/

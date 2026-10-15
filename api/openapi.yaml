@@ -1,0 +1,404 @@
+openapi: 3.0.3
+info:
+  title: Kubeflow Admin implemented API
+  version: 1.0.0
+  description: >-
+    Same-origin browser API; no bearer-token or auth bypass mode. Obtain an OIDC
+    browser session, then GET /api/v1/me for the CSRF value. Every unsafe request
+    needs the configured HTTPS Origin (or same-origin Referer) and X-CSRF-Token.
+    POST requests accept a single strict JSON object up to 64 KiB. Plan previews
+    require enabled writes and server dry-run privileges; no cluster mutation is
+    committed until an actor-bound unexpired plan is submitted. No arbitrary
+    Kubernetes manifests, proxy, deletion or operation replay endpoints exist.
+    This describes the implemented subset, not all routes from design plans.
+servers:
+  - url: /
+security:
+  - browserSession: []
+paths:
+  /login:
+    $ref: '#/paths/~1auth~1login'
+  /callback:
+    $ref: '#/paths/~1auth~1callback'
+  /healthz:
+    get:
+      security: []
+      summary: Process liveness
+      responses:
+        '200': {$ref: '#/components/responses/Health'}
+  /readyz:
+    get:
+      security: []
+      summary: Database and required API discovery readiness (not full RBAC)
+      responses:
+        '200': {$ref: '#/components/responses/Health'}
+        '503': {$ref: '#/components/responses/Error'}
+  /auth/login:
+    get:
+      security: []
+      summary: Start single-use OIDC authorization-code/PKCE login
+      responses:
+        '302': {description: Redirect to provider; sets browser binding cookie}
+        '503': {description: 'Safe authentication failure, possibly plain text'}
+  /auth/callback:
+    get:
+      security: []
+      summary: Validate OIDC response and create authorized short-lived session
+      parameters:
+        - {name: code, in: query, schema: {type: string}}
+        - {name: state, in: query, schema: {type: string}}
+        - {name: error, in: query, schema: {type: string}}
+      responses:
+        '302': {description: Redirect to console; sets secure host-only session cookie}
+        '400': {description: Invalid callback; safe plain-text authentication error}
+        '403': {description: Identity not authorized}
+        '503': {description: Identity provider or session store unavailable}
+  /logout:
+    post:
+      summary: Revoke local session (does not terminate upstream SSO)
+      parameters:
+        - {$ref: '#/components/parameters/CSRF'}
+        - {$ref: '#/components/parameters/Origin'}
+      responses:
+        '303': {description: Session cleared; redirect to login}
+        '401': {description: Session required}
+        '403': {description: Same-origin/CSRF check failed}
+  /api/v1/me:
+    get:
+      summary: Current administrator identity and CSRF token
+      responses:
+        '200':
+          description: Identity (not a capability envelope)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Identity'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/inventory:
+    get: &inventory
+      summary: Timestamped projected resource inventory
+      parameters:
+        - {$ref: '#/components/parameters/Namespace'}
+        - {$ref: '#/components/parameters/Profile'}
+      responses:
+        '200': {$ref: '#/components/responses/Inventory'}
+        '503': {$ref: '#/components/responses/Error'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/overview:
+    get:
+      <<: *inventory
+      summary: Timestamped inventory (not precomputed counts)
+  /api/v1/profiles:
+    get:
+      <<: *inventory
+      summary: Profile projections
+  /api/v1/namespaces:
+    get:
+      <<: *inventory
+      summary: Namespace projections
+  /api/v1/pvs:
+    get:
+      <<: *inventory
+      summary: PV projections (no backend path/handle or filesystem usage)
+  /api/v1/pvcs:
+    get:
+      <<: *inventory
+      summary: PVC projections
+  /api/v1/storage-classes:
+    get:
+      <<: *inventory
+      summary: StorageClass projections including approval hint
+  /api/v1/notebooks:
+    get:
+      <<: *inventory
+      summary: Notebook desired/observed projections
+  /api/v1/pods:
+    get:
+      <<: *inventory
+      summary: Pod status projections (no env/logs)
+  /api/v1/events:
+    get:
+      <<: *inventory
+      summary: Event reason/object projections (no raw event message)
+  /api/v1/quotas:
+    get:
+      <<: *inventory
+      summary: ResourceQuota projections
+  /api/v1/plans:
+    post:
+      summary: Prepare typed action, validate dependencies and server dry-run
+      parameters:
+        - {$ref: '#/components/parameters/CSRF'}
+        - {$ref: '#/components/parameters/Origin'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Action'}
+      responses:
+        '201':
+          description: Server-owned plan; five-minute TTL, bound to actor
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Plan'}
+        '400': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+        '415': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/operations:
+    get:
+      summary: Recent operations (bounded server-side list, no pagination contract)
+      responses:
+        '200':
+          description: Operations
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Operation'}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      summary: Submit the server-stored plan without accepting an edited patch
+      parameters:
+        - {$ref: '#/components/parameters/CSRF'}
+        - {$ref: '#/components/parameters/Origin'}
+        - name: Idempotency-Key
+          in: header
+          description: May instead be sent in JSON; both must match if supplied
+          schema: {type: string, minLength: 16, maxLength: 128}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [planID]
+              properties:
+                planID: {type: string, minLength: 1, maxLength: 256}
+                idempotencyKey: {type: string, minLength: 16, maxLength: 128}
+      responses:
+        '202':
+          description: Queued operation, or same existing idempotent operation
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Operation'}
+        '400': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '415': {$ref: '#/components/responses/Error'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/operations/{id}:
+    get:
+      summary: Poll durable operation
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: Operation
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Operation'}
+        '404': {$ref: '#/components/responses/Error'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/audit:
+    get:
+      summary: Recent audit records (bounded server-side list, not full archive)
+      responses:
+        '200':
+          description: Audit records
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Audit'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    browserSession:
+      type: apiKey
+      in: cookie
+      name: __Host-kfa-session
+      description: Opaque Secure/HttpOnly/SameSite=Lax cookie, at most 15 minutes
+  parameters:
+    CSRF:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      schema: {type: string}
+      description: CSRF from current authenticated identity; forms may use csrf
+    Origin:
+      name: Origin
+      in: header
+      schema: {type: string}
+      description: Must match configured HTTPS origin; same-origin Referer alternative
+    Namespace:
+      name: namespace
+      in: query
+      schema: {type: string}
+      description: Exact namespace filter (cluster-scoped objects generally omitted)
+    Profile:
+      name: profile
+      in: query
+      schema: {type: string}
+      description: Namespace filter alias, used only if namespace is absent
+  responses:
+    Health:
+      description: Minimal health status
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [status]
+            properties:
+              status: {type: string, enum: [ok, ready]}
+    Inventory:
+      description: Projected inventory, no full Kubernetes manifests
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Inventory'}
+    Error:
+      description: >-
+        Safe failure. Handler errors are JSON with error string; authentication,
+        CSRF and standard HTTP routing failures may be plain text. No stable
+        machine error code, field-error or retryability contract is implemented.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error: {type: string}
+        text/plain:
+          schema: {type: string}
+  schemas:
+    Identity:
+      type: object
+      required: [issuer, subject, email, groups, authenticatedAt, expiresAt]
+      properties:
+        issuer: {type: string}
+        subject: {type: string}
+        email: {type: string}
+        groups: {type: array, nullable: true, items: {type: string}}
+        authenticatedAt: {type: string, format: date-time}
+        expiresAt: {type: string, format: date-time}
+        csrf: {type: string}
+    Action:
+      type: object
+      additionalProperties: false
+      required: [kind, name]
+      description: Only fields relevant to the selected kind are permitted by policy
+      properties:
+        kind:
+          type: string
+          enum: [profile.create, profile.quota.change, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, notebook.start, notebook.stop, notebook.edit]
+        namespace: {type: string}
+        name: {type: string}
+        reason: {type: string}
+        owner: {type: string, description: 'Exact Kubeflow owner identity, not an LDAP account creation'}
+        quota: {type: object, additionalProperties: {type: string}}
+        storageClass: {type: string}
+        size: {type: string, description: Kubernetes storage quantity}
+        accessMode: {type: string}
+        pvName: {type: string}
+        template: {type: string, description: Approved server-configured static template name}
+        subdirectory: {type: string}
+        container: {type: string}
+        image: {type: string}
+        cpuRequest: {type: string}
+        cpuLimit: {type: string}
+        memoryRequest: {type: string}
+        memoryLimit: {type: string}
+        gpuPreset: {type: string}
+        gpuCount: {type: integer, format: int64, minimum: 0, nullable: true}
+        mounts:
+          type: array
+          nullable: true
+          description: Omitted/null leaves mounts unchanged; empty array requests removal
+          items: {$ref: '#/components/schemas/Mount'}
+        restart: {type: boolean}
+    Mount:
+      type: object
+      additionalProperties: false
+      required: [name, claim, path]
+      properties:
+        name: {type: string}
+        claim: {type: string, description: PVC in the same namespace}
+        path: {type: string}
+        readOnly: {type: boolean}
+    Prepared:
+      type: object
+      required: [action, targetUID, resourceVersion, summary, warnings]
+      properties:
+        action: {$ref: '#/components/schemas/Action'}
+        targetUID: {type: string}
+        resourceVersion: {type: string}
+        summary: {type: string}
+        warnings: {type: array, nullable: true, items: {type: string}}
+        changes: {type: array, items: {$ref: '#/components/schemas/Change'}}
+        data:
+          type: object
+          additionalProperties: true
+          description: Opaque safe dependency evidence; never resubmit or edit this
+    Change:
+      type: object
+      required: [field, before, after]
+      properties:
+        field: {type: string}
+        before: {type: string, description: Redacted allowed-field value before the change}
+        after: {type: string, description: Redacted allowed-field value after the change}
+    Plan:
+      type: object
+      required: [id, actor, createdAt, expiresAt, prepared]
+      properties:
+        id: {type: string}
+        actor: {type: string, description: Issuer and subject identity key}
+        createdAt: {type: string, format: date-time}
+        expiresAt: {type: string, format: date-time}
+        prepared: {$ref: '#/components/schemas/Prepared'}
+    Operation:
+      type: object
+      required: [id, planID, actor, target, action, state, step, createdAt, updatedAt]
+      properties:
+        id: {type: string}
+        planID: {type: string}
+        actor: {type: string}
+        target: {type: string}
+        action: {type: string}
+        state: {type: string, description: Durable state; incomplete recovery becomes needs-review}
+        step: {type: string}
+        error: {type: string}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    Audit:
+      type: object
+      required: [id, actor, action, target, result, time]
+      properties:
+        id: {type: string}
+        actor: {type: string}
+        action: {type: string}
+        target: {type: string}
+        result: {type: string}
+        operationID: {type: string}
+        reason: {type: string}
+        changes: {type: array, items: {$ref: '#/components/schemas/Change'}}
+        time: {type: string, format: date-time}
+    Resource:
+      type: object
+      required: [kind, name]
+      properties:
+        kind: {type: string}
+        namespace: {type: string}
+        name: {type: string}
+        uid: {type: string}
+        owner: {type: string}
+        state: {type: string}
+        desired: {type: string}
+        details: {type: object, additionalProperties: {type: string}}
+    Inventory:
+      type: object
+      required: [observedAt, resources]
+      properties:
+        observedAt: {type: string, format: date-time}
+        resources: {type: array, items: {$ref: '#/components/schemas/Resource'}}
+        warnings: {type: array, items: {type: string}}

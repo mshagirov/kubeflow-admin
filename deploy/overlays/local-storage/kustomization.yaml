@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - storage.yaml
+patches:
+  - target:
+      kind: PersistentVolumeClaim
+      name: kubeflow-admin-data
+    patch: |-
+      - op: replace
+        path: /spec/storageClassName
+        value: kubeflow-admin-local
+      - op: add
+        path: /spec/volumeName
+        value: kubeflow-admin-local-db

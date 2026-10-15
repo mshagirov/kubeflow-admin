@@ -1,0 +1,55 @@
+name: local-verification
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.27.2'
+          cache: true
+      - name: Local tests, vet and build (no cluster)
+        run: make test vet build
+      - name: Install offline manifest tooling
+        run: |
+          go install sigs.k8s.io/kustomize/kustomize/v5@v5.7.1
+          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+          python3 -m venv /tmp/manifest-tools
+          /tmp/manifest-tools/bin/pip install --require-hashes -r scripts/requirements.txt
+      - name: Render and check security invariants
+        run: |
+          PATH="/tmp/manifest-tools/bin:$PATH" make manifests
+          for overlay in deploy/base deploy/overlays/*; do
+            kustomize build "$overlay" | kubeconform -strict -summary -kubernetes-version 1.32.0
+          done
+          /tmp/manifest-tools/bin/openapi-spec-validator api/openapi.yaml
+          bash -n scripts/discover.sh
+      - name: Compile multi-architecture runtime images (no push)
+        run: |
+          docker buildx create --driver docker-container --use
+          docker buildx build --platform linux/amd64,linux/arm64 --output type=oci,dest=/tmp/kubeflow-admin.oci .
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.27.2'
+          cache: true
+      - name: Scan reachable Go vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...
+      - name: Scan source dependencies, secrets and manifest misconfiguration
+        run: docker run --rm -v "$PWD:/src:ro" aquasec/trivy:0.67.2@sha256:e2b22eac59c02003d8749f5b8d9bd073b62e30fefaef5b7c8371204e0a4b0c08 fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 /src

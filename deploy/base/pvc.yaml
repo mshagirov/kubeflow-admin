@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kubeflow-admin-data
+spec:
+  accessModes: [ReadWriteOnce]
+  volumeMode: Filesystem
+  # Omit storageClassName to use the cluster default (including configured BeeGFS).
+  # BeeGFS requires global file locks and remote fsync; see docs/database.md.
+  resources:
+    requests:
+      storage: 5Gi
