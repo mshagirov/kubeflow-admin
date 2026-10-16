@@ -40,14 +40,27 @@ storage:
       volumeAttributes: {}
 ```
 
-Never insert an already Bound PV's handle to assign it to another user. Existing PV inventory is checked for duplicates. A CSI import only registers existing storage; it does not allocate a disk, prepare backend directories or enforce a directory capacity quota. The same is true of declared NFS capacity. Profile identity is not filesystem UID/GID; test the notebook image's actual permissions.
+Never insert an already Bound PV's handle to assign it to another user. A CSI import only registers existing storage; it does not allocate a disk, prepare backend directories or enforce a directory capacity quota. The same is true of declared NFS capacity. Profile identity is not filesystem UID/GID; test the notebook image's actual permissions.
+
+## Static backend uniqueness cannot be guaranteed by this app alone
+
+Before reserving or creating a static PV the application lists PVs and rejects a backend that an existing PV already represents (same NFS `server`+overlapping path, or same CSI `driver`+`volumeHandle`). That check is **not atomic**: the list and the subsequent create/patch are separate API calls, so two independent application processes sharing one cluster (for example two database instances, or an administrator using `kubectl`) can both observe "absent" and then both register the same backend. The application's single-writer lock only covers **its own** database, not the cluster.
+
+Consequently:
+
+- Run exactly one application writer against the cluster (one replica/`Recreate`, one database). This is already required for the database, and it is also required here.
+- Treat static backend registration as a site-owned resource: enforce cluster-wide uniqueness with admission policy and a registration/coordination process covering **every** privileged writer (other tooling, operators, GitOps and direct `kubectl`), not only this app.
+- Do not rely on a `ValidatingAdmissionPolicy` CEL expression to make this atomic. CEL in an admission rule cannot list and check the other PVs in the cluster; such a policy cannot close the race and would give false assurance. A real guard needs a component that can observe cluster state (for example a controller/reconciler, or an external registration system) and serialize the writers.
+- Document the intended backend (`server`/path or driver/handle), owner and approval, and reconcile manually if two PVs are ever found pointing at the same backend; the app cannot repair that.
 
 ## Dynamic PVCs and expansion
 
 For a new dynamically provisioned workspace, choose an approved class explicitly; do not create a PV yourself. Review Delete versus Retain behavior before choosing a class. No app workflow deletes a PVC/PV.
 
+With `volumeBindingMode: WaitForFirstConsumer`, the operation reports creation success while the claim is still `Pending`: the PVC cannot bind until a consuming Pod is scheduled, and the app never creates that Pod. This is creation success only, not provisioning verification — no volume exists yet, and real binding, capacity and backend behavior remain unproven until the operator schedules a workload and observes the bound claim.
+
 Expansion is upward-only and feature/RBAC gated. A class advertising `allowVolumeExpansion` does not prove its backend procedure works. The initial adapter requires a bound CSI volume whose driver matches the class; plain NFS PV expansion is unsupported. A successful spec patch is not proof that filesystem resize completed. Do not use expansion to change a class, access mode or volume mode.
 
 ## App database is separate
 
-SQLite WAL requires local/block storage. The base uses DELETE journaling and supports configured BeeGFS on the default class; see [database requirements](database.md).
+SQLite WAL requires local/block storage and is the base default. The base PVC omits `storageClassName`, so it uses the cluster's **default** StorageClass with **WAL**; verified BeeGFS instead requires `journalMode: delete` plus `allowUnverifiedFilesystem: true`. See [database requirements](database.md).

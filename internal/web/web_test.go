@@ -8,13 +8,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"kubeflow-admin/internal/auth"
 	"kubeflow-admin/internal/config"
 	"kubeflow-admin/internal/kube"
 	"kubeflow-admin/internal/model"
+	"kubeflow-admin/internal/operations"
 	"kubeflow-admin/internal/store"
 )
 
@@ -88,7 +91,7 @@ func TestRouteProtectionAndPublicRoutes(t *testing.T) {
 			t.Errorf("%s: got %d", path, got)
 		}
 	}
-	for _, path := range []string{"/healthz", "/readyz", "/static/app.js", "/static/logic.js", "/static/style.css", "/login", "/callback"} {
+	for _, path := range []string{"/healthz", "/readyz", "/static/app.js", "/static/logic.js", "/static/style.css", "/login", "/callback", "/auth/signed-out", "/signed-out"} {
 		if got := request(h, "GET", path, "").Code; got != 200 && got != 204 {
 			t.Errorf("public %s: %d", path, got)
 		}
@@ -237,6 +240,7 @@ func TestStructuredBackendErrors(t *testing.T) {
 		{"locked", store.ErrConflict, 409, "operation_conflict", "Check Operations", false},
 		{"missing", fmt.Errorf("lookup: %w", store.ErrNotFound), 404, "not_found", "not found", false},
 		{"quota", errors.New("Notebook resource total exceeds namespace quota"), 422, "validation_failed", "exceeds namespace quota", false},
+		{"operator-managed quota", errors.New("changing an unsupported quota key is unsupported"), 422, "validation_failed", "unsupported quota key", false},
 		{"gpu", errors.New("approved GPU preset required"), 422, "validation_failed", "approved GPU preset required", false},
 		{"mount", errors.New("protected workspace mount cannot be removed"), 422, "validation_failed", "cannot be removed", false},
 		{"storage", errors.New("template class/access mismatch"), 422, "validation_failed", "template class/access mismatch", false},
@@ -246,6 +250,8 @@ func TestStructuredBackendErrors(t *testing.T) {
 		{"timeout", context.DeadlineExceeded, 503, "request_timeout", "same idempotency key", true},
 		{"queue", errors.New("operation queue full; retry later"), 503, "queue_full", "queue is full", true},
 		{"expired", errors.New("plan expired; preview again"), 409, "plan_expired", "expired", false},
+		{"session invalid", auth.ErrSessionInvalid, 403, "reauthentication_required", "Sign in again", false},
+		{"session invalid wrapped", fmt.Errorf("authorize: %w", auth.ErrSessionInvalid), 403, "reauthentication_required", "Sign in again", false},
 		{"sql", errors.New("SQLITE_BUSY: SELECT secret FROM records /private/internal.db"), 503, "service_unavailable", "sanitized diagnostics", true},
 		{"unexpected", errors.New("unexpected internal error secret-value"), 503, "service_unavailable", "sanitized diagnostics", true},
 		{"token appended", errors.New("protected namespace Bearer secret-value"), 503, "service_unavailable", "sanitized diagnostics", true},
@@ -408,5 +414,123 @@ func TestExactOwnerIdentityAndSafeServerChanges(t *testing.T) {
 	js := request(handler(s), "GET", "/static/app.js", "").Body.String()
 	if !strings.Contains(js, "plan.prepared.changes.map") || strings.Contains(js, "innerHTML") || strings.Contains(js, "plan.prepared.data") {
 		t.Fatal("unsafe or missing change preview")
+	}
+}
+
+type planBackend struct{}
+
+func (planBackend) Prepare(context.Context, model.Action) (model.Prepared, error) {
+	return model.Prepared{}, nil
+}
+func (planBackend) Execute(context.Context, model.Prepared, func(string) error) error { return nil }
+
+// End-to-end regression: the real Manager returns auth.ErrSessionInvalid
+// unchanged and the web layer must map it by error identity, not message text.
+func TestRealManagerSessionInvalidIsMappedByErrorIdentity(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	cfg := config.Config{
+		Features: config.Features{WritesEnabled: true},
+		Auth:     config.Auth{IssuerURL: "https://issuer.example", SessionMinutes: 15, AdminGroups: []string{"admins"}},
+	}
+	m, err := operations.New(context.Background(), cfg, st, planBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	s := &server{cfg: cfg, ops: m, ping: st.Ping, identity: func(context.Context) (model.Identity, bool) {
+		// A syntactically invalid session key fails ValidateSession before any
+		// store lookup, exercising the real worker authorization boundary.
+		return model.Identity{Issuer: "https://issuer.example", Subject: "alice", SessionID: "not-a-session-key"}, true
+	}}
+	w := request(handler(s), "POST", "/api/v1/plans", `{"kind":"profile.create","name":"team"}`)
+	var response struct {
+		Error apiError `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != 403 || response.Error.Code != "reauthentication_required" || !strings.Contains(response.Error.Message, "Sign in again") {
+		t.Fatalf("got %d %+v", w.Code, response)
+	}
+}
+
+func TestSignedOutPageIsPublicStaticAndDoesNotAutoLogin(t *testing.T) {
+	s, _, _ := fixture()
+	h := handler(s)
+	for _, path := range []string{"/auth/signed-out", "/signed-out"} {
+		w := request(h, "GET", path, "")
+		if w.Code != 200 {
+			t.Fatalf("%s: %d", path, w.Code)
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, `href="/auth/login"`) {
+			t.Fatalf("%s: missing explicit sign-in link", path)
+		}
+		for _, forbidden := range []string{`http-equiv="refresh"`, "<script", "location.href", "window.location"} {
+			if strings.Contains(body, forbidden) {
+				t.Fatalf("%s: auto-login construct %q", path, forbidden)
+			}
+		}
+		if w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+			t.Fatalf("%s: insecure headers %v", path, w.Header())
+		}
+	}
+}
+
+// The template must receive an explicit projection of config, never the whole
+// struct, so sensitive fields cannot leak by accident.
+func TestPageViewExposesOnlySafeConfigProjection(t *testing.T) {
+	s, _, _ := fixture()
+	s.cfg = config.Config{
+		Server:     config.Server{PublicURL: "https://private-public-url.example", Listen: "127.0.0.1:9999"},
+		Auth:       config.Auth{IssuerURL: "https://private-issuer.example", ClientID: "private-client", ClientSecretFile: "/run/private/secret", AdminGroups: []string{"private-admins"}},
+		Kubernetes: config.Kubernetes{Kubeconfig: "/private/kubeconfig"},
+		Database:   config.Database{Path: "/private/internal.db"},
+		Features:   config.Features{WritesEnabled: true, StaticStorage: true, PVCExpansion: true},
+		Notebooks: config.Notebooks{
+			ControllerContractConfirmed: true,
+			AllowedImages:               []string{"registry.example/allowed-image:1"},
+			ProtectedMountPaths:         []string{"/private/protected-mount"},
+			GPUPresets:                  []config.GPUPreset{{Name: "private-a100", ResourceKey: "nvidia.com/private-gpu", NodeSelector: map[string]string{"private": "selector"}, RuntimeClassName: "private-runtime"}},
+		},
+		Storage: config.Storage{
+			AllowedStorageClasses: []string{"allowed-class"},
+			NFSTemplates:          []config.NFSTemplate{{Name: "allowed-nfs", Server: "private-nfs-server", BasePath: "/private/nfs", StorageClass: "allowed-class"}},
+			CSITemplates:          []config.CSITemplate{{Name: "allowed-csi", Driver: "private-driver", VolumeHandle: "private-handle", StorageClass: "allowed-class"}},
+		},
+	}
+	s.identity = func(context.Context) (model.Identity, bool) {
+		return model.Identity{Subject: "admin@example.org", CSRF: "csrf-token"}, true
+	}
+	h := handler(s)
+	for path, wants := range map[string][]string{
+		"/storage":   {"allowed-class", "allowed-nfs", "allowed-csi"},
+		"/profiles":  {"nvidia.com/private-gpu"},
+		"/notebooks": {"private-a100", "registry.example/allowed-image:1"},
+	} {
+		w := request(h, "GET", path, "")
+		if w.Code != 200 {
+			t.Fatalf("%s: %d", path, w.Code)
+		}
+		body := w.Body.String()
+		for _, want := range wants {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s missing %q", path, want)
+			}
+		}
+		for _, secret := range []string{
+			"private-public-url.example", "127.0.0.1:9999", "private-issuer.example", "private-client",
+			"/run/private/secret", "private-admins", "/private/kubeconfig", "/private/internal.db",
+			"/private/protected-mount", "private-selector", "private-runtime", "private-nfs-server",
+			"/private/nfs", "private-driver", "private-handle",
+		} {
+			if strings.Contains(body, secret) {
+				t.Errorf("%s leaked %q", path, secret)
+			}
+		}
 	}
 }

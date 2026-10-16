@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -23,6 +24,7 @@ import (
 	"golang.org/x/oauth2"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,6 +33,7 @@ import (
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"kubeflow-admin/internal/auth"
 	"kubeflow-admin/internal/config"
 	"kubeflow-admin/internal/kube"
@@ -111,6 +114,17 @@ func TestAuthenticatedApplicationWorkflow(t *testing.T) {
 	typed := fake.NewSimpleClientset(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "pilot", UID: "namespace-uid", Annotations: map[string]string{"owner": "researcher@example.org"}, OwnerReferences: ref("Profile", "pilot", "profile-uid")}, Status: corev1.NamespaceStatus{Phase: corev1.NamespaceActive}}, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "lab", Namespace: "pilot", UID: "sts-uid", Generation: 1, OwnerReferences: ref("Notebook", "lab", "notebook-uid")}, Spec: appsv1.StatefulSetSpec{Replicas: &replicas}, Status: appsv1.StatefulSetStatus{ObservedGeneration: 1}})
 	typed.Discovery().(*fakediscovery.FakeDiscovery).Resources = []*metav1.APIResourceList{{GroupVersion: "kubeflow.org/v1", APIResources: []metav1.APIResource{{Name: "profiles", Kind: "Profile"}, {Name: "notebooks", Kind: "Notebook", Namespaced: true}}}}
 	dynamic := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{kube.Profiles: "ProfileList", kube.Notebooks: "NotebookList"}, profile, notebook)
+	dynamic.PrependReactor("get", "notebooks", func(action ktesting.Action) (bool, runtime.Object, error) {
+		name := action.(ktesting.GetAction).GetName()
+		switch name {
+		case "access-denied":
+			return true, nil, apierrors.NewForbidden(kube.Notebooks.GroupResource(), name, errors.New("DO_NOT_EXPOSE_ADMISSION_DETAILS"))
+		case "internal-error":
+			return true, nil, errors.New("DO_NOT_EXPOSE_INTERNAL_DETAILS")
+		default:
+			return false, nil, nil
+		}
+	})
 	k := &kube.Service{Config: cfg, Typed: typed, Dynamic: dynamic, PollInterval: time.Millisecond}
 	m, err := operations.New(ctx, cfg, s, k)
 	if err != nil {
@@ -185,6 +199,42 @@ func TestAuthenticatedApplicationWorkflow(t *testing.T) {
 	if page.StatusCode != 200 {
 		t.Fatal("page", page.StatusCode)
 	}
+	// Exercise the real authentication -> web -> manager -> adapter boundary;
+	// injecting errors directly into web-only fakes cannot catch manager masking.
+	for _, test := range []struct {
+		name      string
+		action    model.Action
+		status    int
+		code      string
+		retryable bool
+	}{
+		{"protected namespace", model.Action{Kind: "notebook.stop", Namespace: "kubeflow", Name: "lab"}, 422, "validation_failed", false},
+		{"missing Profile", model.Action{Kind: "notebook.stop", Namespace: "missing-profile", Name: "lab"}, 404, "resource_not_found", false},
+		{"unapproved image", model.Action{Kind: "notebook.edit", Namespace: "pilot", Name: "lab", Container: "lab", Image: "unapproved.example/image:v1"}, 422, "validation_failed", false},
+		{"existing Profile", model.Action{Kind: "profile.create", Name: "pilot", Owner: "researcher@example.org"}, 409, "stale_plan", false},
+		{"RBAC denied", model.Action{Kind: "notebook.stop", Namespace: "pilot", Name: "access-denied"}, 503, "cluster_access_denied", false},
+		{"unknown backend error", model.Action{Kind: "notebook.stop", Namespace: "pilot", Name: "internal-error"}, 503, "service_unavailable", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := request("POST", "/api/v1/plans", test.action, identity.CSRF)
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var envelope struct {
+				Error struct {
+					Code      string `json:"code"`
+					Retryable bool   `json:"retryable"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(body, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != test.status || envelope.Error.Code != test.code || envelope.Error.Retryable != test.retryable || bytes.Contains(body, []byte("DO_NOT_EXPOSE")) {
+				t.Fatalf("got HTTP %d %s; want status=%d code=%s retryable=%v", response.StatusCode, body, test.status, test.code, test.retryable)
+			}
+		})
+	}
 	bad := request("POST", "/api/v1/plans", model.Action{Kind: "notebook.stop", Namespace: "pilot", Name: "lab"}, "")
 	if bad.StatusCode != 403 {
 		t.Fatal("missing CSRF accepted", bad.StatusCode)
@@ -216,6 +266,15 @@ func TestAuthenticatedApplicationWorkflow(t *testing.T) {
 	logout := request("POST", "/auth/logout", map[string]string{}, identity.CSRF)
 	if logout.StatusCode != 303 {
 		t.Fatal("logout", logout.StatusCode)
+	}
+	if logout.Header.Get("Location") != "/auth/signed-out" {
+		t.Fatal("logout must not restart OIDC", logout.Header.Get("Location"))
+	}
+	for _, path := range []string{"/auth/signed-out", "/signed-out"} {
+		signedOut := request("GET", path, nil, "")
+		if signedOut.StatusCode != 200 || signedOut.Header.Get("Location") != "" {
+			t.Fatal("signed-out landing must be public and must not redirect", path, signedOut.StatusCode)
+		}
 	}
 	if response = request("GET", "/api/v1/me", nil, ""); response.StatusCode != 401 {
 		t.Fatal("logout failed", response.StatusCode)

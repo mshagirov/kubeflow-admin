@@ -120,7 +120,7 @@ func TestStartupNeverReplaysIncompleteOperations(t *testing.T) {
 	}
 	defer s.Close()
 	ctx := context.Background()
-	p := model.Plan{ID: "old", Actor: "issuer|admin"}
+	p := model.Plan{ID: "old", Actor: "issuer|admin", Prepared: model.Prepared{Action: model.Action{Kind: "notebook.stop", Namespace: "a", Name: "b"}}}
 	op := model.Operation{ID: "old-op", Actor: p.Actor, PlanID: p.ID, Target: "notebook:a/b", State: "queued", Step: "queued"}
 	if _, _, e = s.CreateOperation(ctx, op, p, "old-idempotency-key"); e != nil {
 		t.Fatal(e)

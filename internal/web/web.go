@@ -25,6 +25,79 @@ import (
 //go:embed assets/*
 var assets embed.FS
 
+// pageView is the explicit, minimal configuration projection rendered by the
+// embedded console template. config.Config must never be passed to the template
+// directly: it also carries database paths, secret file names, kubeconfig
+// locations and CSI/NFS backend handles the console has no need to see.
+type pageView struct {
+	Identity pageIdentity
+	Config   pageConfig
+}
+type pageIdentity struct {
+	Email   string
+	Subject string
+	CSRF    string
+}
+type pageConfig struct {
+	Features  pageFeatures
+	Notebooks pageNotebooks
+	Storage   pageStorage
+}
+type pageFeatures struct {
+	WritesEnabled bool
+	StaticStorage bool
+	PVCExpansion  bool
+}
+type pageNotebooks struct {
+	ControllerContractConfirmed bool
+	GPUPresets                  []pageGPUPreset
+	AllowedImages               []string
+}
+type pageGPUPreset struct {
+	Name        string
+	ResourceKey string
+}
+type pageStorage struct {
+	AllowedStorageClasses []string
+	NFSTemplates          []pageTemplate
+	CSITemplates          []pageTemplate
+}
+type pageTemplate struct {
+	Name         string
+	StorageClass string
+}
+
+// buildPageView copies only the configuration the template consumes: feature
+// switches, GPU preset names and resource keys, allowed images, and approved
+// storage class/template names.
+func buildPageView(identity model.Identity, cfg config.Config) pageView {
+	v := pageView{
+		Identity: pageIdentity{Email: identity.Email, Subject: identity.Subject, CSRF: identity.CSRF},
+		Config: pageConfig{
+			Features: pageFeatures{
+				WritesEnabled: cfg.Features.WritesEnabled,
+				StaticStorage: cfg.Features.StaticStorage,
+				PVCExpansion:  cfg.Features.PVCExpansion,
+			},
+			Notebooks: pageNotebooks{
+				ControllerContractConfirmed: cfg.Notebooks.ControllerContractConfirmed,
+				AllowedImages:               cfg.Notebooks.AllowedImages,
+			},
+			Storage: pageStorage{AllowedStorageClasses: cfg.Storage.AllowedStorageClasses},
+		},
+	}
+	for _, p := range cfg.Notebooks.GPUPresets {
+		v.Config.Notebooks.GPUPresets = append(v.Config.Notebooks.GPUPresets, pageGPUPreset{Name: p.Name, ResourceKey: p.ResourceKey})
+	}
+	for _, t := range cfg.Storage.NFSTemplates {
+		v.Config.Storage.NFSTemplates = append(v.Config.Storage.NFSTemplates, pageTemplate{Name: t.Name, StorageClass: t.StorageClass})
+	}
+	for _, t := range cfg.Storage.CSITemplates {
+		v.Config.Storage.CSITemplates = append(v.Config.Storage.CSITemplates, pageTemplate{Name: t.Name, StorageClass: t.StorageClass})
+	}
+	return v
+}
+
 type inventoryService interface {
 	Inventory(context.Context) (model.Inventory, error)
 	Check(context.Context) error
@@ -102,10 +175,7 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 				return
 			}
 			var page bytes.Buffer
-			if err := tmpl.Execute(&page, struct {
-				Identity model.Identity
-				Config   config.Config
-			}{identity, s.cfg}); err != nil {
+			if err := tmpl.Execute(&page, buildPageView(identity, s.cfg)); err != nil {
 				fail(w, 500, "The console could not be rendered.")
 				return
 			}
@@ -128,6 +198,21 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 	root.HandleFunc("GET /callback", callback)
 	root.HandleFunc("GET /auth/login", login)
 	root.HandleFunc("GET /auth/callback", callback)
+	// A public, script-free signed-out page gives the user an explicit sign-in
+	// link instead of silently restarting the OIDC flow after logout.
+	for _, path := range []string{"/auth/signed-out", "/signed-out"} {
+		root.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {
+			b, e := assets.ReadFile("assets/signed-out.html")
+			if e != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Robots-Tag", "noindex")
+			_, _ = w.Write(b)
+		})
+	}
 	for _, name := range []string{"app.js", "logic.js", "style.css"} {
 		name := name
 		root.HandleFunc("GET /static/"+name, func(w http.ResponseWriter, r *http.Request) {

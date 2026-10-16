@@ -6,23 +6,38 @@ import subprocess
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
+# The read-only base role grants get/list over exactly these resources. Keep it
+# separate from ALLOWED: a write overlay may need an extra verb/resource (for
+# example RuntimeClass get while planning a GPU edit) without the read base
+# silently gaining it.
+READ_RESOURCES = {
+    ("kubeflow.org", "profiles"),
+    ("kubeflow.org", "notebooks"),
+    ("", "persistentvolumes"),
+    ("", "persistentvolumeclaims"),
+    *(("", r) for r in (
+        "namespaces", "pods", "events", "resourcequotas", "limitranges", "nodes")),
+    ("apps", "statefulsets"),
+    ("storage.k8s.io", "storageclasses"),
+    ("rbac.authorization.k8s.io", "rolebindings"),
+}
+# ALLOWED is the union of every verb/resource any shipped role may grant.
 ALLOWED = {
+    **{key: {"get", "list"} for key in READ_RESOURCES},
     ("kubeflow.org", "profiles"): {"get", "list", "create", "patch"},
     ("kubeflow.org", "notebooks"): {"get", "list", "patch"},
     ("", "persistentvolumes"): {"get", "list", "create", "patch"},
     ("", "persistentvolumeclaims"): {"get", "list", "create", "patch"},
-    **{("", r): {"get", "list"} for r in (
-        "namespaces", "pods", "events", "resourcequotas", "limitranges", "nodes")},
-    ("apps", "statefulsets"): {"get", "list"},
-    ("storage.k8s.io", "storageclasses"): {"get", "list"},
-    ("rbac.authorization.k8s.io", "rolebindings"): {"get", "list"},
+    # GPU notebook planning must read the referenced RuntimeClass; get only.
+    ("node.k8s.io", "runtimeclasses"): {"get"},
 }
 EXPECTED_ROLES = {
-    "kubeflow-admin-read": {key: {"get", "list"} for key in ALLOWED},
+    "kubeflow-admin-read": {key: {"get", "list"} for key in READ_RESOURCES},
     "kubeflow-admin-writes": {
         ("kubeflow.org", "profiles"): {"create", "patch"},
         ("kubeflow.org", "notebooks"): {"patch"},
         ("", "persistentvolumeclaims"): {"create"},
+        ("node.k8s.io", "runtimeclasses"): {"get"},
     },
     "kubeflow-admin-static-storage": {("", "persistentvolumes"): {"create", "patch"}},
     "kubeflow-admin-pvc-expansion": {("", "persistentvolumeclaims"): {"patch"}},

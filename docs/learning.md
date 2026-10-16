@@ -381,7 +381,9 @@ in a ConfigMap; keep the OIDC client secret in a Secret mounted read-only.
 **Write tests:** extend `scripts/check-manifests.py` — render every variant and
 assert: the shipped config stays read-only, RBAC verbs stay within the
 allowlist, Pod hardening fields are present, single replica/`Recreate`, and
-journal-mode values are valid.
+journal-mode values are valid. Keep `scripts/check-api-parity.py` green so every
+registered `/api/` route and the structured error envelope stay documented in
+`api/openapi.yaml`.
 
 **Verify by hand:** render each overlay and grep the result for `REPLACE_`
 and `.invalid`; the base must not be deployable until replaced.

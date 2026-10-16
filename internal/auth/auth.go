@@ -30,6 +30,17 @@ const (
 	sessionBucket = "auth.sessions"
 	attemptBucket = "auth.attempts"
 	loginTTL      = 5 * time.Minute
+
+	// globalLoginPerMinute bounds total login starts for every source. It is the
+	// only admission control in the default "global" mode, so the shipped
+	// reverse-proxy deployment cannot be starved by one shared peer address.
+	globalLoginPerMinute = 100
+	// sourceLoginPerMinute bounds login starts per validated client source when
+	// per-source limiting is explicitly enabled.
+	sourceLoginPerMinute = 10
+	// maxLoginSources hard-caps the per-source map so a flood of distinct sources
+	// cannot grow memory without bound.
+	maxLoginSources = 1024
 )
 
 type identityKey struct{}
@@ -66,6 +77,7 @@ type Auth struct {
 	verifier    *oidc.IDTokenVerifier
 	client      *http.Client
 	origin      string
+	trusted     []*net.IPNet
 	mu          sync.Mutex
 	rates       map[string]rateEntry
 	global      rateEntry
@@ -80,6 +92,22 @@ func New(ctx context.Context, cfg config.Config, s *store.Store) (*Auth, error) 
 	}
 	if cfg.Auth.ClientID == "" || cfg.Auth.ClientSecretFile == "" || cfg.Auth.SessionMinutes < 1 || cfg.Auth.SessionMinutes > 15 || len(cfg.Auth.AdminGroups)+len(cfg.Auth.AdminSubjects) == 0 {
 		return nil, errors.New("auth: invalid authentication configuration")
+	}
+	switch cfg.Auth.LoginSourceLimit {
+	case "", "global", "peer", "forwarded":
+	default:
+		return nil, errors.New("auth: invalid login source limit")
+	}
+	var trusted []*net.IPNet
+	for _, raw := range cfg.Auth.TrustedProxyCIDRs {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, errors.New("auth: invalid trusted proxy CIDR")
+		}
+		trusted = append(trusted, network)
+	}
+	if cfg.Auth.LoginSourceLimit == "forwarded" && len(trusted) == 0 {
+		return nil, errors.New("auth: forwarded login source limit requires trusted proxy CIDRs")
 	}
 	public, err := secureURL(cfg.Server.PublicURL)
 	if err != nil || public.RawQuery != "" || (public.Path != "" && public.Path != "/") {
@@ -138,7 +166,7 @@ func New(ctx context.Context, cfg config.Config, s *store.Store) (*Auth, error) 
 	// Use a non-request context for key refresh: a canceled startup context must
 	// not prevent later JWKS rotation.
 	keys := oidc.NewRemoteKeySet(oidc.ClientContext(context.Background(), client), metadata.JWKS)
-	return &Auth{cfg: cfg, store: s, client: client, origin: origin,
+	return &Auth{cfg: cfg, store: s, client: client, origin: origin, trusted: trusted,
 		oauth:    oauth2.Config{ClientID: cfg.Auth.ClientID, ClientSecret: secretText, Endpoint: ep, RedirectURL: origin + "/auth/callback", Scopes: scopes},
 		verifier: oidc.NewVerifier(cfg.Auth.IssuerURL, keys, &oidc.Config{ClientID: cfg.Auth.ClientID}), rates: make(map[string]rateEntry)}, nil
 }
@@ -290,6 +318,14 @@ func (a *Auth) sameOrigin(r *http.Request) bool {
 	return err == nil && ref.User == nil && ref.Scheme+"://"+ref.Host == a.origin
 }
 
+// rateAllowed bounds login starts. The global budget always applies. A
+// per-source bucket is used only when the configured loginSourceLimit yields a
+// source that can be trusted: "peer" trusts only the immediate peer address,
+// and "forwarded" trusts only a client address derived from a validated
+// X-Forwarded-For chain whose immediate peer is a configured trusted proxy.
+// The default "global" mode deliberately applies no per-source bucket, because
+// the shipped deployment funnels every client through one reverse proxy and a
+// per-peer bucket would let one client exhaust a shared limit for everyone.
 func (a *Auth) rateAllowed(r *http.Request) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -297,32 +333,103 @@ func (a *Auth) rateAllowed(r *http.Request) bool {
 	if now.Sub(a.global.start) >= time.Minute {
 		a.global = rateEntry{start: now}
 	}
-	if a.global.count >= 100 {
+	if a.global.count >= globalLoginPerMinute {
 		return false
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	for key, entry := range a.rates {
-		if now.Sub(entry.start) >= time.Minute {
-			delete(a.rates, key)
+	if source, ok := a.loginSource(r); ok {
+		for key, entry := range a.rates {
+			if now.Sub(entry.start) >= time.Minute {
+				delete(a.rates, key)
+			}
 		}
-	}
-	entry, exists := a.rates[host]
-	if !exists {
-		if len(a.rates) >= 1024 {
+		entry, exists := a.rates[source]
+		if !exists {
+			if len(a.rates) >= maxLoginSources {
+				return false
+			}
+			entry.start = now
+		}
+		if entry.count >= sourceLoginPerMinute {
 			return false
 		}
-		entry.start = now
+		entry.count++
+		a.rates[source] = entry
 	}
-	if entry.count >= 10 {
-		return false
-	}
-	entry.count++
-	a.rates[host] = entry
 	a.global.count++
 	return true
+}
+
+// loginSource returns the per-source limiter key, or false when no trustworthy
+// source can be determined. It never returns a value taken from a forwarded
+// header unless the immediate peer is a configured trusted proxy and the whole
+// chain validates right-to-left.
+func (a *Auth) loginSource(r *http.Request) (string, bool) {
+	switch a.cfg.Auth.LoginSourceLimit {
+	case "peer":
+		if ip := peerIP(r.RemoteAddr); ip != nil {
+			return ip.String(), true
+		}
+	case "forwarded":
+		peer := peerIP(r.RemoteAddr)
+		if peer == nil || !a.trustedPeer(peer) {
+			return "", false
+		}
+		if ip, ok := forwardedClient(r.Header.Values("X-Forwarded-For"), a.trusted); ok {
+			return ip.String(), true
+		}
+	}
+	return "", false
+}
+
+func (a *Auth) trustedPeer(ip net.IP) bool {
+	for _, network := range a.trusted {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func peerIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	return net.ParseIP(strings.TrimSpace(host))
+}
+
+// forwardedClient walks X-Forwarded-For right-to-left, skipping configured
+// trusted proxies; the first non-trusted entry is the client. A malformed
+// entry, an empty chain, or a chain made entirely of trusted proxies is not
+// trusted (the caller then falls back to the global budget only). Spoofed
+// entries added by a client appear to the left of the real client address and
+// are ignored.
+func forwardedClient(values []string, trusted []*net.IPNet) (net.IP, bool) {
+	var chain []string
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				chain = append(chain, part)
+			}
+		}
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		ip := net.ParseIP(chain[i])
+		if ip == nil {
+			return nil, false
+		}
+		trustedHop := false
+		for _, network := range trusted {
+			if network.Contains(ip) {
+				trustedHop = true
+				break
+			}
+		}
+		if !trustedHop {
+			return ip, true
+		}
+	}
+	return nil, false
 }
 
 // Login starts a single-use code flow bound to an independent browser cookie.
@@ -492,6 +599,6 @@ func (a *Auth) Logout(w http.ResponseWriter, r *http.Request) {
 		}
 		clearCookie(w, sessionCookie)
 		clearCookie(w, loginCookie)
-		http.Redirect(w, r, "/auth/login", http.StatusSeeOther)
+		http.Redirect(w, r, "/auth/signed-out", http.StatusSeeOther)
 	})).ServeHTTP(w, r)
 }

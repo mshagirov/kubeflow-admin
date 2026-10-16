@@ -25,7 +25,7 @@ func TestFilesystemJournalPolicy(t *testing.T) {
 		{"ext4 delete", 0xEF53, "delete", false, false, false},
 		{"xfs wal", 0x58465342, "wal", false, false, false},
 		{"btrfs delete", 0x9123683E, "delete", false, false, false},
-		{"overlayfs accepted for containers", 0x794C7630, "wal", false, false, false},
+		{"overlayfs accepted but unverified", 0x794C7630, "wal", false, false, true},
 		{"unknown requires opt-in", 0x12345678, "wal", false, true, true},
 		{"unknown allowed with opt-in", 0x12345678, "wal", true, false, true},
 	} {

@@ -103,7 +103,10 @@ func (s *Service) notebookChanges(ctx context.Context, a model.Action, n *unstru
 	if err != nil {
 		return nil, err
 	}
-	c := cs[idx].(map[string]any)
+	c, ok := cs[idx].(map[string]any)
+	if !ok {
+		return nil, errors.New("unsupported container shape")
+	}
 	cn, ok := c["name"].(string)
 	if !ok || cn == "" {
 		return nil, errors.New("unsupported container identity")
@@ -176,8 +179,14 @@ func (s *Service) notebookChanges(ctx context.Context, a model.Action, n *unstru
 }
 
 func (s *Service) mountChanges(a model.Action, n *unstructured.Unstructured, spec map[string]any, idx int) ([]any, []any, error) {
-	cs := spec["containers"].([]any)
-	c := cs[idx].(map[string]any)
+	cs, ok := spec["containers"].([]any)
+	if !ok || idx < 0 || idx >= len(cs) {
+		return nil, nil, errors.New("unsupported container list")
+	}
+	c, ok := cs[idx].(map[string]any)
+	if !ok {
+		return nil, nil, errors.New("unsupported container shape")
+	}
 	vols, ok := spec["volumes"].([]any)
 	if !ok && spec["volumes"] != nil {
 		return nil, nil, errors.New("unsupported volumes shape")
@@ -258,7 +267,10 @@ func (s *Service) mountChanges(a model.Action, n *unstructured.Unstructured, spe
 		for vn, prev := range old {
 			mp, _ := prev["mountPath"].(string)
 			if s.protectedPath(mp) {
-				pvc := byName[vn]["persistentVolumeClaim"].(map[string]any)
+				pvc, ok := byName[vn]["persistentVolumeClaim"].(map[string]any)
+				if !ok {
+					return nil, nil, errors.New("unsupported PVC volume")
+				}
 				if mp == m.Path && (pvc["claimName"] != m.Claim || vn != m.Name) {
 					return nil, nil, errors.New("protected workspace mount cannot be replaced")
 				}
@@ -266,7 +278,11 @@ func (s *Service) mountChanges(a model.Action, n *unstructured.Unstructured, spe
 		}
 		mount := map[string]any{"name": m.Name, "mountPath": m.Path, "readOnly": m.ReadOnly}
 		if old[m.Name] != nil {
-			mount = runtime.DeepCopyJSONValue(old[m.Name]).(map[string]any)
+			copied, ok := runtime.DeepCopyJSONValue(old[m.Name]).(map[string]any)
+			if !ok {
+				return nil, nil, errors.New("unsupported mount shape")
+			}
+			mount = copied
 			mount["mountPath"] = m.Path
 			mount["readOnly"] = m.ReadOnly
 		}
@@ -299,7 +315,15 @@ func (s *Service) mountChanges(a model.Action, n *unstructured.Unstructured, spe
 	// container/init container. Independent/unknown volumes are retained.
 	used := map[string]bool{}
 	for _, v := range out {
-		used[v.(map[string]any)["name"].(string)] = true
+		m, ok := v.(map[string]any)
+		if !ok {
+			return nil, nil, errors.New("unsupported mount shape")
+		}
+		vn, ok := m["name"].(string)
+		if !ok {
+			return nil, nil, errors.New("unsupported mount identity")
+		}
+		used[vn] = true
 	}
 	for i, raw := range cs {
 		if i == idx {
@@ -321,8 +345,14 @@ func (s *Service) mountChanges(a model.Action, n *unstructured.Unstructured, spe
 	}
 	final := []any{}
 	for _, raw := range vols {
-		m := raw.(map[string]any)
-		vn := m["name"].(string)
+		m, ok := raw.(map[string]any)
+		if !ok {
+			return nil, nil, errors.New("unsupported volume shape")
+		}
+		vn, ok := m["name"].(string)
+		if !ok {
+			return nil, nil, errors.New("unsupported volume identity")
+		}
 		if !managed[vn] || used[vn] {
 			final = append(final, m)
 		}
@@ -377,7 +407,10 @@ func (s *Service) gpuChanges(ctx context.Context, a model.Action, n *unstructure
 		return nil, errors.New("GPU edit requires a nonnegative bounded integer count")
 	}
 	var next, old *config.GPUPreset
-	cn := c["name"].(string)
+	cn, ok := c["name"].(string)
+	if !ok {
+		return nil, errors.New("unsupported container identity")
+	}
 	ownerKey := "admin.kubeflow.org/gpu-preset-" + cn
 	prev := n.GetAnnotations()[ownerKey]
 	for i := range s.Config.Notebooks.GPUPresets {
@@ -401,8 +434,15 @@ func (s *Service) gpuChanges(ctx context.Context, a model.Action, n *unstructure
 	if *a.GPUCount == 0 {
 		next = nil
 	}
-	for _, raw := range spec["containers"].([]any) {
-		cc := raw.(map[string]any)
+	containers, ok := spec["containers"].([]any)
+	if !ok {
+		return nil, errors.New("unsupported container list")
+	}
+	for _, raw := range containers {
+		cc, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("unsupported container shape")
+		}
 		if cc["name"] != cn {
 			for _, p := range s.Config.Notebooks.GPUPresets {
 				for _, group := range []string{"requests", "limits"} {
@@ -982,14 +1022,25 @@ func templateMatches(obj map[string]any, n *unstructured.Unstructured, ops []pat
 		if len(p) > 4 && (p[3] == "containers" || p[3] == "volumes") {
 			source, _, _ := unstructured.NestedSlice(n.Object, p[:4]...)
 			i, err := strconv.Atoi(p[4])
-			if err != nil || i >= len(source) {
+			if err != nil || i < 0 || i >= len(source) {
 				return false
 			}
-			desired := source[i].(map[string]any)
+			desired, ok := source[i].(map[string]any)
+			if !ok {
+				return false
+			}
+			desiredName, ok := desired["name"].(string)
+			if !ok {
+				return false
+			}
 			target, _, _ := unstructured.NestedSlice(obj, p[:4]...)
 			idx := -1
 			for j, v := range target {
-				if v.(map[string]any)["name"] == desired["name"] {
+				m, ok := v.(map[string]any)
+				if !ok {
+					return false
+				}
+				if m["name"] == desiredName {
 					idx = j
 				}
 			}

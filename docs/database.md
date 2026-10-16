@@ -21,6 +21,12 @@ filesystems are rejected at startup. NFS, SMB/CIFS, FUSE, tmpfs, Lustre,
 CephFS, GPFS and OCFS2 are always rejected. A warning is logged whenever the
 database runs on unverified storage.
 
+overlayfs (common for container image roots and CI/dev workspaces) is accepted
+so those environments can run, but it is also reported **unverified** and
+triggers the same startup warning: its durability and cross-node locking are not
+proven. Treat it as a development/CI location only, never as a production
+database backend.
+
 ## BeeGFS deployment
 
 - Verify `tuneUseGlobalFileLocks = true` and `tuneRemoteFSync = true` in the
@@ -32,7 +38,12 @@ database runs on unverified storage.
 - The database directory must be writable by UID/GID 65532 and not accessible
   to other users. The app sets `umask 0077` and creates the directory 0700;
   database, journal, `-wal`/`-shm` and lock files are then private (0600).
-  Keep it separate from notebook/user data.
+  Keep it separate from notebook/user data. Pre-existing sidecars (`.lock`,
+  `-wal`, `-shm`, journal) must be private regular files: a planted symlink or a
+  non-private sidecar is rejected at open, and the app never follows a symlink
+  for its own files. SQLite inherits the main file's 0600 mode for new sidecars;
+  this is regression-tested under a permissive umask in an isolated subprocess.
+  Production still sets `umask 0077` before opening the database as defense in depth.
 - Keep one replica, Recreate, and no HPA. RWO does not enforce single-process
   access on a shared filesystem. Fence an unreachable old node before replacing
   its Pod; do not force-delete a live owner to bypass locking.

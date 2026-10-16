@@ -151,13 +151,26 @@ func quantity(s string) (resource.Quantity, error) {
 	}
 	return q, nil
 }
+
+var builtinQuotaResources = []string{"requests.cpu", "limits.cpu", "requests.memory", "limits.memory", "requests.storage", "persistentvolumeclaims", "pods"}
+
+// supportedQuotaResource reports whether this adapter may author the hard key.
+// Anything else is operator/controller managed and must never be introduced or
+// changed by a quota plan.
+func supportedQuotaResource(k string, presets []string) bool {
+	return has(builtinQuotaResources, k) || has(presets, k)
+}
+
+// quota validates the complete desired set for a new Profile. Introducing an
+// unsupported key here would create a Profile owned quota the adapter cannot
+// later reconcile, so it is rejected.
 func quota(a map[string]string, presets []string) (map[string]any, error) {
 	if len(a) == 0 {
 		return nil, errors.New("nonempty quota required; removing quotas is unsupported")
 	}
 	out := map[string]any{}
 	for k, v := range a {
-		if !has([]string{"requests.cpu", "limits.cpu", "requests.memory", "limits.memory", "requests.storage", "persistentvolumeclaims", "pods"}, k) && !has(presets, k) {
+		if !supportedQuotaResource(k, presets) {
 			return nil, errors.New("unsupported quota resource")
 		}
 		q, err := quantity(v)
@@ -168,6 +181,64 @@ func quota(a map[string]string, presets []string) (map[string]any, error) {
 	}
 	return out, nil
 }
+
+// mergeQuota reconciles a quota change against the Profile's existing hard map.
+// Every existing key is retained: unsupported (operator/controller managed) keys
+// are preserved verbatim and may only be round-tripped with an identical value,
+// while supported keys must be supplied as positive quantities so that a changed
+// value is intentional. Dropping an existing supported key stays a no-op error,
+// preserving the no-removal guard. The returned map replaces the whole hard map,
+// so preserved keys survive the patch.
+func mergeQuota(existing map[string]any, requested map[string]string, presets []string) (map[string]any, error) {
+	if len(requested) == 0 {
+		return nil, errors.New("quota removal is unsupported")
+	}
+	out := map[string]any{}
+	for k, v := range existing {
+		out[k] = v
+	}
+	for k, raw := range requested {
+		if !supportedQuotaResource(k, presets) {
+			old, ok := existing[k]
+			if !ok {
+				return nil, errors.New("unsupported quota resource")
+			}
+			oldString, ok := old.(string)
+			if !ok {
+				return nil, errors.New("unsupported Profile quota shape")
+			}
+			if !quantityEqual(oldString, raw) {
+				return nil, errors.New("changing an unsupported quota key is unsupported")
+			}
+			out[k] = old
+			continue
+		}
+		q, err := quantity(raw)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = q.String()
+	}
+	for k := range existing {
+		if supportedQuotaResource(k, presets) {
+			if _, ok := requested[k]; !ok {
+				return nil, errors.New("quota key removal is unsupported by this adapter")
+			}
+		}
+	}
+	return out, nil
+}
+
+// quantityEqual compares two quota values, accepting different spellings of the
+// same quantity so a round-tripped unknown key is not mistaken for a change.
+func quantityEqual(a, b string) bool {
+	if a == b {
+		return true
+	}
+	qa, ea := resource.ParseQuantity(a)
+	qb, eb := resource.ParseQuantity(b)
+	return ea == nil && eb == nil && qa.Cmp(qb) == 0
+}
 func (s *Service) prepareProfile(ctx context.Context, a model.Action, w *work) error {
 	keys := []string{}
 	for _, p := range s.Config.Notebooks.GPUPresets {
@@ -175,13 +246,13 @@ func (s *Service) prepareProfile(ctx context.Context, a model.Action, w *work) e
 	}
 	hard := map[string]any{}
 	var err error
-	if len(a.Quota) > 0 {
-		hard, err = quota(a.Quota, keys)
-		if err != nil {
-			return err
-		}
-	}
 	if a.Kind == "profile.create" {
+		if len(a.Quota) > 0 {
+			hard, err = quota(a.Quota, keys)
+			if err != nil {
+				return err
+			}
+		}
 		if a.Owner == "" || len(a.Owner) > 253 || strings.TrimSpace(a.Owner) != a.Owner || strings.ContainsAny(a.Owner, "\r\n\t\x00") {
 			return errors.New("exact nonempty owner identity required")
 		}
@@ -208,7 +279,7 @@ func (s *Service) prepareProfile(ctx context.Context, a model.Action, w *work) e
 		w.prepared.Warnings = append(w.prepared.Warnings, "The exact owner identity is retained; directory existence is not verified.")
 		w.prepared.Warnings = append(w.prepared.Warnings, "Setup verification covers the Profile-owned active namespace, owner admin RoleBinding and requested quota; service-account and Istio policy contents are not independently verified.")
 	} else {
-		if len(hard) == 0 {
+		if len(a.Quota) == 0 {
 			return errors.New("quota removal is unsupported")
 		}
 		if err = s.scope(ctx, a.Name, &w.ev); err != nil {
@@ -222,10 +293,11 @@ func (s *Service) prepareProfile(ctx context.Context, a model.Action, w *work) e
 		if err != nil {
 			return errors.New("unsupported Profile quota shape")
 		}
-		for k := range old {
-			if _, ok := hard[k]; !ok {
-				return errors.New("quota key removal is unsupported by this adapter")
-			}
+		// Preserve operator/controller-managed keys this adapter does not
+		// understand instead of failing the whole change or dropping them.
+		hard, err = mergeQuota(old, a.Quota, keys)
+		if err != nil {
+			return err
 		}
 		w.profile = p
 		w.prepared.TargetUID = string(p.GetUID())

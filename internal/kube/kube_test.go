@@ -18,6 +18,7 @@ import (
 	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -688,5 +689,904 @@ func TestInventorySanitizesAndPropagatesFailures(t *testing.T) {
 	})
 	if _, err = s.Inventory(context.Background()); err == nil || strings.Contains(err.Error(), "sensitive") {
 		t.Fatal("did not safely propagate inventory error")
+	}
+}
+
+// --- quota change preservation ---
+
+func TestQuotaChangePreservesExistingUnknownKeys(t *testing.T) {
+	s, api, _ := testService(t)
+	p := api.get("profiles", "", "alice")
+	if err := unstructured.SetNestedMap(p.Object, map[string]any{"requests.cpu": "2", "requests.ephemeral-storage": "5Gi"}, "spec", "resourceQuotaSpec", "hard"); err != nil {
+		t.Fatal(err)
+	}
+	api.put("profiles", p)
+	// 5120Mi is the same quantity as 5Gi for the operator-managed key; a
+	// round-tripped unchanged value must be accepted and preserved verbatim.
+	w, err := s.build(context.Background(), model.Action{Kind: "profile.quota.change", Name: "alice", Quota: map[string]string{"requests.cpu": "4", "requests.ephemeral-storage": "5120Mi"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.ops) != 1 || w.ops[0].Op != "add" {
+		t.Fatalf("unexpected ops: %+v", w.ops)
+	}
+	hard, ok := w.ops[0].Value.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected hard value: %#v", w.ops[0].Value)
+	}
+	if hard["requests.cpu"] != "4" {
+		t.Fatalf("supported key not updated: %v", hard)
+	}
+	if hard["requests.ephemeral-storage"] != "5Gi" {
+		t.Fatalf("unknown key not preserved: %v", hard)
+	}
+}
+
+func TestQuotaChangeRejectsUnsafeEdits(t *testing.T) {
+	cases := []struct {
+		name      string
+		existing  map[string]any
+		requested map[string]string
+		want      string
+	}{
+		{"introduce-unsupported", map[string]any{"requests.cpu": "2"}, map[string]string{"requests.cpu": "2", "example.com/gpu": "1"}, "unsupported quota resource"},
+		{"change-unsupported", map[string]any{"requests.cpu": "2", "requests.ephemeral-storage": "5Gi"}, map[string]string{"requests.cpu": "2", "requests.ephemeral-storage": "6Gi"}, "changing an unsupported quota key is unsupported"},
+		{"remove-all", map[string]any{"requests.cpu": "2"}, map[string]string{}, "quota removal is unsupported"},
+		{"remove-supported", map[string]any{"requests.cpu": "2", "requests.memory": "1Gi"}, map[string]string{"requests.cpu": "3"}, "quota key removal is unsupported by this adapter"},
+		{"bad-quantity", map[string]any{"requests.cpu": "2"}, map[string]string{"requests.cpu": "-1"}, "a positive Kubernetes quantity is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, api, _ := testService(t)
+			p := api.get("profiles", "", "alice")
+			if err := unstructured.SetNestedMap(p.Object, tc.existing, "spec", "resourceQuotaSpec", "hard"); err != nil {
+				t.Fatal(err)
+			}
+			api.put("profiles", p)
+			_, err := s.build(context.Background(), model.Action{Kind: "profile.quota.change", Name: "alice", Quota: tc.requested})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// --- root NFS base path ---
+
+func TestRootNFSBasePathRejectedAtRuntime(t *testing.T) {
+	s, api, _ := testService(t)
+	s.Config.Storage.NFSTemplates[0].BasePath = "/"
+	_, err := s.build(context.Background(), model.Action{Kind: "storage.create.static", Namespace: "alice", Name: "new", PVName: "new-pv", Template: "nfs-template", Subdirectory: "alice", StorageClass: "approved", Size: "10Gi", AccessMode: "ReadWriteMany"})
+	if err == nil || !strings.Contains(err.Error(), "invalid approved NFS template") {
+		t.Fatalf("root NFS base path accepted: %v", err)
+	}
+	assertNoWrites(t, api)
+}
+
+// --- defensive mount parsing ---
+
+func mountEdit() model.Action {
+	return model.Action{Kind: "notebook.edit", Namespace: "alice", Name: "research", Container: "research", Mounts: &[]model.Mount{{Name: "home", Claim: "home", Path: "/home/jovyan"}}}
+}
+
+func setFixtureVolume(t *testing.T, n *unstructured.Unstructured, i int, key string, value any) {
+	t.Helper()
+	vols, _, err := unstructured.NestedSlice(n.Object, "spec", "template", "spec", "volumes")
+	if err != nil || i >= len(vols) {
+		t.Fatalf("fixture volume %d: %v", i, err)
+	}
+	vols[i].(map[string]any)[key] = value
+	if err = unstructured.SetNestedSlice(n.Object, vols, "spec", "template", "spec", "volumes"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setFixtureMount(t *testing.T, n *unstructured.Unstructured, ci, mi int, value any) {
+	t.Helper()
+	cs, _, err := unstructured.NestedSlice(n.Object, "spec", "template", "spec", "containers")
+	if err != nil || ci >= len(cs) {
+		t.Fatalf("fixture container %d: %v", ci, err)
+	}
+	mounts, ok := cs[ci].(map[string]any)["volumeMounts"].([]any)
+	if !ok || mi >= len(mounts) {
+		t.Fatalf("fixture mount %d/%d", ci, mi)
+	}
+	mounts[mi] = value
+	cs[ci].(map[string]any)["volumeMounts"] = mounts
+	if err = unstructured.SetNestedSlice(n.Object, cs, "spec", "template", "spec", "containers"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMountEditRejectsMalformedShapesWithoutPanic(t *testing.T) {
+	s, api, _ := testService(t)
+	ctx := context.Background()
+	if _, err := s.build(ctx, mountEdit()); err != nil {
+		t.Fatalf("valid mount edit failed: %v", err)
+	}
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, n *unstructured.Unstructured)
+	}{
+		{"pvc-not-map", func(t *testing.T, n *unstructured.Unstructured) {
+			setFixtureVolume(t, n, 0, "persistentVolumeClaim", "not-a-map")
+		}},
+		{"volume-name-not-string", func(t *testing.T, n *unstructured.Unstructured) {
+			setFixtureVolume(t, n, 0, "name", int64(3))
+		}},
+		{"mount-not-map", func(t *testing.T, n *unstructured.Unstructured) {
+			setFixtureMount(t, n, 0, 0, "not-a-map")
+		}},
+		{"containers-not-list", func(t *testing.T, n *unstructured.Unstructured) {
+			if err := unstructured.SetNestedField(n.Object, "not-a-list", "spec", "template", "spec", "containers"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n := fixture(t)
+			tc.mutate(t, n)
+			api.put("notebooks", n)
+			if _, err := s.build(ctx, mountEdit()); err == nil {
+				t.Fatal("accepted malformed mount object")
+			}
+			assertNoWrites(t, api)
+		})
+	}
+}
+
+func TestExecuteRejectsMalformedMountAfterValidPlan(t *testing.T) {
+	s, api, _ := testService(t)
+	ctx := context.Background()
+	p, err := s.Prepare(ctx, mountEdit())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := api.get("notebooks", "alice", "research")
+	setFixtureVolume(t, n, 0, "persistentVolumeClaim", "not-a-map")
+	api.put("notebooks", n)
+	if err = s.Execute(ctx, p, func(string) error { return nil }); err == nil {
+		t.Fatal("executed against a malformed live object")
+	}
+	assertNoWrites(t, api)
+}
+
+func TestProtectedMountSurvivesMalformedSibling(t *testing.T) {
+	s, api, _ := testService(t)
+	n := fixture(t)
+	setFixtureVolume(t, n, 1, "persistentVolumeClaim", "not-a-map")
+	api.put("notebooks", n)
+	spec, _, _ := unstructured.NestedMap(n.Object, "spec", "template", "spec")
+	empty := []model.Mount{}
+	if _, _, err := s.mountChanges(model.Action{Mounts: &empty}, n, spec, 0); err == nil || !strings.Contains(err.Error(), "protected workspace mount cannot be removed") {
+		t.Fatalf("protected mount not preserved: %v", err)
+	}
+}
+
+// --- deterministic storage-controller fixtures ---
+
+var (
+	pvGVR  = corev1.SchemeGroupVersion.WithResource("persistentvolumes")
+	pvcGVR = corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims")
+	nsGVR  = corev1.SchemeGroupVersion.WithResource("namespaces")
+)
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// dryRunReactor makes the typed fake honor server-side dry-run, which client-go's
+// ObjectTracker otherwise persists.
+func dryRunReactor(k *fake.Clientset) ktesting.ReactionFunc {
+	return func(a ktesting.Action) (bool, runtime.Object, error) {
+		switch act := a.(type) {
+		case ktesting.CreateActionImpl:
+			if len(act.GetCreateOptions().DryRun) > 0 {
+				return true, act.GetObject(), nil
+			}
+		case ktesting.UpdateActionImpl:
+			if len(act.GetUpdateOptions().DryRun) > 0 {
+				return true, act.GetObject(), nil
+			}
+		case ktesting.PatchActionImpl:
+			if len(act.GetPatchOptions().DryRun) > 0 {
+				obj, err := k.Tracker().Get(act.GetResource(), act.GetNamespace(), act.GetName())
+				return true, obj, err
+			}
+		}
+		return false, nil, nil
+	}
+}
+
+func bindFakePV(k *fake.Clientset, vol string, pvc *corev1.PersistentVolumeClaim) error {
+	existing, err := k.Tracker().Get(pvGVR, "", vol)
+	if apierrors.IsNotFound(err) {
+		pv := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: vol, UID: types.UID("fake-pv-" + vol), ResourceVersion: "1"},
+			Spec: corev1.PersistentVolumeSpec{
+				StorageClassName:              derefString(pvc.Spec.StorageClassName),
+				AccessModes:                   append([]corev1.PersistentVolumeAccessMode(nil), pvc.Spec.AccessModes...),
+				VolumeMode:                    pvc.Spec.VolumeMode,
+				Capacity:                      pvc.Spec.Resources.Requests.DeepCopy(),
+				PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+				PersistentVolumeSource:        corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: "csi.example.vendor", VolumeHandle: "provisioned-" + vol}},
+				ClaimRef:                      &corev1.ObjectReference{Name: pvc.Name, Namespace: pvc.Namespace, UID: pvc.UID},
+			},
+			Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+		}
+		return k.Tracker().Create(pvGVR, pv, "")
+	}
+	if err != nil {
+		return err
+	}
+	pv, ok := existing.(*corev1.PersistentVolume)
+	if !ok {
+		return errors.New("unexpected PV type")
+	}
+	pv = pv.DeepCopy()
+	if pv.Spec.ClaimRef == nil {
+		pv.Spec.ClaimRef = &corev1.ObjectReference{}
+	}
+	pv.Spec.ClaimRef.Name = pvc.Name
+	pv.Spec.ClaimRef.Namespace = pvc.Namespace
+	pv.Spec.ClaimRef.UID = pvc.UID
+	pv.Status.Phase = corev1.VolumeBound
+	return k.Tracker().Update(pvGVR, pv, "")
+}
+
+// fakeController is a deterministic stand-in for the cluster's dry-run behavior,
+// the storage controller and a CSI driver completing a resize. It provisions no
+// real storage: an Immediate claim is recorded Bound with a matching PV, a
+// WaitForFirstConsumer claim stays Pending. Both are creation outcomes only and
+// must never be read as a provisioning guarantee.
+func fakeController(k *fake.Clientset, wffc bool) {
+	k.PrependReactor("create", "persistentvolumeclaims", func(a ktesting.Action) (bool, runtime.Object, error) {
+		ca, ok := a.(ktesting.CreateActionImpl)
+		if !ok {
+			return false, nil, nil
+		}
+		pvc, ok := ca.GetObject().(*corev1.PersistentVolumeClaim)
+		if !ok {
+			return false, nil, nil
+		}
+		pvc = pvc.DeepCopy()
+		if len(ca.GetCreateOptions().DryRun) > 0 {
+			return true, pvc, nil
+		}
+		pvc.UID = types.UID("fake-" + pvc.Namespace + "-" + pvc.Name)
+		pvc.ResourceVersion = "1"
+		if wffc && pvc.Spec.VolumeName == "" {
+			pvc.Status.Phase = corev1.ClaimPending
+			if err := k.Tracker().Create(pvcGVR, pvc, pvc.Namespace); err != nil {
+				return true, nil, err
+			}
+			return true, pvc, nil
+		}
+		if pvc.Spec.VolumeName == "" {
+			pvc.Spec.VolumeName = "provisioned-" + pvc.Name
+		}
+		pvc.Status.Phase = corev1.ClaimBound
+		pvc.Status.Capacity = pvc.Spec.Resources.Requests.DeepCopy()
+		if err := bindFakePV(k, pvc.Spec.VolumeName, pvc); err != nil {
+			return true, nil, err
+		}
+		if err := k.Tracker().Create(pvcGVR, pvc, pvc.Namespace); err != nil {
+			return true, nil, err
+		}
+		return true, pvc, nil
+	})
+	k.PrependReactor("patch", "persistentvolumeclaims", func(a ktesting.Action) (bool, runtime.Object, error) {
+		pa, ok := a.(ktesting.PatchActionImpl)
+		if !ok || pa.GetPatchType() != types.JSONPatchType {
+			return false, nil, nil
+		}
+		obj, err := k.Tracker().Get(pvcGVR, pa.GetNamespace(), pa.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		if len(pa.GetPatchOptions().DryRun) > 0 {
+			return true, obj, nil
+		}
+		old, err := json.Marshal(obj)
+		if err != nil {
+			return true, nil, err
+		}
+		patch, err := jsonpatch.DecodePatch(pa.GetPatch())
+		if err != nil {
+			return true, nil, err
+		}
+		modified, err := patch.Apply(old)
+		if err != nil {
+			return true, nil, err
+		}
+		out := &corev1.PersistentVolumeClaim{}
+		if err := json.Unmarshal(modified, out); err != nil {
+			return true, nil, err
+		}
+		if req := out.Spec.Resources.Requests.Storage(); req != nil {
+			if out.Status.Capacity == nil {
+				out.Status.Capacity = corev1.ResourceList{}
+			}
+			out.Status.Capacity[corev1.ResourceStorage] = req.DeepCopy()
+		}
+		if err := k.Tracker().Update(pvcGVR, out, out.Namespace); err != nil {
+			return true, nil, err
+		}
+		return true, out, nil
+	})
+	k.PrependReactor("*", "persistentvolumes", dryRunReactor(k))
+	k.PrependReactor("*", "persistentvolumeclaims", dryRunReactor(k))
+}
+
+// --- execution coverage ---
+
+func TestExecuteProfileCreateConverges(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	action := model.Action{Kind: "profile.create", Name: "bob", Owner: "bob@example.test", Quota: map[string]string{"requests.cpu": "4", "requests.memory": "8Gi"}}
+	api.after = func(p *unstructured.Unstructured) {
+		if p.GetKind() != "Profile" {
+			return
+		}
+		uid := p.GetUID()
+		ownerName, _, _ := unstructured.NestedString(p.Object, "spec", "owner", "name")
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: p.GetName(), UID: types.UID("ns-" + p.GetName()), Annotations: map[string]string{"owner": ownerName}, OwnerReferences: owner(uid, "Profile", p.GetName())}, Status: corev1.NamespaceStatus{Phase: corev1.NamespaceActive}}
+		if _, err := k.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{}); err != nil {
+			t.Errorf("namespace fixture: %v", err)
+		}
+		rb := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "kubeflow-admin", Namespace: p.GetName(), UID: types.UID("rb-" + p.GetName()), OwnerReferences: owner(uid, "Profile", p.GetName())}, Subjects: []rbacv1.Subject{{Kind: "User", Name: ownerName, APIGroup: "rbac.authorization.k8s.io"}}, RoleRef: rbacv1.RoleRef{Kind: "ClusterRole", Name: "kubeflow-admin", APIGroup: "rbac.authorization.k8s.io"}}
+		if _, err := k.RbacV1().RoleBindings(p.GetName()).Create(ctx, rb, metav1.CreateOptions{}); err != nil {
+			t.Errorf("rolebinding fixture: %v", err)
+		}
+		rl := corev1.ResourceList{}
+		for key, v := range action.Quota {
+			q, err := quantity(v)
+			if err != nil {
+				t.Errorf("bad quota fixture: %v", err)
+			}
+			rl[corev1.ResourceName(key)] = q
+		}
+		q := &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: "kf-resource-quota", Namespace: p.GetName(), UID: types.UID("q-" + p.GetName()), OwnerReferences: owner(uid, "Profile", p.GetName())}, Spec: corev1.ResourceQuotaSpec{Hard: rl}, Status: corev1.ResourceQuotaStatus{Hard: rl}}
+		if _, err := k.CoreV1().ResourceQuotas(p.GetName()).Create(ctx, q, metav1.CreateOptions{}); err != nil {
+			t.Errorf("quota fixture: %v", err)
+		}
+	}
+	p, err := s.Prepare(ctx, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Execute(ctx, p, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if api.get("profiles", "", "bob") == nil {
+		t.Fatal("profile not created")
+	}
+}
+
+func TestExecuteProfileQuotaChangePreservesUnknownKeys(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	p := api.get("profiles", "", "alice")
+	if err := unstructured.SetNestedMap(p.Object, map[string]any{"requests.cpu": "2", "requests.ephemeral-storage": "5Gi"}, "spec", "resourceQuotaSpec", "hard"); err != nil {
+		t.Fatal(err)
+	}
+	api.put("profiles", p)
+	api.after = func(obj *unstructured.Unstructured) {
+		if obj.GetKind() != "Profile" {
+			return
+		}
+		hard, _, _ := unstructured.NestedMap(obj.Object, "spec", "resourceQuotaSpec", "hard")
+		rl := corev1.ResourceList{}
+		for key, v := range hard {
+			q, err := resource.ParseQuantity(fmt.Sprint(v))
+			if err != nil {
+				continue
+			}
+			rl[corev1.ResourceName(key)] = q
+		}
+		q := &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: "kf-resource-quota", Namespace: obj.GetName(), UID: "quota-1", OwnerReferences: owner(obj.GetUID(), "Profile", obj.GetName())}, Spec: corev1.ResourceQuotaSpec{Hard: rl}, Status: corev1.ResourceQuotaStatus{Hard: rl}}
+		if _, err := k.CoreV1().ResourceQuotas(obj.GetName()).Create(ctx, q, metav1.CreateOptions{}); apierrors.IsAlreadyExists(err) {
+			_, _ = k.CoreV1().ResourceQuotas(obj.GetName()).Update(ctx, q, metav1.UpdateOptions{})
+		}
+	}
+	prepared, err := s.Prepare(ctx, model.Action{Kind: "profile.quota.change", Name: "alice", Quota: map[string]string{"requests.cpu": "4"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Execute(ctx, prepared, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	cur := api.get("profiles", "", "alice")
+	hard, _, _ := unstructured.NestedMap(cur.Object, "spec", "resourceQuotaSpec", "hard")
+	if hard["requests.ephemeral-storage"] != "5Gi" {
+		t.Fatalf("unknown key lost: %v", hard)
+	}
+	if hard["requests.cpu"] != "4" {
+		t.Fatalf("cpu not updated: %v", hard)
+	}
+}
+
+func TestExecuteDynamicPVCCreationOutcomes(t *testing.T) {
+	cases := []struct {
+		name      string
+		binding   storagev1.VolumeBindingMode
+		wffc      bool
+		wantPhase corev1.PersistentVolumeClaimPhase
+	}{
+		{"immediate-binds", storagev1.VolumeBindingImmediate, false, corev1.ClaimBound},
+		{"wait-for-consumer-stays-pending", storagev1.VolumeBindingWaitForFirstConsumer, true, corev1.ClaimPending},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, k := testService(t)
+			sc, err := k.StorageV1().StorageClasses().Get(context.Background(), "approved", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sc.VolumeBindingMode = &tc.binding
+			if _, err = k.StorageV1().StorageClasses().Update(context.Background(), sc, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			fakeController(k, tc.wffc)
+			action := model.Action{Kind: "pvc.create.dynamic", Namespace: "alice", Name: "dyn", StorageClass: "approved", Size: "5Gi", AccessMode: "ReadWriteMany"}
+			p, err := s.Prepare(context.Background(), action)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wffc {
+				if !strings.Contains(strings.Join(p.Warnings, " "), "not evidence that storage will be provisioned") {
+					t.Fatalf("missing provisioning caveat: %v", p.Warnings)
+				}
+			}
+			if err = s.Execute(context.Background(), p, func(string) error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			cur, err := k.CoreV1().PersistentVolumeClaims("alice").Get(context.Background(), "dyn", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cur.Status.Phase != tc.wantPhase {
+				t.Fatalf("phase = %v, want %v", cur.Status.Phase, tc.wantPhase)
+			}
+		})
+	}
+}
+
+func TestExecuteStaticCreateAndReserve(t *testing.T) {
+	t.Run("static", func(t *testing.T) {
+		s, _, k := testService(t)
+		fakeController(k, false)
+		action := model.Action{Kind: "storage.create.static", Namespace: "alice", Name: "new", PVName: "new-pv", Template: "nfs-template", Subdirectory: "alice/data", StorageClass: "approved", Size: "10Gi", AccessMode: "ReadWriteMany"}
+		p, err := s.Prepare(context.Background(), action)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = s.Execute(context.Background(), p, func(string) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		pv, err := k.CoreV1().PersistentVolumes().Get(context.Background(), "new-pv", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain || pv.Status.Phase != corev1.VolumeBound {
+			t.Fatalf("unexpected PV: %+v", pv)
+		}
+	})
+	t.Run("reserve", func(t *testing.T) {
+		s, _, k := testService(t)
+		fakeController(k, false)
+		available := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "available-pv", UID: "available-uid", ResourceVersion: "2"}, Spec: corev1.PersistentVolumeSpec{PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain, StorageClassName: "approved", MountOptions: []string{"nfsvers=3"}, AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}, PersistentVolumeSource: corev1.PersistentVolumeSource{NFS: &corev1.NFSVolumeSource{Server: "nfs.example.test", Path: "/prepared/alice/data"}}}, Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeAvailable}}
+		if _, err := k.CoreV1().PersistentVolumes().Create(context.Background(), available, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		action := model.Action{Kind: "pv.reserve-and-claim", Namespace: "alice", Name: "reserved", PVName: "available-pv", StorageClass: "approved", Size: "5Gi", AccessMode: "ReadWriteMany"}
+		p, err := s.Prepare(context.Background(), action)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = s.Execute(context.Background(), p, func(string) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		cur, err := k.CoreV1().PersistentVolumeClaims("alice").Get(context.Background(), "reserved", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cur.Status.Phase != corev1.ClaimBound || cur.Spec.VolumeName != "available-pv" {
+			t.Fatalf("reservation did not bind: %+v", cur.Status)
+		}
+	})
+}
+
+func TestExecutePVCExpansionConverges(t *testing.T) {
+	s, _, k := testService(t)
+	fakeController(k, false)
+	p, err := s.Prepare(context.Background(), model.Action{Kind: "pvc.expand", Namespace: "alice", Name: "home", Size: "20Gi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Execute(context.Background(), p, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	cur, err := k.CoreV1().PersistentVolumeClaims("alice").Get(context.Background(), "home", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.Spec.Resources.Requests.Storage().Cmp(resource.MustParse("20Gi")) != 0 || cur.Status.Capacity.Storage().Cmp(resource.MustParse("20Gi")) != 0 {
+		t.Fatalf("expansion not converged: req=%v status=%v", cur.Spec.Resources.Requests.Storage(), cur.Status.Capacity.Storage())
+	}
+}
+
+func staticCreateAction() model.Action {
+	return model.Action{Kind: "storage.create.static", Namespace: "alice", Name: "new", PVName: "new-pv", Template: "nfs-template", Subdirectory: "alice/data", StorageClass: "approved", Size: "10Gi", AccessMode: "ReadWriteMany"}
+}
+
+func csiStaticCreateAction() model.Action {
+	return model.Action{Kind: "storage.create.static", Namespace: "alice", Name: "csi", PVName: "csi-pv", Template: "csi-template", StorageClass: "approved", Size: "10Gi", AccessMode: "ReadWriteMany"}
+}
+
+func TestExecuteStorageRaceDetection(t *testing.T) {
+	t.Run("overlap-injected-at-checkpoint", func(t *testing.T) {
+		s, _, k := testService(t)
+		fakeController(k, false)
+		p, err := s.Prepare(context.Background(), staticCreateAction())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Execute(context.Background(), p, func(step string) error {
+			if step == "create-reserved-pv" {
+				competitor := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "competitor-pv", UID: "competitor-uid"}, Spec: corev1.PersistentVolumeSpec{StorageClassName: "approved", PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain, AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}, PersistentVolumeSource: corev1.PersistentVolumeSource{NFS: &corev1.NFSVolumeSource{Server: "nfs.example.test", Path: "/prepared/alice/data/sub"}}}, Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeAvailable}}
+				if _, cerr := k.CoreV1().PersistentVolumes().Create(context.Background(), competitor, metav1.CreateOptions{}); cerr != nil {
+					t.Fatal(cerr)
+				}
+			}
+			return nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "already represented") {
+			t.Fatalf("overlap not detected: %v", err)
+		}
+		if _, err := k.CoreV1().PersistentVolumes().Get(context.Background(), "new-pv", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatal("wrote a PV despite detected overlap")
+		}
+		if _, err := k.CoreV1().PersistentVolumeClaims("alice").Get(context.Background(), "new", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatal("wrote a PVC despite detected overlap")
+		}
+	})
+	t.Run("dependency-changed-between-writes", func(t *testing.T) {
+		s, _, k := testService(t)
+		fakeController(k, false)
+		k.PrependReactor("create", "persistentvolumes", func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateActionImpl)
+			if !ok || len(ca.GetCreateOptions().DryRun) > 0 {
+				return false, nil, nil
+			}
+			pv, ok := ca.GetObject().(*corev1.PersistentVolume)
+			if !ok {
+				return false, nil, nil
+			}
+			stored := pv.DeepCopy()
+			stored.UID = types.UID("created-" + stored.Name)
+			stored.ResourceVersion = "1"
+			if err := k.Tracker().Create(pvGVR, stored, ""); err != nil {
+				return true, nil, err
+			}
+			// Change the namespace identity after the PV write and before the
+			// PVC write. Mutate through the tracker because the fake holds its
+			// reaction lock while a reactor runs.
+			nsObj, err := k.Tracker().Get(nsGVR, "", "alice")
+			if err != nil {
+				return true, nil, err
+			}
+			ns := nsObj.(*corev1.Namespace).DeepCopy()
+			ns.UID = "namespace-changed"
+			if err = k.Tracker().Update(nsGVR, ns, ""); err != nil {
+				return true, nil, err
+			}
+			return true, stored, nil
+		})
+		p, err := s.Prepare(context.Background(), staticCreateAction())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Execute(context.Background(), p, func(string) error { return nil })
+		if !errors.Is(err, ErrConflict) {
+			t.Fatalf("dependency change not detected: %v", err)
+		}
+		if _, err := k.CoreV1().PersistentVolumes().Get(context.Background(), "new-pv", metav1.GetOptions{}); err != nil {
+			t.Fatal("expected the partial PV to remain for review")
+		}
+		if _, err := k.CoreV1().PersistentVolumeClaims("alice").Get(context.Background(), "new", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatal("created a PVC after a dependency change")
+		}
+	})
+	t.Run("pv-mutated-after-create", func(t *testing.T) {
+		s, _, k := testService(t)
+		fakeController(k, false)
+		k.PrependReactor("create", "persistentvolumes", func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateActionImpl)
+			if !ok || len(ca.GetCreateOptions().DryRun) > 0 {
+				return false, nil, nil
+			}
+			pv, ok := ca.GetObject().(*corev1.PersistentVolume)
+			if !ok {
+				return false, nil, nil
+			}
+			stored := pv.DeepCopy()
+			stored.UID = types.UID("created-" + stored.Name)
+			stored.ResourceVersion = "1"
+			stored.Spec.Capacity[corev1.ResourceStorage] = resource.MustParse("1Gi")
+			if err := k.Tracker().Create(pvGVR, stored, ""); err != nil {
+				return true, nil, err
+			}
+			return true, stored, nil
+		})
+		p, err := s.Prepare(context.Background(), staticCreateAction())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Execute(context.Background(), p, func(string) error { return nil })
+		if !errors.Is(err, ErrConflict) {
+			t.Fatalf("PV mutation not detected: %v", err)
+		}
+		if _, err := k.CoreV1().PersistentVolumeClaims("alice").Get(context.Background(), "new", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatal("created a PVC against a mutated PV")
+		}
+	})
+}
+
+// --- exact PV identity ---
+
+func plannedNFSPV(path string) *corev1.PersistentVolume {
+	fs := corev1.PersistentVolumeFilesystem
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv", UID: "uid-1", ResourceVersion: "1"},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName:              "approved",
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
+			VolumeMode:                    &fs,
+			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+			MountOptions:                  []string{"nfsvers=3"},
+			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			PersistentVolumeSource:        corev1.PersistentVolumeSource{NFS: &corev1.NFSVolumeSource{Server: "nfs.example.test", Path: path}},
+			ClaimRef:                      &corev1.ObjectReference{Name: "claim", Namespace: "alice"},
+		},
+	}
+}
+
+func plannedCSIPV() *corev1.PersistentVolume {
+	fs := corev1.PersistentVolumeFilesystem
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv", UID: "uid-1", ResourceVersion: "1"},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName:              "approved",
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
+			VolumeMode:                    &fs,
+			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{
+				Driver: "csi.example.vendor", VolumeHandle: "handle-1",
+				VolumeAttributes: map[string]string{"a": "b"}, FSType: "ext4",
+			}},
+			ClaimRef: &corev1.ObjectReference{Name: "claim", Namespace: "alice"},
+		},
+	}
+}
+
+func TestPVMatchesPlanExactIdentity(t *testing.T) {
+	cases := []struct {
+		name    string
+		planned *corev1.PersistentVolume
+		actual  func(*corev1.PersistentVolume)
+		want    bool
+	}{
+		{"nfs-identical", plannedNFSPV("/prepared/alice/data"), func(*corev1.PersistentVolume) {}, true},
+		{"nfs-ancestor", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) { pv.Spec.NFS.Path = "/prepared/alice" }, false},
+		{"nfs-descendant", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) { pv.Spec.NFS.Path = "/prepared/alice/data/sub" }, false},
+		{"nfs-other-server", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) { pv.Spec.NFS.Server = "evil.example.test" }, false},
+		{"capacity", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) {
+			pv.Spec.Capacity[corev1.ResourceStorage] = resource.MustParse("1Gi")
+		}, false},
+		{"mount-options", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) { pv.Spec.MountOptions = []string{"nolock"} }, false},
+		{"class", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) { pv.Spec.StorageClassName = "other" }, false},
+		{"volume-mode", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) { pv.Spec.VolumeMode = nil }, false},
+		{"reclaim-policy", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) {
+			pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
+		}, false},
+		// A mutation to scheduling must be rejected even with an identical UID and reservation.
+		{"node-affinity", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) {
+			pv.Spec.NodeAffinity = &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{}}
+		}, false},
+		// ClaimRef is the reservation identity, verified separately, so a different value is not a spec mismatch.
+		{"claim-ref-excluded", plannedNFSPV("/prepared/alice/data"), func(pv *corev1.PersistentVolume) { pv.Spec.ClaimRef = nil }, true},
+		{"csi-identical", plannedCSIPV(), func(*corev1.PersistentVolume) {}, true},
+		{"csi-attrs", plannedCSIPV(), func(pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeAttributes = map[string]string{"a": "evil"} }, false},
+		{"csi-fstype", plannedCSIPV(), func(pv *corev1.PersistentVolume) { pv.Spec.CSI.FSType = "xfs" }, false},
+		{"csi-readonly", plannedCSIPV(), func(pv *corev1.PersistentVolume) { pv.Spec.CSI.ReadOnly = true }, false},
+		{"csi-node-publish-secret", plannedCSIPV(), func(pv *corev1.PersistentVolume) {
+			pv.Spec.CSI.NodePublishSecretRef = &corev1.SecretReference{Name: "s"}
+		}, false},
+		{"csi-node-stage-secret", plannedCSIPV(), func(pv *corev1.PersistentVolume) { pv.Spec.CSI.NodeStageSecretRef = &corev1.SecretReference{Name: "s"} }, false},
+		{"csi-handle", plannedCSIPV(), func(pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeHandle = "handle-2" }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := tc.planned.DeepCopy()
+			tc.actual(actual)
+			if got := pvMatchesPlan(actual, tc.planned); got != tc.want {
+				t.Fatalf("pvMatchesPlan = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// --- post-create PV mutation must leave a partial PV and no PVC ---
+
+func TestExecuteStaticCreateRejectsPostCreateNFSMutation(t *testing.T) {
+	mutations := []struct {
+		name   string
+		mutate func(pv *corev1.PersistentVolume)
+	}{
+		{"nfs-ancestor", func(pv *corev1.PersistentVolume) { pv.Spec.NFS.Path = "/prepared/alice" }},
+		{"nfs-descendant", func(pv *corev1.PersistentVolume) { pv.Spec.NFS.Path = "/prepared/alice/data/sub" }},
+		{"node-affinity", func(pv *corev1.PersistentVolume) {
+			pv.Spec.NodeAffinity = &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{}}
+		}},
+		{"mount-options", func(pv *corev1.PersistentVolume) { pv.Spec.MountOptions = []string{"nolock"} }},
+		{"capacity", func(pv *corev1.PersistentVolume) {
+			pv.Spec.Capacity[corev1.ResourceStorage] = resource.MustParse("1Gi")
+		}},
+		{"class", func(pv *corev1.PersistentVolume) { pv.Spec.StorageClassName = "other" }},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, k := testService(t)
+			fakeController(k, false)
+			k.PrependReactor("create", "persistentvolumes", mutatingPVReactor(k, tc.mutate))
+			p, err := s.Prepare(context.Background(), staticCreateAction())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = s.Execute(context.Background(), p, func(string) error { return nil }); !errors.Is(err, ErrConflict) {
+				t.Fatalf("mutation not detected: %v", err)
+			}
+			assertPartialPVNoPVC(t, k, "new-pv", "new")
+		})
+	}
+}
+
+func TestExecuteStaticCreateRejectsPostCreateCSIMutation(t *testing.T) {
+	mutations := []struct {
+		name   string
+		mutate func(pv *corev1.PersistentVolume)
+	}{
+		{"attrs", func(pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeAttributes = map[string]string{"a": "evil"} }},
+		{"fstype", func(pv *corev1.PersistentVolume) { pv.Spec.CSI.FSType = "xfs" }},
+		{"readonly", func(pv *corev1.PersistentVolume) { pv.Spec.CSI.ReadOnly = true }},
+		{"node-publish-secret", func(pv *corev1.PersistentVolume) {
+			pv.Spec.CSI.NodePublishSecretRef = &corev1.SecretReference{Name: "s"}
+		}},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, k := testService(t)
+			fakeController(k, false)
+			k.PrependReactor("create", "persistentvolumes", mutatingPVReactor(k, tc.mutate))
+			p, err := s.Prepare(context.Background(), csiStaticCreateAction())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = s.Execute(context.Background(), p, func(string) error { return nil }); !errors.Is(err, ErrConflict) {
+				t.Fatalf("CSI mutation not detected: %v", err)
+			}
+			assertPartialPVNoPVC(t, k, "csi-pv", "csi")
+		})
+	}
+}
+
+func mutatingPVReactor(k *fake.Clientset, mutate func(*corev1.PersistentVolume)) ktesting.ReactionFunc {
+	return func(a ktesting.Action) (bool, runtime.Object, error) {
+		ca, ok := a.(ktesting.CreateActionImpl)
+		if !ok || len(ca.GetCreateOptions().DryRun) > 0 {
+			return false, nil, nil
+		}
+		pv, ok := ca.GetObject().(*corev1.PersistentVolume)
+		if !ok {
+			return false, nil, nil
+		}
+		stored := pv.DeepCopy()
+		stored.UID = types.UID("created-" + stored.Name)
+		stored.ResourceVersion = "1"
+		mutate(stored)
+		if err := k.Tracker().Create(pvGVR, stored, ""); err != nil {
+			return true, nil, err
+		}
+		return true, stored, nil
+	}
+}
+
+func assertPartialPVNoPVC(t *testing.T, k *fake.Clientset, pvName, pvcName string) {
+	t.Helper()
+	if _, err := k.CoreV1().PersistentVolumes().Get(context.Background(), pvName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected the partial PV %s to remain for review: %v", pvName, err)
+	}
+	if _, err := k.CoreV1().PersistentVolumeClaims("alice").Get(context.Background(), pvcName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no PVC %s after rejected PV, got %v", pvcName, err)
+	}
+}
+
+// --- mutations injected inside the create-pvc checkpoint must be caught ---
+
+func TestExecuteStaticCreateRevalidatesInsideCreatePVCCheckpoint(t *testing.T) {
+	t.Run("pv-mutated", func(t *testing.T) {
+		s, _, k := testService(t)
+		fakeController(k, false)
+		p, err := s.Prepare(context.Background(), staticCreateAction())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Execute(context.Background(), p, func(step string) error {
+			if step != "create-pvc" {
+				return nil
+			}
+			obj, gerr := k.Tracker().Get(pvGVR, "", "new-pv")
+			if gerr != nil {
+				return gerr
+			}
+			pv := obj.(*corev1.PersistentVolume).DeepCopy()
+			pv.Spec.NFS.Path = "/prepared/alice"
+			return k.Tracker().Update(pvGVR, pv, "")
+		})
+		if !errors.Is(err, ErrConflict) {
+			t.Fatalf("checkpoint-injected PV mutation not detected: %v", err)
+		}
+		assertPartialPVNoPVC(t, k, "new-pv", "new")
+	})
+	t.Run("overlap-injected", func(t *testing.T) {
+		s, _, k := testService(t)
+		fakeController(k, false)
+		p, err := s.Prepare(context.Background(), staticCreateAction())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Execute(context.Background(), p, func(step string) error {
+			if step != "create-pvc" {
+				return nil
+			}
+			competitor := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "competitor-pv", UID: "competitor-uid"}, Spec: corev1.PersistentVolumeSpec{StorageClassName: "approved", PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain, AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}, PersistentVolumeSource: corev1.PersistentVolumeSource{NFS: &corev1.NFSVolumeSource{Server: "nfs.example.test", Path: "/prepared/alice/data/sub"}}}, Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeAvailable}}
+			_, cerr := k.CoreV1().PersistentVolumes().Create(context.Background(), competitor, metav1.CreateOptions{})
+			return cerr
+		})
+		if err == nil || !strings.Contains(err.Error(), "already represented") {
+			t.Fatalf("checkpoint-injected overlap not detected: %v", err)
+		}
+		assertPartialPVNoPVC(t, k, "new-pv", "new")
+	})
+}
+
+// An empty CSI VolumeAttributes map is dropped by the apiserver on read-back
+// (omitempty), so the planned PV must not emit one or post-create identity
+// verification would falsely reject a correct create.
+func TestStaticCSITemplateWithoutAttributesSurvivesAPIServerRoundTrip(t *testing.T) {
+	s, _, _ := testService(t)
+	w, err := s.build(context.Background(), csiStaticCreateAction())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.pv.Spec.CSI.VolumeAttributes != nil {
+		t.Fatalf("empty attributes must be nil, got %#v", w.pv.Spec.CSI.VolumeAttributes)
+	}
+	raw, err := json.Marshal(w.pv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := &corev1.PersistentVolume{}
+	if err = json.Unmarshal(raw, actual); err != nil {
+		t.Fatal(err)
+	}
+	if !pvMatchesPlan(actual, w.pv) {
+		t.Fatal("round-tripped PV no longer matches the reviewed plan")
 	}
 }

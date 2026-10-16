@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -404,6 +403,9 @@ func TestLogoutProtectedAndRevokes(t *testing.T) {
 		if w.Code != tc.want {
 			t.Errorf("logout %+v: %d", tc, w.Code)
 		}
+		if tc.want == 303 && w.Header().Get("Location") != "/auth/signed-out" {
+			t.Errorf("logout must land on the signed-out page, got %q", w.Header().Get("Location"))
+		}
 	}
 	if w, _ := f.request("GET", "/", c, "", "", ""); w.Code != 401 {
 		t.Fatal("logout did not revoke")
@@ -425,19 +427,6 @@ func TestUnauthenticatedAndRateLimit(t *testing.T) {
 		f.a.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("spoofed headers accepted") })).ServeHTTP(w, r)
 		if w.Code != tc.want {
 			t.Fatal(tc, w.Code)
-		}
-	}
-	for n := 0; n < 11; n++ {
-		r := httptest.NewRequest("GET", "https://admin.example/auth/login", nil)
-		r.Header.Set("X-Forwarded-For", fmt.Sprint(n))
-		w := httptest.NewRecorder()
-		f.a.Login(w, r)
-		want := 303
-		if n == 10 {
-			want = 429
-		}
-		if w.Code != want {
-			t.Fatalf("rate limit request %d got %d", n, w.Code)
 		}
 	}
 }
@@ -553,6 +542,9 @@ func TestMethodsAndInitializationFailClosed(t *testing.T) {
 		func(c *config.Config) { c.Server.PublicURL = "https://admin.example/prefix" },
 		func(c *config.Config) { c.Server.PublicURL = "https://admin.example?query" },
 		func(c *config.Config) { c.Auth.ClientSecretFile = "" },
+		func(c *config.Config) { c.Auth.LoginSourceLimit = "trust" },
+		func(c *config.Config) { c.Auth.LoginSourceLimit = "forwarded" },
+		func(c *config.Config) { c.Auth.TrustedProxyCIDRs = []string{"10.0.0.1"} },
 	} {
 		cfg := f.a.cfg
 		mutate(&cfg)

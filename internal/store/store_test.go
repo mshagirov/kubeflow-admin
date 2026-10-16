@@ -48,7 +48,7 @@ func TestDurableRecordsAndSingleUse(t *testing.T) {
 func TestConcurrentClaimsAndIdempotency(t *testing.T) {
 	s := database(t)
 	ctx := context.Background()
-	plan := model.Plan{ID: "plan", Actor: "issuer|subject"}
+	plan := model.Plan{ID: "plan", Actor: "issuer|subject", Prepared: model.Prepared{Action: model.Action{Kind: "notebook.stop", Namespace: "alice", Name: "work"}}}
 	op := model.Operation{ID: "operation", Actor: plan.Actor, PlanID: plan.ID, Target: "notebook:alice/work", State: "queued", CreatedAt: time.Now()}
 	var wg sync.WaitGroup
 	for range 10 {
@@ -73,6 +73,12 @@ func TestConcurrentClaimsAndIdempotency(t *testing.T) {
 	if _, _, e := s.CreateOperation(ctx, next, otherPlan, "same-idempotency-key"); !errors.Is(e, ErrConflict) {
 		t.Fatal(e)
 	}
+	// Execution must be checkpointed before a success outcome is accepted.
+	op.State = "applying"
+	op.Step = "stop-notebook"
+	if e := s.Checkpoint(ctx, op, model.Audit{ID: "checkpoint"}); e != nil {
+		t.Fatal(e)
+	}
 	op.State = "succeeded"
 	if e := s.Finish(ctx, op, model.Audit{ID: "done", Result: op.State}); e != nil {
 		t.Fatal(e)
@@ -80,7 +86,7 @@ func TestConcurrentClaimsAndIdempotency(t *testing.T) {
 	if _, created, e := s.CreateOperation(ctx, next, otherPlan, "different-key-123"); e != nil || !created {
 		t.Fatal(created, e)
 	}
-	if rows, e := s.List(ctx, "audit", 10); e != nil || len(rows) != 3 {
+	if rows, e := s.List(ctx, "audit", 10); e != nil || len(rows) != 4 {
 		t.Fatal(len(rows), e)
 	}
 }

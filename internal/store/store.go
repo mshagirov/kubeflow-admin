@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -25,6 +26,25 @@ var ErrConflict = errors.New("operation conflicts with an existing request or lo
 
 // ErrLocked reports that another process already owns the database files.
 var ErrLocked = errors.New("database is already owned by another application")
+
+// ErrIntegrity reports durable operation state that cannot be reconciled
+// automatically without either releasing a lock without inspecting the cluster
+// or inventing audit history. Callers must fail closed and stop.
+var ErrIntegrity = errors.New("operation storage integrity error")
+
+// IntegrityError is a safe, actionable description of inconsistent durable
+// state. It intentionally carries only a short structural reason, never raw
+// record contents, tokens or user data.
+type IntegrityError struct {
+	Reason string
+}
+
+func (e *IntegrityError) Error() string {
+	return ErrIntegrity.Error() + ": " + e.Reason + "; stop writes, inspect the cluster and database, and reconcile with an operator before restarting"
+}
+func (e *IntegrityError) Unwrap() error { return ErrIntegrity }
+
+func integrity(reason string) error { return &IntegrityError{Reason: reason} }
 
 type Store struct {
 	db         *sql.DB
@@ -82,6 +102,15 @@ func OpenWithJournal(path, journal string, allowUnverifiedFilesystem bool) (*Sto
 		return fail(err)
 	}
 	if err := f.Close(); err != nil {
+		return fail(err)
+	}
+	// A pre-existing WAL/SHM/journal sidecar is opened by SQLite with the same
+	// initial flags as the main file, so a planted symlink or a sidecar that is
+	// not private could redirect or expose writes. SQLite creates new sidecars
+	// with the main file's 0600 permissions (verified by the permissive-umask
+	// regression test), so only pre-existing files need rejection here. The
+	// library must never change the process-global umask; main() sets 0077.
+	if err := verifyExistingSidecars(path); err != nil {
 		return fail(err)
 	}
 	u := url.URL{Scheme: "file", Path: path}
@@ -150,6 +179,28 @@ func privateFile(path string) (*os.File, error) {
 		return nil, errors.New("database and lock files must be private regular files (0600)")
 	}
 	return f, nil
+}
+
+// sidecarSuffixes are the SQLite journal/WAL shared-memory files that live next
+// to the main database. SQLite creates them with the main database's mode, so
+// they inherit 0600; only files that already exist before SQLite opens the
+// database can have been planted by another user.
+var sidecarSuffixes = []string{"-wal", "-shm", "-journal"}
+
+func verifyExistingSidecars(path string) error {
+	for _, suffix := range sidecarSuffixes {
+		info, err := os.Lstat(path + suffix)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+			return fmt.Errorf("SQLite %s file must be a private regular file created by the application (0600)", suffix)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -256,21 +307,91 @@ func (s *Store) Take(ctx context.Context, bucket, key string, out any) error {
 	return tx.Commit()
 }
 
-// CleanupAuth removes only expired/invalid authentication records. SQLite
-// performs the bounded-bucket scan directly; it cannot starve old records
-// behind List's newest-first limit. Audit and operation records are untouched.
+// CleanupAuth removes only expired/invalid authentication records. Malformed
+// rows are removed first because json_extract raises on invalid JSON and would
+// otherwise abort the whole delete, making every authenticated request fail
+// closed forever. Audit and operation records are untouched.
 func (s *Store) CleanupAuth(ctx context.Context, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM records WHERE
-	 (bucket='auth.attempts' AND COALESCE(julianday(json_extract(value,'$.expiresAt')),0)<=julianday(?)) OR
-	 (bucket='auth.sessions' AND (COALESCE(julianday(json_extract(value,'$.identity.expiresAt')),0)<=julianday(?) OR COALESCE(julianday(json_extract(value,'$.identity.authenticatedAt')),0)+15.0/1440<=julianday(?)))`, now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano))
-	return err
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	return s.cleanupRecords(ctx, []string{"auth.attempts", "auth.sessions"},
+		cleanupDelete{
+			query: `DELETE FROM records WHERE bucket='auth.attempts' AND json_valid(value)=1 AND COALESCE(julianday(json_extract(value,'$.expiresAt')),0)<=julianday(?)`,
+			args:  []any{stamp},
+		},
+		cleanupDelete{
+			query: `DELETE FROM records WHERE bucket='auth.sessions' AND json_valid(value)=1 AND (COALESCE(julianday(json_extract(value,'$.identity.expiresAt')),0)<=julianday(?) OR COALESCE(julianday(json_extract(value,'$.identity.authenticatedAt')),0)+15.0/1440<=julianday(?))`,
+			args:  []any{stamp, stamp},
+		},
+	)
 }
 
-// Targets locks both a PVC and its selected PV; using only PVName would allow
-// two queued operations to mutate the same PVC using different PV reservations.
-func Targets(p model.Plan, primary string) []string {
+// CleanupPlans removes expired or malformed preview plans. Plans are ephemeral
+// server-owned previews; operations, audit history and accepted idempotency
+// claims are never touched. Accepted retries resolve through operation_claims
+// (OperationForKey), so deleting an expired plan cannot lose an accepted task.
+func (s *Store) CleanupPlans(ctx context.Context, now time.Time) error {
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	return s.cleanupRecords(ctx, []string{"plans"},
+		cleanupDelete{
+			query: `DELETE FROM records WHERE bucket='plans' AND json_valid(value)=1 AND COALESCE(julianday(json_extract(value,'$.expiresAt')),0)<=julianday(?)`,
+			args:  []any{stamp},
+		},
+	)
+}
+
+type cleanupDelete struct {
+	query string
+	args  []any
+}
+
+// cleanupRecords deletes malformed rows (json_valid=0) in buckets and then runs
+// the bounded expiry deletes, all in one transaction. A malformed row can never
+// abort cleanup of the remaining records.
+func (s *Store) cleanupRecords(ctx context.Context, buckets []string, deletes ...cleanupDelete) error {
+	if len(buckets) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(buckets)), ",")
+	args := make([]any, 0, len(buckets))
+	for _, b := range buckets {
+		args = append(args, b)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `DELETE FROM records WHERE bucket IN (`+placeholders+`) AND json_valid(value)=0`, args...); err != nil {
+		return err
+	}
+	for _, d := range deletes {
+		if _, err = tx.ExecContext(ctx, d.query, d.args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// PrimaryTarget is the canonical lock name derived from the server-owned action.
+// It is the only primary target a caller may claim; accepting an arbitrary
+// caller primary would let a plan lock unrelated PVC/PV/object targets.
+func PrimaryTarget(a model.Action) string {
+	switch {
+	case strings.HasPrefix(a.Kind, "notebook."):
+		return "notebook:" + a.Namespace + "/" + a.Name
+	case strings.HasPrefix(a.Kind, "profile."):
+		return "profile:" + a.Name
+	default:
+		return "pvc:" + a.Namespace + "/" + a.Name
+	}
+}
+
+// Targets locks the canonical primary plus its selected PV; using only PVName
+// would allow two queued operations to mutate the same PVC using different PV
+// reservations.
+func Targets(p model.Plan) []string {
 	a := p.Prepared.Action
-	out := []string{primary}
+	out := []string{PrimaryTarget(a)}
 	add := func(v string) {
 		for _, old := range out {
 			if old == v {
@@ -279,17 +400,10 @@ func Targets(p model.Plan, primary string) []string {
 		}
 		out = append(out, v)
 	}
-	switch {
-	case strings.HasPrefix(a.Kind, "notebook."):
-		add("notebook:" + a.Namespace + "/" + a.Name)
-	case strings.HasPrefix(a.Kind, "profile."):
-		add("profile:" + a.Name)
-	default:
-		if a.Name != "" {
-			add("pvc:" + a.Namespace + "/" + a.Name)
-		}
-	}
-	if a.PVName != "" {
+	// PVName is meaningful only for these two actions. Other adapters ignore it;
+	// carrying an irrelevant field in an otherwise valid action must not acquire
+	// a lock on an unrelated PV (especially a needs-review lock).
+	if (a.Kind == "storage.create.static" || a.Kind == "pv.reserve-and-claim") && a.PVName != "" {
 		add("pv:" + a.PVName)
 	}
 	return out
@@ -299,6 +413,12 @@ func Targets(p model.Plan, primary string) []string {
 // affected targets, and writes the accepted operation plus audit record.
 func (s *Store) CreateOperation(ctx context.Context, op model.Operation, plan model.Plan, key string) (model.Operation, bool, error) {
 	if op.ID == "" || plan.ID == "" || op.PlanID != plan.ID || op.Actor == "" || op.Actor != plan.Actor || op.Target == "" || key == "" || op.State != "queued" {
+		return model.Operation{}, false, ErrConflict
+	}
+	// The primary target must be exactly the canonical target of the server-owned
+	// plan action. Derived targets (for example a reserved PV) never substitute an
+	// arbitrary caller-supplied primary.
+	if op.Target != PrimaryTarget(plan.Prepared.Action) {
 		return model.Operation{}, false, ErrConflict
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -332,7 +452,7 @@ func (s *Store) CreateOperation(ctx context.Context, op model.Operation, plan mo
 	if !errors.Is(err, sql.ErrNoRows) {
 		return op, false, err
 	}
-	for _, target := range Targets(plan, op.Target) {
+	for _, target := range Targets(plan) {
 		err = tx.QueryRowContext(ctx, `SELECT 1 FROM operation_targets WHERE target=? AND active=1`, target).Scan(&exists)
 		if err == nil {
 			return op, false, ErrConflict
@@ -344,7 +464,7 @@ func (s *Store) CreateOperation(ctx context.Context, op model.Operation, plan mo
 	if _, err = tx.ExecContext(ctx, `INSERT INTO operation_claims(id,actor,idem,plan_id,target) VALUES(?,?,?,?,?)`, op.ID, op.Actor, key, plan.ID, op.Target); err != nil {
 		return op, false, err
 	}
-	for _, target := range Targets(plan, op.Target) {
+	for _, target := range Targets(plan) {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO operation_targets(operation_id,target) VALUES(?,?)`, op.ID, target); err != nil {
 			return op, false, err
 		}
@@ -398,13 +518,20 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 	}
 	var currentBytes []byte
 	if err := tx.QueryRowContext(ctx, `SELECT value FROM records WHERE bucket='operations' AND key=?`, op.ID).Scan(&currentBytes); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return integrity("active operation claim has no operation record")
+		}
 		return err
 	}
 	var current model.Operation
 	if err := json.Unmarshal(currentBytes, &current); err != nil {
-		return err
+		return integrity("operation record is not readable JSON")
 	}
-	if current.State == "succeeded" || current.State == "failed" || current.State == "needs-review" {
+	// Only real lifecycle transitions are accepted. In particular a fresh
+	// queued operation cannot be reported succeeded without an applying
+	// checkpoint, while shutdown (queued->failed) and crash recovery
+	// (queued/applying->needs-review) remain valid.
+	if !allowedTransition(current.State, op.State, finish) {
 		return ErrConflict
 	}
 	// Identity/action metadata belongs to the original claim, not caller input.
@@ -418,11 +545,16 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 	audit.Time = op.UpdatedAt
 	var acceptedBytes []byte
 	if err := tx.QueryRowContext(ctx, `SELECT value FROM records WHERE bucket='audit' AND key=?`, op.ID+"-accepted").Scan(&acceptedBytes); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Never fabricate the immutable accepted reason/diff. Fail closed so an
+			// operator can restore or reconcile the exact history.
+			return integrity("operation " + op.ID + " is missing its immutable accepted audit record")
+		}
 		return err
 	}
 	var accepted model.Audit
 	if err := json.Unmarshal(acceptedBytes, &accepted); err != nil {
-		return err
+		return integrity("accepted audit record is not readable JSON")
 	}
 	audit.Reason = accepted.Reason
 	audit.Changes = accepted.Changes
@@ -445,6 +577,28 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 	return tx.Commit()
 }
 
+// allowedTransition reports whether a store update may move an operation from
+// its durable state to the requested state.
+func allowedTransition(from, to string, finish bool) bool {
+	if !finish {
+		// Checkpoints only advance a non-terminal operation to applying; repeats
+		// let a long operation record further verified steps.
+		return to == "applying" && (from == "queued" || from == "applying")
+	}
+	switch to {
+	case "succeeded":
+		// Success requires evidence that execution started and was checkpointed.
+		return from == "applying"
+	case "failed":
+		// Shutdown may account for accepted-but-unstarted work.
+		return from == "queued" || from == "applying"
+	case "needs-review":
+		// Crash recovery and uncertain execution retain locks for reconciliation.
+		return from == "queued" || from == "applying"
+	}
+	return false
+}
+
 func (s *Store) IncompleteOperations(ctx context.Context) ([]model.Operation, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT r.value FROM records r JOIN operation_claims c ON c.id=r.key WHERE r.bucket='operations' AND c.active=1`)
 	if err != nil {
@@ -464,6 +618,42 @@ func (s *Store) IncompleteOperations(ctx context.Context) ([]model.Operation, er
 		out = append(out, op)
 	}
 	return out, rows.Err()
+}
+
+// CheckIntegrity fails closed when durable operation state is internally
+// inconsistent: an active claim without its operation record, an active claim
+// whose operation is already terminal, an active claim without its immutable
+// accepted audit, or an active target lock with no active claim. Such state
+// cannot be repaired automatically without silently releasing locks or
+// inventing audit history, so the caller must stop for operator reconciliation.
+// Locks are never released and no records are synthesized here.
+func (s *Store) CheckIntegrity(ctx context.Context) error {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_claims c LEFT JOIN records r ON r.bucket='operations' AND r.key=c.id WHERE c.active=1 AND r.key IS NULL`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return integrity(fmt.Sprintf("%d active operation claim(s) have no operation record", n))
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_claims c JOIN records r ON r.bucket='operations' AND r.key=c.id WHERE c.active=1 AND json_valid(r.value)=1 AND json_extract(r.value,'$.state') IN ('succeeded','failed')`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return integrity(fmt.Sprintf("%d active operation claim(s) conflict with a terminal operation state", n))
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_claims c LEFT JOIN records a ON a.bucket='audit' AND a.key=c.id||'-accepted' WHERE c.active=1 AND a.key IS NULL`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return integrity(fmt.Sprintf("%d active operation claim(s) are missing their accepted audit record", n))
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_targets t LEFT JOIN operation_claims c ON c.id=t.operation_id WHERE t.active=1 AND (c.id IS NULL OR c.active!=1)`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return integrity(fmt.Sprintf("%d active target lock(s) have no active operation claim", n))
+	}
+	return nil
 }
 func (s *Store) OperationForKey(ctx context.Context, actor, key, planID string) (model.Operation, error) {
 	var b []byte

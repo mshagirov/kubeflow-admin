@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"kubeflow-admin/internal/kube"
 	"kubeflow-admin/internal/model"
 	"kubeflow-admin/internal/store"
 )
@@ -216,15 +218,8 @@ func TestConcurrentAcceptanceExecutesOnce(t *testing.T) {
 
 func TestPersistedErrorsNeverIncludeBackendDetails(t *testing.T) {
 	secret := "ADMISSION_ENV_VALUE=totally-private-value /private/config/provider-error"
-	b := &fakeBackend{prepare: func(context.Context, model.Action) (model.Prepared, error) {
-		return model.Prepared{}, errors.New(secret)
-	}}
+	b := &fakeBackend{execute: func(context.Context, model.Prepared, func(string) error) error { return errors.New(secret) }}
 	m, _, actor := setup(t, b)
-	if _, err := m.Plan(context.Background(), actor, model.Action{}); err == nil || strings.Contains(err.Error(), "private") {
-		t.Fatal("preview leaked backend detail", err)
-	}
-	b.prepare = nil
-	b.execute = func(context.Context, model.Prepared, func(string) error) error { return errors.New(secret) }
 	op := accept(t, m, actor, "error")
 	got := waitOperation(t, m, op.ID)
 	if got.State != "needs-review" || strings.Contains(got.Error, "private") || strings.Contains(got.Error, "ADMISSION") {
@@ -243,11 +238,147 @@ func TestPersistedErrorsNeverIncludeBackendDetails(t *testing.T) {
 	}
 }
 
+// A real Manager must not swallow Prepare errors: the HTTP boundary classifies
+// them with errors.Is and its authored-message allowlist. Replacing the backend
+// error with a fixed message would make every classification impossible while
+// the boundary still fails closed for unknown text.
+func TestPlanPreservesPrepareErrorForBoundaryClassification(t *testing.T) {
+	sentinel := errors.New("stale-preview-sentinel")
+	authored := errors.New("protected workspace mount cannot be removed")
+	b := &fakeBackend{prepare: func(context.Context, model.Action) (model.Prepared, error) {
+		return model.Prepared{}, fmt.Errorf("wrapped: %w: %w", sentinel, authored)
+	}}
+	m, _, actor := setup(t, b)
+	action := model.Action{Kind: "notebook.edit", Namespace: "alice", Name: "lab"}
+	_, err := m.Plan(context.Background(), actor, action)
+	if !errors.Is(err, sentinel) {
+		t.Fatal("prepare error identity lost", err)
+	}
+	if !strings.Contains(err.Error(), authored.Error()) {
+		t.Fatal("authored message not preserved for the web allowlist", err)
+	}
+	// The structured stale-plan sentinel and cancellation identity survive too.
+	b.prepare = func(context.Context, model.Action) (model.Prepared, error) {
+		return model.Prepared{}, fmt.Errorf("stale: %w", kube.ErrConflict)
+	}
+	if _, err := m.Plan(context.Background(), actor, action); !errors.Is(err, kube.ErrConflict) {
+		t.Fatal("stale-plan sentinel not preserved", err)
+	}
+	b.prepare = func(context.Context, model.Action) (model.Prepared, error) { return model.Prepared{}, context.Canceled }
+	if _, err := m.Plan(context.Background(), actor, action); !errors.Is(err, context.Canceled) {
+		t.Fatal("cancellation identity lost", err)
+	}
+}
+
+// Preview housekeeping deletes only expired/malformed plans and never touches
+// accepted operations or audit history. A retry still resolves through the
+// durable claim even after its plan row is gone.
+func TestExpiredPlanCleanupIsBoundedAndPreservesAcceptedWork(t *testing.T) {
+	m, s, actor := setup(t, &fakeBackend{})
+	ctx := context.Background()
+	stale, err := m.Plan(ctx, actor, model.Action{Kind: "notebook.stop", Namespace: "alice", Name: "stale"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := m.Plan(ctx, actor, model.Action{Kind: "notebook.stop", Namespace: "alice", Name: "live"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := m.Submit(ctx, actor, live.ID, "idempotency-key-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := waitOperation(t, m, op.ID); got.State != "succeeded" {
+		t.Fatal(got)
+	}
+	for _, p := range []model.Plan{stale, live} {
+		p.ExpiresAt = time.Now().Add(-time.Hour)
+		if err := s.Put(ctx, "plans", p.ID, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A plan-shaped row with no usable expiry is invalid and removed too.
+	if err := s.Put(ctx, "plans", "malformed", "not-a-plan"); err != nil {
+		t.Fatal(err)
+	}
+	// Allow the next preview to run the bounded housekeeping.
+	m.cleanupMu.Lock()
+	m.lastPlanCleanup = time.Time{}
+	m.cleanupMu.Unlock()
+	if _, err := m.Plan(ctx, actor, model.Action{Kind: "notebook.stop", Namespace: "alice", Name: "fresh"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{stale.ID, live.ID, "malformed"} {
+		var p model.Plan
+		if err := s.Get(ctx, "plans", id, &p); !errors.Is(err, store.ErrNotFound) {
+			t.Fatal("expired plan not cleaned", id, err)
+		}
+	}
+	// Accepted idempotent retry still works with no plan row.
+	again, err := m.Submit(ctx, actor, live.ID, "idempotency-key-live")
+	if err != nil || again.ID != op.ID {
+		t.Fatal(again, err)
+	}
+	// Operations and audit history are never TTL-cleaned.
+	if _, err := m.Get(ctx, op.ID); err != nil {
+		t.Fatal("operation was cleaned", err)
+	}
+	audit, err := m.Audit(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audit) == 0 {
+		t.Fatal("audit history was cleaned")
+	}
+	// Bounded frequency: an immediate second preview does not run cleanup again.
+	if err := s.Put(ctx, "plans", "sneaky", model.Plan{ID: "sneaky", ExpiresAt: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Plan(ctx, actor, model.Action{Kind: "notebook.stop", Namespace: "alice", Name: "second"}); err != nil {
+		t.Fatal(err)
+	}
+	var sneaky model.Plan
+	if err := s.Get(ctx, "plans", "sneaky", &sneaky); err != nil {
+		t.Fatal("cleanup ignored its bounded frequency", err)
+	}
+}
+
 func TestSecondManagerCannotRecoverLiveWorker(t *testing.T) {
 	m, s, _ := setup(t, &fakeBackend{})
 	if other, err := newManager(context.Background(), m.cfg, s, &fakeBackend{}); err == nil {
 		other.Close()
 		t.Fatal("second manager acquired live database")
+	}
+}
+
+// Startup must reject orphaned active claims with a typed integrity error,
+// preserve their locks, and never silently unlock or invent audit history.
+func TestStartupFailsClosedOnOrphanedActiveClaim(t *testing.T) {
+	m, s, actor := setup(t, &fakeBackend{})
+	m.Close()
+	ctx := context.Background()
+	p := model.Plan{ID: "orphan-plan", Actor: actor.Key(), Prepared: model.Prepared{Action: model.Action{Kind: "notebook.stop", Namespace: "alice", Name: "orphan"}}}
+	op := model.Operation{ID: "orphan-op", PlanID: p.ID, Actor: p.Actor, Target: "notebook:alice/orphan", State: "queued"}
+	if _, _, err := s.CreateOperation(ctx, op, p, "orphan-idempotency-key"); err != nil {
+		t.Fatal(err)
+	}
+	// Remove only the operation record; the active claim and target lock remain.
+	if err := s.Delete(ctx, "operations", op.ID); err != nil {
+		t.Fatal(err)
+	}
+	next, err := newManager(ctx, m.cfg, s, &fakeBackend{})
+	if err == nil {
+		next.Close()
+		t.Fatal("startup accepted an orphaned active claim")
+	}
+	if !errors.Is(err, store.ErrIntegrity) {
+		t.Fatal("expected typed integrity error", err)
+	}
+	// Fail closed: a fresh request for the same canonical target is still locked.
+	newPlan := model.Plan{ID: "new-plan", Actor: p.Actor, Prepared: p.Prepared}
+	fresh := model.Operation{ID: "new-op", PlanID: newPlan.ID, Actor: p.Actor, Target: "notebook:alice/orphan", State: "queued"}
+	if _, _, err := s.CreateOperation(ctx, fresh, newPlan, "new-idempotency-key1"); !errors.Is(err, store.ErrConflict) {
+		t.Fatal("orphan lock was silently released", err)
 	}
 }
 

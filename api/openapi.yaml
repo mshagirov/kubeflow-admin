@@ -20,6 +20,14 @@ paths:
     $ref: '#/paths/~1auth~1login'
   /callback:
     $ref: '#/paths/~1auth~1callback'
+  /auth/signed-out:
+    get:
+      security: []
+      summary: Public signed-out page with an explicit sign-in link
+      responses:
+        '200': {description: 'Script-free static HTML; no session required'}
+  /signed-out:
+    $ref: '#/paths/~1auth~1signed-out'
   /healthz:
     get:
       security: []
@@ -38,7 +46,9 @@ paths:
       security: []
       summary: Start single-use OIDC authorization-code/PKCE login
       responses:
-        '302': {description: Redirect to provider; sets browser binding cookie}
+        '303': {description: Redirect to provider; sets browser binding cookie}
+        '429': {description: Login attempt rate limit exceeded}
+        '500': {description: 'Safe authentication failure, possibly plain text'}
         '503': {description: 'Safe authentication failure, possibly plain text'}
   /auth/callback:
     get:
@@ -49,8 +59,9 @@ paths:
         - {name: state, in: query, schema: {type: string}}
         - {name: error, in: query, schema: {type: string}}
       responses:
-        '302': {description: Redirect to console; sets secure host-only session cookie}
+        '303': {description: Redirect to console; sets secure host-only session cookie}
         '400': {description: Invalid callback; safe plain-text authentication error}
+        '401': {description: Token exchange or ID-token validation failed}
         '403': {description: Identity not authorized}
         '503': {description: Identity provider or session store unavailable}
   /logout:
@@ -60,9 +71,12 @@ paths:
         - {$ref: '#/components/parameters/CSRF'}
         - {$ref: '#/components/parameters/Origin'}
       responses:
-        '303': {description: Session cleared; redirect to login}
+        '303': {description: Session cleared; redirect to /auth/signed-out}
         '401': {description: Session required}
         '403': {description: Same-origin/CSRF check failed}
+        '503': {description: Session store unavailable}
+  /auth/logout:
+    $ref: '#/paths/~1logout'
   /api/v1/me:
     get:
       summary: Current administrator identity and CSRF token
@@ -123,6 +137,22 @@ paths:
     get:
       <<: *inventory
       summary: ResourceQuota projections
+  /api/v1/limit-ranges:
+    get:
+      <<: *inventory
+      summary: LimitRange projections (names, no raw spec)
+  /api/v1/role-bindings:
+    get:
+      <<: *inventory
+      summary: RoleBinding projections (role reference only)
+  /api/v1/statefulsets:
+    get:
+      <<: *inventory
+      summary: StatefulSet projections (notebook controller children)
+  /api/v1/nodes:
+    get:
+      <<: *inventory
+      summary: Node projections (advertised extended-resource allocatable, no addresses)
   /api/v1/plans:
     post:
       summary: Prepare typed action, validate dependencies and server dry-run
@@ -259,19 +289,25 @@ components:
           schema: {$ref: '#/components/schemas/Inventory'}
     Error:
       description: >-
-        Safe failure. Handler errors are JSON with error string; authentication,
-        CSRF and standard HTTP routing failures may be plain text. No stable
-        machine error code, field-error or retryability contract is implemented.
+        Safe failure. Handler errors are JSON with a structured error object;
+        authentication, CSRF and standard HTTP routing failures may be plain text.
       content:
         application/json:
           schema:
             type: object
             required: [error]
             properties:
-              error: {type: string}
+              error: {$ref: '#/components/schemas/APIError'}
         text/plain:
           schema: {type: string}
   schemas:
+    APIError:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code: {type: string, description: 'Stable machine code, e.g. validation_failed'}
+        message: {type: string}
+        retryable: {type: boolean}
     Identity:
       type: object
       required: [issuer, subject, email, groups, authenticatedAt, expiresAt]

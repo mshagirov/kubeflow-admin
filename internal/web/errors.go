@@ -8,6 +8,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"kubeflow-admin/internal/auth"
 	"kubeflow-admin/internal/kube"
 	"kubeflow-admin/internal/store"
 )
@@ -42,6 +43,11 @@ func backendFailure(w http.ResponseWriter, err error, validation bool) {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		failure(w, 503, "request_timeout", "The request timed out. Refresh inventory or check Operations before retrying a submission with the same idempotency key.", true)
 		return
+	case errors.Is(err, auth.ErrSessionInvalid):
+		// The worker boundary returns auth.ErrSessionInvalid unchanged; match it
+		// by identity so wrapping or message changes cannot misroute this.
+		failure(w, 403, "reauthentication_required", "Fresh administrator authentication is required. Sign in again before preparing a new plan.", false)
+		return
 	}
 	message := err.Error()
 	switch message {
@@ -51,8 +57,6 @@ func backendFailure(w http.ResponseWriter, err error, validation bool) {
 		failure(w, 503, "cluster_access_denied", "Kubernetes denied the request. Ask the operator to check the application's RBAC and cluster admission policy.", false)
 	case "Kubernetes API rejected validation or conditional patch":
 		failure(w, 422, "cluster_validation_failed", "Kubernetes rejected validation or the conditional patch. Check quantities, admission policy and installed API compatibility, then refresh and prepare again.", false)
-	case "fresh administrator authentication required", "writes disabled or fresh administrator authentication required":
-		failure(w, 403, "reauthentication_required", "Fresh administrator authentication is required and writes must be enabled. Sign in again before preparing a new plan.", false)
 	case "plan belongs to a different actor":
 		failure(w, 403, "plan_actor_mismatch", "This plan belongs to another administrator. Prepare a plan in your own session.", false)
 	case "plan expired; preview again":
@@ -104,6 +108,7 @@ unsupported action kind
 a positive Kubernetes quantity is required
 nonempty quota required; removing quotas is unsupported
 unsupported quota resource
+changing an unsupported quota key is unsupported
 exact nonempty owner identity required
 Profile must have a namespace-compatible name
 existing namespaces cannot be adopted

@@ -8,10 +8,10 @@ import (
 )
 
 const beegfsMagic = 0x19830326
+const overlayfsMagic = 0x794C7630
 
 // localFilesystems are known local, durable filesystems acceptable for the
-// application database. overlayfs is accepted because containerized test and
-// development roots (kind, minikube, Docker) store data there.
+// application database.
 var localFilesystems = map[uint32]bool{
 	0xEF53:     true, // ext2/ext3/ext4
 	0x58465342: true, // XFS
@@ -20,7 +20,6 @@ var localFilesystems = map[uint32]bool{
 	0x3153464A: true, // JFS
 	0x52654973: true, // ReiserFS
 	0x2FC12FC1: true, // ZFS
-	0x794C7630: true, // overlayfs
 	0xCA451A4E: true, // bcachefs
 	0x5346544E: true, // NTFS
 }
@@ -67,6 +66,13 @@ func checkFilesystemType(fs uint32, journal string, allowUnverified bool) (bool,
 		if !allowUnverified {
 			return true, fmt.Errorf("BeeGFS requires database.allowUnverifiedFilesystem: true after the storage operator verifies global file locks and remote fsync")
 		}
+		return true, nil
+	}
+	if fs == overlayfsMagic {
+		// Containerized development and CI roots are commonly overlayfs. It is
+		// accepted so those tests run, but its durability and cross-node locking
+		// are not proven, so report it unverified and warn rather than pretending
+		// it is verified local storage.
 		return true, nil
 	}
 	if localFilesystems[fs] {

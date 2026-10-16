@@ -8,6 +8,8 @@ A single Go service for OIDC-authorized Kubeflow administrators: cross-profile i
 
 Install a supported Go toolchain (module requires Go 1.26+; the pinned container toolchain is newer), Kustomize 5, Python 3 and PyYAML (`python3 -m pip install PyYAML` in a virtual environment).
 
+If using the repository's `.venv`, activate it first (`source .venv/bin/activate`), so `make` uses the Python interpreter that has PyYAML installed.
+
 ```sh
 make test
 make vet
@@ -40,15 +42,15 @@ kubectl apply -f deploy/base/namespace.yaml
 kubectl -n kubeflow-admin create secret generic kubeflow-admin-oidc \
   --from-file=client-secret=/secure/local/path/oidc-client-secret
 
-# 4. Use the republished muratshagirov/kubeflow-admin:0.1.0 image.
-#    Pin sha256:19f3eba52e65952c6812a24c061e0e0bce2e38a4308e48e9cd9ca1549a25ef7d
-#    in your site overlay; see docs/deployment.md.
+# 4. Build, publish and scan the reviewed source, then pin its fresh registry
+#    digest in the site overlay; see docs/deployment.md (make image-push).
+#    The historical published 0.1.0 image does NOT include these review fixes.
 kustomize build deploy/site > rendered.yaml   # review: no REPLACE/.invalid values remain
 kubectl apply -f rendered.yaml
 kubectl -n kubeflow-admin rollout status deployment/kubeflow-admin --timeout=180s
 ```
 
-Then: log in as an admin over HTTPS, confirm a non-admin is denied, compare inventory with `kubectl`, and only afterward enable write features and the matching RBAC overlay for a disposable pilot namespace. The existing `kubeflow/kubeflow-gateway` is HTTP-only, so a dedicated HTTPS route is required before login works.
+Then: log in as an admin over HTTPS, confirm a non-admin is denied, compare inventory with `kubectl`, and only afterward enable write features and the matching RBAC overlay for a disposable pilot namespace. The existing `kubeflow/kubeflow-gateway` is HTTP-only, so a dedicated HTTPS route is required before login works. Logout returns to the public `/auth/signed-out` page; login rate limiting defaults to `auth.loginSourceLimit: global`, and `forwarded` requires `auth.trustedProxyCIDRs` (see [deployment](docs/deployment.md), section 5).
 
 ## Deployment and operations
 

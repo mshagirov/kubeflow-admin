@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"gopkg.in/yaml.v3"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -33,6 +34,17 @@ type Auth struct {
 	AdminSubjects    []string `yaml:"adminSubjects"`
 	Scopes           []string `yaml:"scopes"`
 	SessionMinutes   int      `yaml:"sessionMinutes"`
+	// LoginSourceLimit selects how the per-source login (not write) limiter keys
+	// requests. Empty or "global" applies only the bounded global budget, which
+	// is the fail-safe default for the shipped reverse-proxy deployment where
+	// every request may share one peer address. "peer" keys by the immediate
+	// peer address and is only safe when the process is directly exposed.
+	// "forwarded" keys by a client address derived from X-Forwarded-For, and
+	// only when the immediate peer is inside TrustedProxyCIDRs.
+	LoginSourceLimit string `yaml:"loginSourceLimit"`
+	// TrustedProxyCIDRs lists the reverse proxies whose X-Forwarded-For is
+	// trusted in "forwarded" mode. Every entry must be valid CIDR notation.
+	TrustedProxyCIDRs []string `yaml:"trustedProxyCIDRs"`
 }
 type Kubernetes struct {
 	Kubeconfig            string `yaml:"kubeconfig"`
@@ -130,6 +142,19 @@ func (c Config) Validate() error {
 	if c.Auth.SessionMinutes < 1 || c.Auth.SessionMinutes > 15 {
 		return fmt.Errorf("sessionMinutes must be 1..15; re-login refreshes authorization")
 	}
+	switch c.Auth.LoginSourceLimit {
+	case "", "global", "peer", "forwarded":
+	default:
+		return fmt.Errorf("loginSourceLimit must be one of global, peer or forwarded")
+	}
+	for _, s := range c.Auth.TrustedProxyCIDRs {
+		if _, _, e := net.ParseCIDR(strings.TrimSpace(s)); e != nil {
+			return fmt.Errorf("trustedProxyCIDRs must contain valid CIDR ranges")
+		}
+	}
+	if c.Auth.LoginSourceLimit == "forwarded" && len(c.Auth.TrustedProxyCIDRs) == 0 {
+		return fmt.Errorf("forwarded loginSourceLimit requires trustedProxyCIDRs")
+	}
 	if c.Database.Path == "" {
 		return fmt.Errorf("database path required")
 	}
@@ -141,7 +166,7 @@ func (c Config) Validate() error {
 	}
 	names := map[string]bool{}
 	for _, t := range c.Storage.NFSTemplates {
-		if t.Name == "" || names[t.Name] || t.Server == "" || !strings.HasPrefix(t.BasePath, "/") || len(t.AccessModes) == 0 {
+		if t.Name == "" || names[t.Name] || t.Server == "" || !validNFSBasePath(t.BasePath) || len(t.AccessModes) == 0 {
 			return fmt.Errorf("invalid or duplicate NFS storage template")
 		}
 		names[t.Name] = true

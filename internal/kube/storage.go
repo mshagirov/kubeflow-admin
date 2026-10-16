@@ -177,7 +177,7 @@ func (s *Service) prepareStorage(ctx context.Context, a model.Action, w *work) e
 		}
 		w.delayed = c.VolumeBindingMode != nil && *c.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer
 		if w.delayed {
-			w.prepared.Warnings = append(w.prepared.Warnings, "WaitForFirstConsumer: Pending is expected until a consuming Pod is scheduled.")
+			w.prepared.Warnings = append(w.prepared.Warnings, "WaitForFirstConsumer: the claim is created but stays Pending until a consuming Pod is scheduled. Pending is not evidence that storage will be provisioned or that backend capacity exists; verify provisioning separately.")
 		}
 		if c.ReclaimPolicy != nil {
 			w.prepared.Warnings = append(w.prepared.Warnings, "StorageClass reclaim policy: "+string(*c.ReclaimPolicy))
@@ -240,7 +240,7 @@ func (s *Service) prepareStorage(ctx context.Context, a model.Action, w *work) e
 		if sub == "" || sub == "." || sub == ".." || path.IsAbs(sub) || path.Clean(sub) != sub || strings.Contains(sub, "\\") || strings.HasPrefix(sub, "../") {
 			return errors.New("canonical nonempty relative NFS subdirectory required")
 		}
-		if t.Server == "" || !path.IsAbs(t.BasePath) || path.Clean(t.BasePath) != t.BasePath {
+		if t.Server == "" || !path.IsAbs(t.BasePath) || path.Clean(t.BasePath) != t.BasePath || path.Clean(t.BasePath) == "/" {
 			return errors.New("invalid approved NFS template")
 		}
 		joined := path.Join(t.BasePath, sub)
@@ -264,9 +264,15 @@ func (s *Service) prepareStorage(ctx context.Context, a model.Action, w *work) e
 		if t.Driver == "" || t.VolumeHandle == "" || a.Subdirectory != "" || t.StorageClass != a.StorageClass || !has(t.AccessModes, a.AccessMode) {
 			return errors.New("invalid or incompatible fixed CSI template")
 		}
-		attrs := map[string]string{}
-		for k, v := range t.VolumeAttributes {
-			attrs[k] = v
+		// Keep the exact reviewed attributes. Do not emit an empty non-nil map:
+		// the apiserver drops it via omitempty on read-back, which would then
+		// differ from the planned spec during post-create identity verification.
+		var attrs map[string]string
+		if len(t.VolumeAttributes) > 0 {
+			attrs = make(map[string]string, len(t.VolumeAttributes))
+			for k, v := range t.VolumeAttributes {
+				attrs[k] = v
+			}
 		}
 		v.Spec.CSI = &corev1.CSIPersistentVolumeSource{Driver: t.Driver, VolumeHandle: t.VolumeHandle, VolumeAttributes: attrs}
 	}
@@ -313,7 +319,7 @@ func sameBackend(a, b *corev1.PersistentVolume) bool {
 func (s *Service) approvedExistingVolume(v *corev1.PersistentVolume) error {
 	if v.Spec.NFS != nil {
 		for _, t := range s.Config.Storage.NFSTemplates {
-			if t.Server == v.Spec.NFS.Server && !v.Spec.NFS.ReadOnly && t.StorageClass == v.Spec.StorageClassName && path.IsAbs(t.BasePath) && path.Clean(v.Spec.NFS.Path) == v.Spec.NFS.Path && v.Spec.NFS.Path != path.Clean(t.BasePath) && pathWithin(t.BasePath, v.Spec.NFS.Path) && equalStrings(v.Spec.MountOptions, t.MountOptions) && modesApproved(v.Spec.AccessModes, t.AccessModes) {
+			if t.Server == v.Spec.NFS.Server && !v.Spec.NFS.ReadOnly && t.StorageClass == v.Spec.StorageClassName && path.IsAbs(t.BasePath) && path.Clean(t.BasePath) == t.BasePath && path.Clean(t.BasePath) != "/" && path.Clean(v.Spec.NFS.Path) == v.Spec.NFS.Path && v.Spec.NFS.Path != path.Clean(t.BasePath) && pathWithin(t.BasePath, v.Spec.NFS.Path) && equalStrings(v.Spec.MountOptions, t.MountOptions) && modesApproved(v.Spec.AccessModes, t.AccessModes) {
 				return nil
 			}
 		}
@@ -426,6 +432,9 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		if err := checkpoint(cp, "expand-pvc"); err != nil {
 			return err
 		}
+		if err := s.revalidateClass(ctx, *w.pvc.Spec.StorageClassName, w); err != nil {
+			return err
+		}
 		p, err := s.Typed.CoreV1().PersistentVolumeClaims(a.Namespace).Patch(ctx, a.Name, types.JSONPatchType, b, metav1.PatchOptions{})
 		if err != nil {
 			return safe(err)
@@ -452,8 +461,24 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		})
 	}
 	var reserved *corev1.PersistentVolume
-	if a.Kind == "storage.create.static" {
+	static := a.Kind == "storage.create.static"
+	if static {
 		if err := checkpoint(cp, "create-reserved-pv"); err != nil {
+			return err
+		}
+		// Revalidate immediately before the write. An external privileged writer or
+		// a second application instance with an independent database can inject an
+		// overlapping backend or change the approved class after the plan was built
+		// and even after this checkpoint. relist is honest scoped detection, not an
+		// atomic guarantee: two clients can still pass this and create distinct PVs
+		// for one backend. Closing that window requires cluster admission/registry
+		// coordination, not an invented atomic list+create. We deliberately relist
+		// and compare backend identity instead of the recorded PersistentVolumeList
+		// digest, which our own create would always invalidate.
+		if err := s.revalidateClass(ctx, a.StorageClass, w); err != nil {
+			return err
+		}
+		if err := s.assertNoOverlap(ctx, w.pv, w.pv.Name); err != nil {
 			return err
 		}
 		v, err := s.Typed.CoreV1().PersistentVolumes().Create(ctx, w.pv, metav1.CreateOptions{})
@@ -467,6 +492,9 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		if err := checkpoint(cp, "reserve-pv"); err != nil {
 			return err
 		}
+		if err := s.revalidateClass(ctx, a.StorageClass, w); err != nil {
+			return err
+		}
 		v, err := s.Typed.CoreV1().PersistentVolumes().Patch(ctx, w.pv.Name, types.JSONPatchType, b, metav1.PatchOptions{})
 		if err != nil {
 			return safe(err)
@@ -474,19 +502,23 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		reserved = v
 	}
 	if reserved != nil {
-		if err := s.checkEvidence(ctx, a.Namespace, w.ev); err != nil {
+		// Post-write, pre-PVC validation. Policy dependencies are rechecked, the
+		// object we just wrote is re-read and compared to the reviewed plan, and
+		// (for a newly created PV) the backend overlap relist excludes our own PV.
+		// A failure here leaves the PV/claimRef in place with no PVC, so the
+		// operation stops in needs-review for explicit reconciliation.
+		if err := s.prePVCValidation(ctx, a, w, reserved, static); err != nil {
 			return err
-		}
-		v, err := s.Typed.CoreV1().PersistentVolumes().Get(ctx, reserved.Name, metav1.GetOptions{})
-		if err != nil {
-			return safe(err)
-		}
-		r := v.Spec.ClaimRef
-		if v.UID != reserved.UID || v.DeletionTimestamp != nil || r == nil || r.Name != a.Name || r.Namespace != a.Namespace || r.UID != "" {
-			return ErrConflict
 		}
 	}
 	if err := checkpoint(cp, "create-pvc"); err != nil {
+		return err
+	}
+	// The checkpoint performs durable storage and authorization work. Re-run the
+	// scoped checks after it and immediately before the PVC write so a class,
+	// overlap or PV mutation injected during the checkpoint cannot escape. The
+	// checkpoint still precedes this write, preserving durable-before-write.
+	if err := s.prePVCValidation(ctx, a, w, reserved, static); err != nil {
 		return err
 	}
 	p, err := s.Typed.CoreV1().PersistentVolumeClaims(a.Namespace).Create(ctx, w.pvc, metav1.CreateOptions{})
@@ -550,4 +582,144 @@ func (s *Service) quotaObserved(ctx context.Context, ns string, desired map[stri
 		}
 	}
 	return false, nil
+}
+
+// evidenceDep returns the recorded dependency for kind/namespace/name.
+func evidenceDep(e evidence, kind, ns, nm string) (reference, bool) {
+	for _, r := range e.Dependencies {
+		if r.Kind == kind && r.Namespace == ns && r.Name == nm {
+			return r, true
+		}
+	}
+	return reference{}, false
+}
+
+// revalidateClass confirms the approved StorageClass is unchanged since the
+// reviewed plan immediately before a dependent write. A changed or deleted class
+// must conflict rather than silently bind storage to changed semantics.
+func (s *Service) revalidateClass(ctx context.Context, className string, w *work) error {
+	if className == "" {
+		return nil
+	}
+	fresh := s.newEvidence()
+	if _, err := s.class(ctx, className, &fresh); err != nil {
+		return err
+	}
+	want, ok := evidenceDep(w.ev, "StorageClass", "", className)
+	if !ok {
+		return ErrConflict
+	}
+	got, ok := evidenceDep(fresh, "StorageClass", "", className)
+	if !ok || got.Digest != want.Digest {
+		return ErrConflict
+	}
+	return nil
+}
+
+// assertNoOverlap rejects any other PV that represents the same backing storage
+// as planned. own is the PV this operation creates or reserves and is excluded
+// because after our own write it is present in the list. This is honest scoped
+// detection, not an atomic guarantee: list+create is not atomic across clients,
+// so a competing privileged writer can still interleave. Enforcing uniqueness
+// requires cluster admission/registry coordination; callers must surface a
+// partial PV for review rather than assume the write was atomic.
+func (s *Service) assertNoOverlap(ctx context.Context, planned *corev1.PersistentVolume, own string) error {
+	all, err := s.Typed.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return safe(err)
+	}
+	for i := range all.Items {
+		other := &all.Items[i]
+		if other.Name == own {
+			continue
+		}
+		if sameBackend(planned, other) {
+			return errors.New("backing storage is already represented by a PV")
+		}
+	}
+	return nil
+}
+
+// sameCapacity compares ResourceLists by quantity value, avoiding reflect.DeepEqual
+// on resource.Quantity's cached string.
+func sameCapacity(a, b corev1.ResourceList) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok || av.Cmp(bv) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// pvMatchesPlan compares the observed PV against the reviewed plan. ClaimRef is
+// excluded because it is the reservation identity and is checked separately by
+// verifyReservedPV; capacity is compared as a canonical quantity list via
+// sameCapacity. Every other spec field (the exact NFS/CSI volume source
+// including attributes/FSType/readOnly/SecretRefs, access modes, class, reclaim
+// policy, volume mode, node affinity and mount options) must match exactly, so a
+// mutation between plan and observation is rejected instead of being accepted as
+// a merely "overlapping" backend.
+func pvMatchesPlan(actual, planned *corev1.PersistentVolume) bool {
+	if !sameCapacity(actual.Spec.Capacity, planned.Spec.Capacity) {
+		return false
+	}
+	a := actual.Spec.DeepCopy()
+	p := planned.Spec.DeepCopy()
+	a.ClaimRef = nil
+	p.ClaimRef = nil
+	a.Capacity = nil
+	p.Capacity = nil
+	return same(*a, *p)
+}
+
+// prePVCValidation re-runs the scoped checks that must hold immediately before
+// the PVC write. checkEvidence covers namespace/Profile/quota/LimitRange policy,
+// revalidateClass covers the approved StorageClass for every storage kind, and
+// assertNoOverlap/verifyReservedPV cover backend uniqueness and exact PV
+// identity for a newly created or reserved PV.
+func (s *Service) prePVCValidation(ctx context.Context, a model.Action, w *work, reserved *corev1.PersistentVolume, static bool) error {
+	if reserved != nil {
+		if err := s.checkEvidence(ctx, a.Namespace, w.ev); err != nil {
+			return err
+		}
+	}
+	if err := s.revalidateClass(ctx, a.StorageClass, w); err != nil {
+		return err
+	}
+	if static && reserved != nil {
+		if err := s.assertNoOverlap(ctx, w.pv, reserved.Name); err != nil {
+			return err
+		}
+	}
+	if reserved != nil {
+		if err := s.verifyReservedPV(ctx, a, w, reserved); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verifyReservedPV re-reads the PV we just created or reserved and confirms it was
+// neither replaced nor mutated, and that its reservation identity still points at
+// the planned claim with no bound UID yet.
+func (s *Service) verifyReservedPV(ctx context.Context, a model.Action, w *work, reserved *corev1.PersistentVolume) error {
+	v, err := s.Typed.CoreV1().PersistentVolumes().Get(ctx, reserved.Name, metav1.GetOptions{})
+	if err != nil {
+		return safe(err)
+	}
+	if v.UID != reserved.UID || v.DeletionTimestamp != nil {
+		return ErrConflict
+	}
+	if !pvMatchesPlan(v, w.pv) {
+		return ErrConflict
+	}
+	r := v.Spec.ClaimRef
+	if r == nil || r.Name != a.Name || r.Namespace != a.Namespace || r.UID != "" {
+		return ErrConflict
+	}
+	return nil
 }

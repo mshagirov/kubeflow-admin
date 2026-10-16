@@ -40,6 +40,9 @@ type Manager struct {
 	mu        sync.Mutex
 	closed    bool
 	closeOnce sync.Once
+
+	cleanupMu       sync.Mutex
+	lastPlanCleanup time.Time
 }
 
 func New(ctx context.Context, cfg config.Config, s *store.Store, k Backend) (*Manager, error) {
@@ -57,6 +60,12 @@ func newManager(ctx context.Context, cfg config.Config, s *store.Store, k Backen
 	fail := func(err error) (*Manager, error) { cancel(); s.ReleaseWorker(); return nil, err }
 	recoveryCtx, recoveryCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer recoveryCancel()
+	// Orphaned active claims or target locks cannot be recovered automatically
+	// without releasing locks or inventing audit history. Fail closed so an
+	// operator reconciles them instead of silently unlocking.
+	if err := s.CheckIntegrity(recoveryCtx); err != nil {
+		return fail(storageError(err))
+	}
 	list, err := s.IncompleteOperations(recoveryCtx)
 	if err != nil {
 		return fail(storageError(err))
@@ -112,16 +121,26 @@ func (m *Manager) Plan(ctx context.Context, actor model.Identity, a model.Action
 	if err := m.authorize(ctx, actor); err != nil {
 		return model.Plan{}, err
 	}
+	// Bounded-frequency housekeeping: drop expired/malformed preview plans.
+	// Accepted work is unaffected because retries resolve
+	// through operation_claims, not the plan record. Failure never blocks a
+	// preview, and only plans (never operations or audit) are removed.
+	m.cleanupExpiredPlans(ctx)
 	if len(a.Reason) > 500 {
 		return model.Plan{}, errors.New("reason exceeds 500 characters")
 	}
 	p, err := m.k.Prepare(ctx, a)
 	if err != nil {
-		return model.Plan{}, errors.New("preview validation failed; review the request and cluster state")
+		// Preserve the backend error's identity and authored message so the HTTP
+		// boundary can classify it (409 stale plan, 422 approved validation) with
+		// its allowlist. Unknown backend text is not persisted here; the boundary
+		// fails closed before exposing it. Replacing this with a fixed message
+		// would make every prepared-error classification impossible.
+		return model.Plan{}, err
 	}
 	// A slow preview must not produce an authorized plan after logout/shutdown.
 	if ctx.Err() != nil {
-		return model.Plan{}, errors.New("preview canceled")
+		return model.Plan{}, ctx.Err()
 	}
 	if err := m.authorize(ctx, actor); err != nil {
 		return model.Plan{}, err
@@ -136,6 +155,31 @@ func (m *Manager) Plan(ctx context.Context, actor model.Identity, a model.Action
 		return model.Plan{}, storageError(err)
 	}
 	return plan, nil
+}
+
+const planCleanupInterval = time.Minute
+
+// cleanupExpiredPlans removes expired/malformed preview plans at most once per
+// interval. It never removes operations or audit history and never fails the
+// caller: stale previews are a hygiene issue, not a write-safety one.
+func (m *Manager) cleanupExpiredPlans(ctx context.Context) {
+	now := time.Now()
+	m.cleanupMu.Lock()
+	if now.Sub(m.lastPlanCleanup) < planCleanupInterval {
+		m.cleanupMu.Unlock()
+		return
+	}
+	m.lastPlanCleanup = now
+	m.cleanupMu.Unlock()
+	cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := m.s.CleanupPlans(cleanupCtx, now); err != nil {
+		m.cleanupMu.Lock()
+		m.lastPlanCleanup = time.Time{}
+		m.cleanupMu.Unlock()
+		// Cleanup is best-effort; do not put raw driver error text in logs.
+		slog.Warn("expired plan cleanup failed; retained plans will be retried")
+	}
 }
 
 func (m *Manager) Submit(ctx context.Context, actor model.Identity, planID, key string) (model.Operation, error) {
@@ -175,13 +219,7 @@ func (m *Manager) Submit(ctx context.Context, actor model.Identity, planID, key 
 		return model.Operation{}, errors.New("operation queue full; retry later")
 	}
 	a := plan.Prepared.Action
-	target := "pvc:" + a.Namespace + "/" + a.Name
-	switch {
-	case strings.HasPrefix(a.Kind, "notebook."):
-		target = "notebook:" + a.Namespace + "/" + a.Name
-	case strings.HasPrefix(a.Kind, "profile."):
-		target = "profile:" + a.Name
-	}
+	target := store.PrimaryTarget(a)
 	opID, err := id()
 	if err != nil {
 		return model.Operation{}, err
@@ -343,6 +381,11 @@ func safeError(err error) string {
 	return "Operation could not be completed safely."
 }
 func storageError(err error) error {
+	var integrity *store.IntegrityError
+	if errors.As(err, &integrity) {
+		// Preserve the typed, actionable integrity failure so operators can act.
+		return integrity
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		return store.ErrNotFound
 	}

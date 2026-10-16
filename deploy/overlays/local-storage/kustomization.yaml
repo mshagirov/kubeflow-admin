@@ -8,7 +8,7 @@ patches:
       kind: PersistentVolumeClaim
       name: kubeflow-admin-data
     patch: |-
-      - op: replace
+      - op: add
         path: /spec/storageClassName
         value: kubeflow-admin-local
       - op: add

@@ -10,6 +10,12 @@ auth:
   adminSubjects: []
   scopes: [openid, profile, email, groups]
   sessionMinutes: 15
+  # Login-source rate limiting. The default 'global' applies only the bounded
+  # global budget (safe behind the single shared reverse proxy). 'peer' trusts
+  # the immediate peer address; 'forwarded' additionally requires
+  # trustedProxyCIDRs and validates X-Forwarded-For right-to-left from a proxy.
+  loginSourceLimit: global
+  trustedProxyCIDRs: []
 kubernetes:
   kubeconfig: ''
   requestTimeoutSeconds: 15
