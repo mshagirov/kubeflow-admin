@@ -24,6 +24,10 @@ import (
 var ErrNotFound = errors.New("record not found")
 var ErrConflict = errors.New("operation conflicts with an existing request or locked target")
 
+// ErrInvalidTarget reports a server-validated action whose derived target is
+// malformed. No claim or lock is created.
+var ErrInvalidTarget = errors.New("invalid or unsafe operation target")
+
 // ErrLocked reports that another process already owns the database files.
 var ErrLocked = errors.New("database is already owned by another application")
 
@@ -45,6 +49,8 @@ func (e *IntegrityError) Error() string {
 func (e *IntegrityError) Unwrap() error { return ErrIntegrity }
 
 func integrity(reason string) error { return &IntegrityError{Reason: reason} }
+
+const cleanupBatch = 500
 
 type Store struct {
 	db         *sql.DB
@@ -134,12 +140,46 @@ func OpenWithJournal(path, journal string, allowUnverifiedFilesystem bool) (*Sto
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	s := &Store{db: db, lock: lock, unverified: unverified}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var mode string
 	if err := db.QueryRowContext(ctx, "PRAGMA journal_mode="+journal).Scan(&mode); err != nil || mode != journal {
 		s.Close()
 		return nil, errors.New("cannot enable requested SQLite journal mode: " + journal)
+	}
+	if err := s.migrate(ctx); err != nil {
+		s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// schemaVersion is the durable application schema. Migration must be
+// transactional and versioned: an older release unconditionally resetting this
+// value could otherwise silently downgrade a database written by a newer one.
+const schemaVersion = 3
+
+// migrate creates or upgrades the database schema in one transaction. Existing
+// records, journals and authentication state are preserved. Accepted operation
+// evidence is copied from authentic accepted audit rows into the immutable
+// safety ledger; missing evidence is left missing so CheckIntegrity fails closed
+// instead of fabricating history.
+func (s *Store) migrate(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var version int
+	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	if version > schemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported version %d", version, schemaVersion)
+	}
+	var compactionExists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='operation_compaction'`).Scan(&compactionExists); err != nil {
+		return err
 	}
 	for _, query := range []string{
 		`CREATE TABLE IF NOT EXISTS records(bucket TEXT NOT NULL,key TEXT NOT NULL,value BLOB NOT NULL,updated INTEGER NOT NULL,PRIMARY KEY(bucket,key))`,
@@ -148,14 +188,127 @@ func OpenWithJournal(path, journal string, allowUnverifiedFilesystem bool) (*Sto
 		`CREATE TABLE IF NOT EXISTS operation_targets(operation_id TEXT NOT NULL,target TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(operation_id,target))`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS locked_target ON operation_targets(target) WHERE active=1`,
 		`INSERT OR IGNORE INTO operation_targets(operation_id,target,active) SELECT id,target,active FROM operation_claims`,
-		`PRAGMA user_version=2`,
+		// The safety ledger is intentionally separate from visible audit history:
+		// retention may delete presentation rows, but acceptance evidence must
+		// survive for every active/unresolved claim and for idempotent replay.
+		`CREATE TABLE IF NOT EXISTS operation_acceptance(operation_id TEXT PRIMARY KEY,actor TEXT NOT NULL,actor_display TEXT NOT NULL,plan_id TEXT NOT NULL,target TEXT NOT NULL,action TEXT NOT NULL,reason TEXT NOT NULL,changes BLOB NOT NULL,created INTEGER NOT NULL)`,
+		// Pending compaction is indexed by completion time so cleanup examines only
+		// a bounded batch instead of scanning an ever-longer compacted prefix.
+		`CREATE TABLE IF NOT EXISTS operation_compaction(operation_id TEXT PRIMARY KEY,updated INTEGER NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS operation_compaction_updated ON operation_compaction(updated)`,
+		`CREATE INDEX IF NOT EXISTS records_bucket_updated ON records(bucket,updated)`,
+		`CREATE INDEX IF NOT EXISTS operation_claims_active ON operation_claims(active)`,
 	} {
-		if _, err := db.ExecContext(ctx, query); err != nil {
-			s.Close()
-			return nil, err
+		if _, err := tx.ExecContext(ctx, query); err != nil {
+			return err
 		}
 	}
-	return s, nil
+	// Idempotent: fills only missing active ledgers from authentic evidence. This
+	// also lets an operator restore a missing accepted row and reopen a schema-v3
+	// development database without a version change.
+	if err := backfillAcceptance(ctx, tx); err != nil {
+		return err
+	}
+	if compactionExists == 0 {
+		if err := backfillCompactionQueue(ctx, tx); err != nil {
+			return err
+		}
+	}
+	// Never commit a version bump (or any backfill) over active work whose safety
+	// evidence, operation record or primary lock set is inconsistent.
+	if err := validateActiveHistory(ctx, tx); err != nil {
+		return err
+	}
+	if version != schemaVersion {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, schemaVersion)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// backfillAcceptance copies only structurally authentic accepted audit rows. It
+// never fills a missing row, never overwrites existing evidence and never
+// treats a malformed, mismatched or incomplete row as success. Work is bounded
+// to batches so restoring evidence on a large database remains responsive.
+func backfillAcceptance(ctx context.Context, tx *sql.Tx) error {
+	last := ""
+	for {
+		rows, err := tx.QueryContext(ctx, `SELECT c.id,c.actor,c.plan_id,c.target,a.value,a.updated,r.value
+			FROM operation_claims c
+			JOIN (SELECT key,value,updated FROM records WHERE bucket='audit' AND json_valid(value)=1) a ON a.key=c.id||'-accepted'
+			JOIN (SELECT key,value FROM records WHERE bucket='operations' AND json_valid(value)=1) r ON r.key=c.id
+			WHERE NOT EXISTS (SELECT 1 FROM operation_acceptance x WHERE x.operation_id=c.id)
+			AND c.id>? ORDER BY c.id LIMIT 500`, last)
+		if err != nil {
+			return err
+		}
+		type candidate struct {
+			id, actor, planID, target string
+			auditValue                []byte
+			auditUpdated              int64
+			operationValue            []byte
+		}
+		var candidates []candidate
+		for rows.Next() {
+			var c candidate
+			if err := rows.Scan(&c.id, &c.actor, &c.planID, &c.target, &c.auditValue, &c.auditUpdated, &c.operationValue); err != nil {
+				rows.Close()
+				return err
+			}
+			candidates = append(candidates, c)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if len(candidates) == 0 {
+			return nil
+		}
+		for _, c := range candidates {
+			last = c.id
+			audit, err := decodeAudit(c.auditValue)
+			if err != nil || audit.Result != "queued" {
+				continue
+			}
+			op, err := decodeOperation(c.operationValue)
+			if err != nil {
+				continue
+			}
+			if audit.ID != c.id+"-accepted" || audit.OperationID != c.id || audit.Actor != c.actor ||
+				audit.Target != c.target || audit.Action != op.Action ||
+				op.ID != c.id || op.Actor != c.actor || op.PlanID != c.planID || op.Target != c.target {
+				continue
+			}
+			changes, err := json.Marshal(audit.Changes)
+			if err != nil {
+				return err
+			}
+			if audit.Changes == nil {
+				changes = []byte("[]")
+			}
+			created := audit.Time.UnixNano()
+			if audit.Time.IsZero() {
+				created = c.auditUpdated
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO operation_acceptance(operation_id,actor,actor_display,plan_id,target,action,reason,changes,created) VALUES(?,?,?,?,?,?,?,?,?)`,
+				c.id, c.actor, audit.ActorDisplay, c.planID, c.target, op.Action, audit.Reason, changes, created); err != nil {
+				return err
+			}
+		}
+		if len(candidates) < 500 {
+			return nil
+		}
+	}
+}
+
+func backfillCompactionQueue(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO operation_compaction(operation_id,updated)
+		SELECT c.id,r.updated FROM operation_claims c
+		JOIN (SELECT key,value,updated FROM records WHERE bucket='operations' AND json_valid(value)=1) r ON r.key=c.id
+		WHERE c.active=0 AND json_extract(r.value,'$.state') IN ('succeeded','failed')`)
+	return err
 }
 
 // OnUnverifiedFilesystem reports whether the database sits on storage whose
@@ -259,6 +412,22 @@ func (s *Store) Get(ctx context.Context, bucket, key string, out any) error {
 	if err != nil {
 		return err
 	}
+	switch target := out.(type) {
+	case *model.Operation:
+		op, err := decodeOperation(b)
+		if err != nil {
+			return err
+		}
+		*target = op
+		return nil
+	case *model.Audit:
+		audit, err := decodeStoredAudit(b)
+		if err != nil {
+			return err
+		}
+		*target = audit
+		return nil
+	}
 	return json.Unmarshal(b, out)
 }
 func (s *Store) Delete(ctx context.Context, bucket, key string) error {
@@ -310,17 +479,20 @@ func (s *Store) Take(ctx context.Context, bucket, key string, out any) error {
 // CleanupAuth removes only expired/invalid authentication records. Malformed
 // rows are removed first because json_extract raises on invalid JSON and would
 // otherwise abort the whole delete, making every authenticated request fail
-// closed forever. Audit and operation records are untouched.
+// closed forever. Audit and operation records are untouched. Each call performs
+// at most one bounded batch per bucket within the cleanup context budget.
 func (s *Store) CleanupAuth(ctx context.Context, now time.Time) error {
 	stamp := now.UTC().Format(time.RFC3339Nano)
 	return s.cleanupRecords(ctx, []string{"auth.attempts", "auth.sessions"},
 		cleanupDelete{
-			query: `DELETE FROM records WHERE bucket='auth.attempts' AND json_valid(value)=1 AND COALESCE(julianday(json_extract(value,'$.expiresAt')),0)<=julianday(?)`,
-			args:  []any{stamp},
+			bucket:    "auth.attempts",
+			predicate: `json_valid(value)=1 AND COALESCE(julianday(json_extract(value,'$.expiresAt')),0)<=julianday(?)`,
+			args:      []any{stamp},
 		},
 		cleanupDelete{
-			query: `DELETE FROM records WHERE bucket='auth.sessions' AND json_valid(value)=1 AND (COALESCE(julianday(json_extract(value,'$.identity.expiresAt')),0)<=julianday(?) OR COALESCE(julianday(json_extract(value,'$.identity.authenticatedAt')),0)+15.0/1440<=julianday(?))`,
-			args:  []any{stamp, stamp},
+			bucket:    "auth.sessions",
+			predicate: `json_valid(value)=1 AND (COALESCE(julianday(json_extract(value,'$.identity.expiresAt')),0)<=julianday(?) OR COALESCE(julianday(json_extract(value,'$.identity.authenticatedAt')),0)+15.0/1440<=julianday(?))`,
+			args:      []any{stamp, stamp},
 		},
 	)
 }
@@ -333,24 +505,29 @@ func (s *Store) CleanupPlans(ctx context.Context, now time.Time) error {
 	stamp := now.UTC().Format(time.RFC3339Nano)
 	return s.cleanupRecords(ctx, []string{"plans"},
 		cleanupDelete{
-			query: `DELETE FROM records WHERE bucket='plans' AND json_valid(value)=1 AND COALESCE(julianday(json_extract(value,'$.expiresAt')),0)<=julianday(?)`,
-			args:  []any{stamp},
+			bucket:    "plans",
+			predicate: `json_valid(value)=1 AND COALESCE(julianday(json_extract(value,'$.expiresAt')),0)<=julianday(?)`,
+			args:      []any{stamp},
 		},
 	)
 }
 
 type cleanupDelete struct {
-	query string
-	args  []any
+	bucket    string
+	predicate string
+	args      []any
 }
 
 // cleanupRecords deletes malformed rows (json_valid=0) in buckets and then runs
-// the bounded expiry deletes, all in one transaction. A malformed row can never
-// abort cleanup of the remaining records.
+// the bounded expiry deletes, all in one short transaction. Every DELETE is
+// limited to cleanupBatch records by rowid, so request-path housekeeping cannot
+// hold the single SQLite connection for an unbounded scan.
 func (s *Store) cleanupRecords(ctx context.Context, buckets []string, deletes ...cleanupDelete) error {
 	if len(buckets) == 0 {
 		return nil
 	}
+	ctx, cancel := cleanupContext(ctx)
+	defer cancel()
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(buckets)), ",")
 	args := make([]any, 0, len(buckets))
 	for _, b := range buckets {
@@ -361,11 +538,13 @@ func (s *Store) cleanupRecords(ctx context.Context, buckets []string, deletes ..
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `DELETE FROM records WHERE bucket IN (`+placeholders+`) AND json_valid(value)=0`, args...); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM records WHERE rowid IN (SELECT rowid FROM records WHERE bucket IN (`+placeholders+`) AND json_valid(value)=0 LIMIT ?)`, append(args, cleanupBatch)...); err != nil {
 		return err
 	}
 	for _, d := range deletes {
-		if _, err = tx.ExecContext(ctx, d.query, d.args...); err != nil {
+		query := `DELETE FROM records WHERE rowid IN (SELECT rowid FROM records WHERE bucket=? AND ` + d.predicate + ` LIMIT ?)`
+		callArgs := append(append([]any{}, d.args...), cleanupBatch)
+		if _, err = tx.ExecContext(ctx, query, append([]any{d.bucket}, callArgs...)...); err != nil {
 			return err
 		}
 	}
@@ -377,6 +556,8 @@ func (s *Store) cleanupRecords(ctx context.Context, buckets []string, deletes ..
 // caller primary would let a plan lock unrelated PVC/PV/object targets.
 func PrimaryTarget(a model.Action) string {
 	switch {
+	case a.Kind == "pod.restart":
+		return "pod:" + a.Namespace + "/" + a.Name
 	case strings.HasPrefix(a.Kind, "notebook."):
 		return "notebook:" + a.Namespace + "/" + a.Name
 	case strings.HasPrefix(a.Kind, "profile."):
@@ -386,9 +567,26 @@ func PrimaryTarget(a model.Action) string {
 	}
 }
 
+// validTargetName accepts a Kubernetes object name but never a namespace,
+// path, wildcard or empty value. A restart must not acquire a lock on an
+// arbitrary or surprising parent object.
+func validTargetName(name string) bool {
+	if name == "" || len(name) > 253 || strings.Contains(name, "/") || strings.Contains(name, "..") {
+		return false
+	}
+	for i, r := range name {
+		ok := r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '.'
+		if !ok || (r == '.' || r == '-') && (i == 0 || i == len(name)-1) {
+			return false
+		}
+	}
+	return true
+}
+
 // Targets locks the canonical primary plus its selected PV; using only PVName
 // would allow two queued operations to mutate the same PVC using different PV
-// reservations.
+// reservations. A restart also locks its validated parent Notebook so it cannot
+// race an edit or stop of that parent.
 func Targets(p model.Plan) []string {
 	a := p.Prepared.Action
 	out := []string{PrimaryTarget(a)}
@@ -406,20 +604,65 @@ func Targets(p model.Plan) []string {
 	if (a.Kind == "storage.create.static" || a.Kind == "pv.reserve-and-claim") && a.PVName != "" {
 		add("pv:" + a.PVName)
 	}
+	if a.Kind == "pod.restart" && validTargetName(a.Namespace) && validTargetName(p.Prepared.ParentNotebook) {
+		add("notebook:" + a.Namespace + "/" + p.Prepared.ParentNotebook)
+	}
 	return out
 }
 
 // CreateOperation atomically claims actor+idempotency key, immutable plan, all
-// affected targets, and writes the accepted operation plus audit record.
+// affected targets, and writes the accepted operation plus audit record. It uses
+// the shipped operation-budget defaults.
 func (s *Store) CreateOperation(ctx context.Context, op model.Operation, plan model.Plan, key string) (model.Operation, bool, error) {
-	if op.ID == "" || plan.ID == "" || op.PlanID != plan.ID || op.Actor == "" || op.Actor != plan.Actor || op.Target == "" || key == "" || op.State != "queued" {
+	return s.createOperation(ctx, op, plan, key, HistoryPolicy{})
+}
+
+// CreateOperationWithPolicy is the admission path for a configured deployment:
+// it enforces the same total-operation and unresolved-operation budgets inside
+// the acceptance transaction, after idempotent retries have resolved.
+func (s *Store) CreateOperationWithPolicy(ctx context.Context, op model.Operation, plan model.Plan, key string, policy HistoryPolicy) (model.Operation, bool, error) {
+	return s.createOperation(ctx, op, plan, key, policy)
+}
+
+func (s *Store) createOperation(ctx context.Context, op model.Operation, plan model.Plan, key string, policy HistoryPolicy) (model.Operation, bool, error) {
+	p := policy.WithDefaults()
+	if op.CreatedAt.IsZero() {
+		op.CreatedAt = time.Now().UTC()
+	}
+	if op.UpdatedAt.IsZero() {
+		op.UpdatedAt = op.CreatedAt
+	}
+	if op.ID == "" || plan.ID == "" || op.PlanID != plan.ID || op.Actor == "" || op.Actor != plan.Actor || op.Target == "" || op.Action == "" || op.Action != plan.Prepared.Action.Kind || key == "" || op.State != "queued" {
 		return model.Operation{}, false, ErrConflict
+	}
+	// A restart's secondary lock is derived only from the server-validated parent
+	// Notebook. Never accept a namespace/path/wildcard there.
+	if plan.Prepared.Action.Kind == "pod.restart" {
+		if !validTargetName(plan.Prepared.Action.Namespace) || !validTargetName(plan.Prepared.Action.Name) || !validTargetName(plan.Prepared.ParentNotebook) {
+			return model.Operation{}, false, ErrInvalidTarget
+		}
 	}
 	// The primary target must be exactly the canonical target of the server-owned
 	// plan action. Derived targets (for example a reserved PV) never substitute an
 	// arbitrary caller-supplied primary.
 	if op.Target != PrimaryTarget(plan.Prepared.Action) {
 		return model.Operation{}, false, ErrConflict
+	}
+	// The display label is a presentation claim captured at acceptance. It never
+	// substitutes for the issuer|subject authority key above. The manager supplies
+	// the current verified identity at acceptance; direct callers may fall back to
+	// the immutable plan label.
+	display := op.ActorDisplay
+	if display == "" {
+		display = plan.ActorDisplay
+	}
+	op.ActorDisplay = display
+	// Build the exact accepted audit row before admission so its serialized size
+	// is included in the byte budget inside the acceptance transaction.
+	acceptedAudit := model.Audit{ID: op.ID + "-accepted", Actor: op.Actor, ActorDisplay: op.ActorDisplay, Action: op.Action, Target: op.Target, Result: "queued", OperationID: op.ID, Reason: plan.Prepared.Action.Reason, Changes: plan.Prepared.Changes, Time: op.CreatedAt}
+	acceptedAuditValue, err := json.Marshal(acceptedAudit)
+	if err != nil {
+		return op, false, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -436,11 +679,37 @@ func (s *Store) CreateOperation(ctx context.Context, op model.Operation, plan mo
 		if err = tx.QueryRowContext(ctx, `SELECT value FROM records WHERE bucket='operations' AND key=?`, priorID).Scan(&b); err != nil {
 			return op, false, err
 		}
-		err = json.Unmarshal(b, &op)
+		op, err = decodeOperation(b)
 		return op, false, err
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return op, false, err
+	}
+	// A retry above resolves through its existing claim even when admission is
+	// full. A genuinely new claim must not grow total or unresolved work without
+	// bound. These checks are inside the same transaction that inserts the claim,
+	// so concurrent callers cannot both consume the last slot.
+	var claims, unresolved int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(active),0) FROM operation_claims`).Scan(&claims, &unresolved); err != nil {
+		return op, false, err
+	}
+	if claims >= p.MaxOperationRecords {
+		return op, false, budget(fmt.Sprintf("retained operation records reached the configured maximum of %d", p.MaxOperationRecords))
+	}
+	if unresolved >= MaxUnresolvedOperations {
+		return op, false, budget(fmt.Sprintf("unresolved operations reached the safety limit of %d", MaxUnresolvedOperations))
+	}
+	// Audit usage is checked in the same transaction, including the exact new
+	// accepted row. Older audit is now prunable after ledger verification, so a
+	// full budget rejects the new mutation until bounded cleanup catches up; it
+	// never blocks an already accepted checkpoint.
+	var auditCount int
+	var auditBytes int64
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(LENGTH(value)),0) FROM records WHERE bucket='audit'`).Scan(&auditCount, &auditBytes); err != nil {
+		return op, false, err
+	}
+	if auditCount+1 > p.MaxAuditRecords || auditBytes+int64(len(acceptedAuditValue)) > p.MaxAuditBytes {
+		return op, false, budget("audit history budget is full; bounded background retention must prune before another mutation is accepted")
 	}
 	// Check conflicts separately so disk/I/O/constraint corruption errors are not
 	// mislabeled as a harmless competing request.
@@ -472,7 +741,21 @@ func (s *Store) CreateOperation(ctx context.Context, op model.Operation, plan mo
 	if err = put(ctx, tx, "operations", op.ID, op); err != nil {
 		return op, false, err
 	}
-	audit := model.Audit{ID: op.ID + "-accepted", Actor: op.Actor, Action: op.Action, Target: op.Target, Result: "queued", OperationID: op.ID, Reason: plan.Prepared.Action.Reason, Changes: plan.Prepared.Changes, Time: op.CreatedAt}
+	changes, err := json.Marshal(plan.Prepared.Changes)
+	if err != nil {
+		return op, false, err
+	}
+	if plan.Prepared.Changes == nil {
+		changes = []byte("[]")
+	}
+	// The ledger is written in the same transaction as the claim, locks,
+	// operation and visible accepted audit. It is the evidence checkpoints use,
+	// so later presentation-history cleanup cannot break a live operation.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO operation_acceptance(operation_id,actor,actor_display,plan_id,target,action,reason,changes,created) VALUES(?,?,?,?,?,?,?,?,?)`,
+		op.ID, op.Actor, op.ActorDisplay, op.PlanID, op.Target, op.Action, plan.Prepared.Action.Reason, changes, op.CreatedAt.UnixNano()); err != nil {
+		return op, false, err
+	}
+	audit := acceptedAudit
 	if err = insertAudit(ctx, tx, audit); err != nil {
 		return op, false, err
 	}
@@ -491,6 +774,9 @@ func (s *Store) Finish(ctx context.Context, op model.Operation, audit model.Audi
 func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit model.Audit, finish bool) error {
 	if audit.ID == "" {
 		return ErrConflict
+	}
+	if op.UpdatedAt.IsZero() {
+		op.UpdatedAt = time.Now().UTC()
 	}
 	if finish {
 		if op.State != "succeeded" && op.State != "failed" && op.State != "needs-review" {
@@ -524,8 +810,8 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 		return err
 	}
 	var current model.Operation
-	if err := json.Unmarshal(currentBytes, &current); err != nil {
-		return integrity("operation record is not readable JSON")
+	if current, err = decodeOperation(currentBytes); err != nil {
+		return err
 	}
 	// Only real lifecycle transitions are accepted. In particular a fresh
 	// queued operation cannot be reported succeeded without an applying
@@ -537,27 +823,39 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 	// Identity/action metadata belongs to the original claim, not caller input.
 	op.Action = current.Action
 	op.CreatedAt = current.CreatedAt
+	op.HistoryExpired = current.HistoryExpired
+	// Read the immutable safety ledger, not visible audit history: retention may
+	// have deleted the accepted presentation row while the operation was still
+	// active, and that must never turn into missing evidence or a fabricated
+	// reason/diff.
+	var acceptedActor, acceptedDisplay, acceptedPlan, acceptedAction, acceptedTarget, acceptedReason string
+	var acceptedChanges []byte
+	err = tx.QueryRowContext(ctx, `SELECT actor,actor_display,plan_id,action,target,reason,changes FROM operation_acceptance WHERE operation_id=?`, op.ID).Scan(&acceptedActor, &acceptedDisplay, &acceptedPlan, &acceptedAction, &acceptedTarget, &acceptedReason, &acceptedChanges)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Never fabricate the immutable accepted reason/diff. Fail closed so an
+		// operator can restore or reconcile the exact history.
+		return integrity("operation " + op.ID + " is missing its immutable acceptance evidence")
+	}
+	if err != nil {
+		return err
+	}
+	changes, err := decodeChanges(acceptedChanges)
+	if err != nil {
+		return err
+	}
+	if acceptedActor != actor || acceptedPlan != planID || acceptedAction != current.Action || acceptedTarget != current.Target {
+		return integrity("acceptance evidence conflicts with the operation record")
+	}
+	op.ActorDisplay = acceptedDisplay
 	audit.Actor = op.Actor
+	audit.ActorDisplay = acceptedDisplay
 	audit.Action = op.Action
 	audit.Target = op.Target
 	audit.Result = op.State
 	audit.OperationID = op.ID
 	audit.Time = op.UpdatedAt
-	var acceptedBytes []byte
-	if err := tx.QueryRowContext(ctx, `SELECT value FROM records WHERE bucket='audit' AND key=?`, op.ID+"-accepted").Scan(&acceptedBytes); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			// Never fabricate the immutable accepted reason/diff. Fail closed so an
-			// operator can restore or reconcile the exact history.
-			return integrity("operation " + op.ID + " is missing its immutable accepted audit record")
-		}
-		return err
-	}
-	var accepted model.Audit
-	if err := json.Unmarshal(acceptedBytes, &accepted); err != nil {
-		return integrity("accepted audit record is not readable JSON")
-	}
-	audit.Reason = accepted.Reason
-	audit.Changes = accepted.Changes
+	audit.Reason = acceptedReason
+	audit.Changes = changes
 	if err = put(ctx, tx, "operations", op.ID, op); err != nil {
 		return err
 	}
@@ -572,6 +870,13 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE operation_targets SET active=0 WHERE operation_id=?`, op.ID); err != nil {
 			return err
+		}
+		if op.State == "succeeded" || op.State == "failed" {
+			// Indexed pending-compaction marker: cleanup never scans an ever-growing
+			// compacted prefix. needs-review is intentionally not queued.
+			if _, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO operation_compaction(operation_id,updated) VALUES(?,?)`, op.ID, op.UpdatedAt.UnixNano()); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -600,20 +905,24 @@ func allowedTransition(from, to string, finish bool) bool {
 }
 
 func (s *Store) IncompleteOperations(ctx context.Context) ([]model.Operation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT r.value FROM records r JOIN operation_claims c ON c.id=r.key WHERE r.bucket='operations' AND c.active=1`)
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.actor,c.plan_id,c.target,r.value FROM records r JOIN operation_claims c ON c.id=r.key WHERE r.bucket='operations' AND c.active=1`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []model.Operation{}
 	for rows.Next() {
+		var claimID, actor, planID, target string
 		var b []byte
-		var op model.Operation
-		if err = rows.Scan(&b); err != nil {
+		if err = rows.Scan(&claimID, &actor, &planID, &target, &b); err != nil {
 			return nil, err
 		}
-		if err = json.Unmarshal(b, &op); err != nil {
+		op, err := decodeOperation(b)
+		if err != nil {
 			return nil, err
+		}
+		if op.ID != claimID || op.Actor != actor || op.PlanID != planID || op.Target != target {
+			return nil, integrity("an active operation record conflicts with its claim")
 		}
 		out = append(out, op)
 	}
@@ -629,29 +938,20 @@ func (s *Store) IncompleteOperations(ctx context.Context) ([]model.Operation, er
 // Locks are never released and no records are synthesized here.
 func (s *Store) CheckIntegrity(ctx context.Context) error {
 	var n int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_claims c LEFT JOIN records r ON r.bucket='operations' AND r.key=c.id WHERE c.active=1 AND r.key IS NULL`).Scan(&n); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_claims WHERE active=1`).Scan(&n); err != nil {
 		return err
 	}
-	if n > 0 {
-		return integrity(fmt.Sprintf("%d active operation claim(s) have no operation record", n))
+	if n > MaxUnresolvedOperations {
+		return integrity(fmt.Sprintf("%d active operation claims exceed the safety limit of %d", n, MaxUnresolvedOperations))
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_claims c JOIN records r ON r.bucket='operations' AND r.key=c.id WHERE c.active=1 AND json_valid(r.value)=1 AND json_extract(r.value,'$.state') IN ('succeeded','failed')`).Scan(&n); err != nil {
+	if err := validateActiveHistory(ctx, s.db); err != nil {
+		return err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_claims c JOIN records r ON r.bucket='operations' AND r.key=c.id WHERE c.active=1 AND json_extract(r.value,'$.state') IN ('succeeded','failed')`).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
 		return integrity(fmt.Sprintf("%d active operation claim(s) conflict with a terminal operation state", n))
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_claims c LEFT JOIN records a ON a.bucket='audit' AND a.key=c.id||'-accepted' WHERE c.active=1 AND a.key IS NULL`).Scan(&n); err != nil {
-		return err
-	}
-	if n > 0 {
-		return integrity(fmt.Sprintf("%d active operation claim(s) are missing their accepted audit record", n))
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_targets t LEFT JOIN operation_claims c ON c.id=t.operation_id WHERE t.active=1 AND (c.id IS NULL OR c.active!=1)`).Scan(&n); err != nil {
-		return err
-	}
-	if n > 0 {
-		return integrity(fmt.Sprintf("%d active target lock(s) have no active operation claim", n))
 	}
 	return nil
 }
@@ -669,6 +969,5 @@ func (s *Store) OperationForKey(ctx context.Context, actor, key, planID string) 
 	if foundPlan != planID {
 		return op, ErrConflict
 	}
-	err = json.Unmarshal(b, &op)
-	return op, err
+	return decodeOperation(b)
 }

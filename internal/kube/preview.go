@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"kubeflow-admin/internal/model"
 )
@@ -123,6 +124,14 @@ func (s *Service) previews(w *work) {
 			after = "Running"
 		}
 		w.change("desired lifecycle", before, after)
+	case "pod.restart":
+		w.change("target Pod", nil, w.pod.Namespace+"/"+w.pod.Name)
+		w.change("controller", nil, "StatefulSet/"+w.podSet.Name)
+		w.change("parent Notebook", nil, w.podNotebook.GetNamespace()+"/"+w.podNotebook.GetName())
+		w.change("current revision", nil, w.pod.Labels[appsv1.StatefulSetRevisionLabel])
+		w.change("desired revision", nil, w.podSet.Status.UpdateRevision)
+		w.change("assigned Node", nil, w.podNode.Name)
+		w.change("disruption handling", nil, "policy/v1 eviction with UID/resourceVersion preconditions; PodDisruptionBudget enforced by the API")
 	}
 	sort.SliceStable(w.prepared.Changes, func(i, j int) bool { return w.prepared.Changes[i].Field < w.prepared.Changes[j].Field })
 }

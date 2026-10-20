@@ -535,9 +535,10 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var claims struct {
-		Email  string   `json:"email"`
-		Groups []string `json:"groups"`
-		AZP    string   `json:"azp"`
+		Email    string   `json:"email"`
+		Username string   `json:"preferred_username"`
+		Groups   []string `json:"groups"`
+		AZP      string   `json:"azp"`
 	}
 	if err := id.Claims(&claims); err != nil || (claims.AZP != "" && claims.AZP != a.cfg.Auth.ClientID) || (len(id.Audience) > 1 && claims.AZP != a.cfg.Auth.ClientID) {
 		safeError(w, 401)
@@ -555,6 +556,13 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 		expires = id.Expiry
 	}
 	i := model.Identity{Issuer: id.Issuer, Subject: id.Subject, Email: claims.Email, Groups: claims.Groups, AuthenticatedAt: now, ExpiresAt: expires}
+	i.Username = claims.Username
+	notificationScope, err := random()
+	if err != nil {
+		safeError(w, 500)
+		return
+	}
+	i.NotificationScope = notificationScope
 	if !a.allowed(i) {
 		safeError(w, 403)
 		return

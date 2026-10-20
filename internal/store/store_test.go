@@ -49,7 +49,7 @@ func TestConcurrentClaimsAndIdempotency(t *testing.T) {
 	s := database(t)
 	ctx := context.Background()
 	plan := model.Plan{ID: "plan", Actor: "issuer|subject", Prepared: model.Prepared{Action: model.Action{Kind: "notebook.stop", Namespace: "alice", Name: "work"}}}
-	op := model.Operation{ID: "operation", Actor: plan.Actor, PlanID: plan.ID, Target: "notebook:alice/work", State: "queued", CreatedAt: time.Now()}
+	op := model.Operation{ID: "operation", Actor: plan.Actor, PlanID: plan.ID, Target: "notebook:alice/work", Action: plan.Prepared.Action.Kind, State: "queued", CreatedAt: time.Now()}
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Add(1)

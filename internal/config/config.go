@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -21,6 +22,8 @@ type Config struct {
 	Notebooks  Notebooks  `yaml:"notebooks"`
 	Database   Database   `yaml:"database"`
 	Features   Features   `yaml:"features"`
+	History    History    `yaml:"history"`
+	Logging    Logging    `yaml:"logging"`
 }
 type Server struct {
 	Listen    string `yaml:"listen"`
@@ -98,6 +101,50 @@ type Features struct {
 	WritesEnabled bool `yaml:"writesEnabled"`
 	StaticStorage bool `yaml:"staticStorage"`
 	PVCExpansion  bool `yaml:"pvcExpansion"`
+	PodRestarts   bool `yaml:"podRestarts"`
+}
+
+type History struct {
+	RetentionDays       int   `yaml:"retentionDays"`
+	MaxAuditRecords     int   `yaml:"maxAuditRecords"`
+	MaxAuditBytes       int64 `yaml:"maxAuditBytes"`
+	MaxOperationRecords int   `yaml:"maxOperationRecords"`
+}
+
+func (h History) WithDefaults() History {
+	if h.RetentionDays == 0 {
+		h.RetentionDays = 90
+	}
+	if h.MaxAuditRecords == 0 {
+		h.MaxAuditRecords = 50000
+	}
+	if h.MaxAuditBytes == 0 {
+		h.MaxAuditBytes = 64 << 20
+	}
+	if h.MaxOperationRecords == 0 {
+		h.MaxOperationRecords = 100000
+	}
+	return h
+}
+
+type Logging struct {
+	Path       string `yaml:"path"`
+	MaxSizeMiB int    `yaml:"maxSizeMiB"`
+	MaxBackups int    `yaml:"maxBackups"`
+	MaxAgeDays int    `yaml:"maxAgeDays"`
+}
+
+func (l Logging) WithDefaults() Logging {
+	if l.MaxSizeMiB == 0 {
+		l.MaxSizeMiB = 10
+	}
+	if l.MaxBackups == 0 {
+		l.MaxBackups = 5
+	}
+	if l.MaxAgeDays == 0 {
+		l.MaxAgeDays = 7
+	}
+	return l
 }
 
 func Load(path string) (Config, error) {
@@ -118,6 +165,28 @@ func Load(path string) (Config, error) {
 	return c, c.Validate()
 }
 func (c Config) Validate() error {
+	h := c.History.WithDefaults()
+	if h.RetentionDays < 1 || h.RetentionDays > 90 || h.MaxAuditRecords < 100 || h.MaxAuditRecords > 1000000 || h.MaxAuditBytes < 1<<20 || h.MaxAuditBytes > 1<<30 || h.MaxOperationRecords < 100 || h.MaxOperationRecords > 1000000 {
+		return fmt.Errorf("invalid history retention or storage limits")
+	}
+	l := c.Logging.WithDefaults()
+	if l.MaxSizeMiB < 1 || l.MaxSizeMiB > 100 || l.MaxBackups < 1 || l.MaxBackups > 20 || l.MaxAgeDays < 1 || l.MaxAgeDays > 90 {
+		return fmt.Errorf("invalid log rotation limits")
+	}
+	if l.Path != "" {
+		if !filepath.IsAbs(l.Path) {
+			return fmt.Errorf("logging path must be absolute")
+		}
+		db, err := filepath.Abs(c.Database.Path)
+		if err != nil {
+			return fmt.Errorf("invalid database path")
+		}
+		for _, suffix := range []string{"", ".lock", "-wal", "-shm", "-journal"} {
+			if filepath.Clean(l.Path) == db+suffix {
+				return fmt.Errorf("logging path must not overlap database files")
+			}
+		}
+	}
 	for _, s := range []string{c.Server.PublicURL, c.Auth.IssuerURL} {
 		u, e := url.Parse(s)
 		if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {

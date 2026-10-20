@@ -1,6 +1,6 @@
 # Kubeflow Admin
 
-A single Go service for OIDC-authorized Kubeflow administrators: cross-profile inventory, typed previews, durable operations and audit history. No arbitrary manifests, Kubernetes proxy, Secret reads, exec, impersonation or resource deletion.
+A single Go service for OIDC-authorized Kubeflow administrators: cross-profile inventory, typed previews, durable operations and bounded audit history. No arbitrary manifests, Kubernetes proxy, Secret reads, exec, impersonation or unrestricted resource deletion. The separately enabled Pod restart workflow uses normal eviction of supported controller-owned Pods, never forced deletion.
 
 **Start read-only.** Deployment requires a dedicated HTTPS host, issuer/client registration, exact administrator group/subject, image and durable database storage. The base uses the default StorageClass with WAL for local disks; verified BeeGFS additionally needs `journalMode: delete` and `allowUnverifiedFilesystem: true`. See [database requirements](docs/database.md). A node-local PV option is also supplied; no cluster changes have been performed.
 
@@ -58,6 +58,11 @@ Then: log in as an admin over HTTPS, confirm a non-admin is denied, compare inve
 - [Configure, build, deploy and stage writes](docs/deployment.md)
 - [Local evidence vs live acceptance](docs/verification.md)
 - [Backups, recovery and safety boundaries](docs/operations.md)
+- [Step-by-step database backup, restore checks and off-node SSH transfer](docs/backup.md)
+- [Diagnostic logging and bounded file rotation](docs/logging.md)
+- [History windows, readable actors and bounded audit retention](docs/history.md)
+- [Pods page and separately authorized, disruption-budget-aware restart](docs/pods.md)
+- [Responsive UI, bounded History and safe Pod restart delivery plan](docs/ui-history-plan.md)
 - [Approved NFS/CSI user-storage templates](docs/storage.md)
 - [Consolidated final plan and agent work packages](kubeflow-admin-webapp-plan-final.md)
 - [Confirmed site compatibility and remaining gates](docs/compatibility.md)

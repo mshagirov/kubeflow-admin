@@ -2,6 +2,65 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
+## Responsive UI / History / Pods work — 20 October 2026
+
+**Local review image published; live cluster acceptance is still pending.** The
+older artifact and acceptance records below are historical, not evidence that
+this feature set has been deployed or accepted by an operator.
+
+- Planning, implementation and independent review used DeepSeek V4.1 Flash
+  through OpenCode Go with **high thinking**. The supervisor reviewed findings,
+  added regression fixes and repeated the gates on the exact final tree.
+- `make check` passed race tests, vet, API parity/script tests and all seven
+  manifest variants. `go test -race -count=2 ./...` passed twice consecutively
+  uncached after the final retention change. `go build -mod=readonly ./...` and
+  OpenAPI specification validation passed.
+  `go run golang.org/x/vuln/cmd/govulncheck@latest ./...` reported no vulnerabilities.
+- Actual headless Chrome via Playwright 1.56.1 tested synthetic observations at
+  390×844 and 1280×844 after UI remediation: bounded long-table scrolling, no
+  page-width overflow, navigation, History tabs, search shortcut/filtering,
+  drawer close/Escape, profile drilldown/namespace links, one inventory read
+  across sidebar navigation, and warning dismissal surviving refresh. The
+  synthetic fixture included 300 Notebooks, 300 Pods, 300 PVCs and a 1,000-event
+  audit window. An additional optional browser suite covered the History loading
+  race, lazy stage details, pager focus, local-clock freshness, retryable drawer
+  errors and unsupported-owner restart gating.
+- This browser fixture/harness is external temporary tooling, not part of the
+  distributed repository or production image. Node tests in
+  `internal/web/testdata/` are repository gates but their stub DOM does not prove
+  layout, focus management or browser accessibility. Real-browser layout tests
+  complement, rather than replace, keyboard/screen-reader and operator checks.
+- Store tests cover schema-3 migration authenticity, strict read-time audit age
+  filtering, bounded list/cleanup/admission, immutable unresolved acceptance
+  evidence, terminal redaction/tombstones, replay safety and concurrent access.
+  Logical data budgets are not whole-SQLite/WAL or backup disk quotas.
+- Pod fixtures cover feature/scope/owner/Node refusal, one PDB-aware eviction
+  request with UID/RV preconditions, definite rejection versus ambiguity,
+  parent locking and replacement convergence. A fake client does not prove live
+  API-server enforcement, fencing, controller behavior or data durability.
+- Logging tests cover size/count/age rotation, concurrent writes, private files,
+  symlink refusal and oversized existing content.
+
+Published review image (20 October 2026):
+
+- `docker.io/muratshagirov/kubeflow-admin:0.3.0`, linux/amd64 only.
+- OCI index digest: `sha256:bdf48e5883a0496f5f956f2a8bae5f288d5fcb05cc8e1ed87637e0f87750060d`.
+- linux/amd64 manifest: `sha256:6d22631c3bbdc5665a5527bc09b31e524101e4541d1deeab1eecd72f89ed371e`.
+- Built with provenance and SBOM attestations from pinned builder/runtime bases;
+  verified by digest-pinned pull metadata. Runtime user is `65532:65532`; starting
+  without config fails closed.
+- Pinned Trivy 0.76 image scan (`vuln,secret`, HIGH/CRITICAL) found **0**
+  vulnerabilities and **0** secrets. `govulncheck` found no source vulnerabilities.
+  These scans are point-in-time and must be repeated before any later promotion.
+
+Before deployment: take and verify a compatible backup before the schema-3
+migration, pin the index digest above in the site overlay, and keep Pod restart
+disabled until the operator approves the separately scoped eviction permission and
+a disposable pilot. No unfenced force-delete workflow or fabricated
+pipeline/metrics integration is included. Live controller, OIDC, storage, network,
+retention-under-load and restart acceptance remain operator steps; local fake
+fixtures and browser simulation do not establish them.
+
 The review follow-up used DeepSeek V4.1 Flash through OpenCode Go with default thinking for four implementation streams and three separate read-only review scopes (auth/UI/deployment, Kubernetes, and operations/store). The final independent reviews found no blocking issues. Lead review also corrected exact PV identity/checkpoint timing and action-scoped secondary PV locks before the final checks below.
 
 ## Proven locally (16 October 2026)

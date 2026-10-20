@@ -922,20 +922,30 @@ func (s *Service) notebookChildren(ctx context.Context, n *unstructured.Unstruct
 	if err != nil {
 		return nil, nil, safe(err)
 	}
-	owned := []appsv1.StatefulSet{}
-	uids := map[types.UID]bool{n.GetUID(): true}
-	for _, st := range sets.Items {
-		if controlledBy(st.OwnerReferences, n.GetUID()) {
-			owned = append(owned, st)
-			uids[st.UID] = true
-		}
-	}
 	pods, err := s.Typed.CoreV1().Pods(n.GetNamespace()).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, nil, safe(err)
 	}
+	owned, children := notebookChildrenFrom(n, sets.Items, pods.Items)
+	return owned, children, nil
+}
+
+// notebookChildrenFrom uses UID ownership, never names/labels alone. Inventory
+// supplies its bulk lists; mutation observation still fetches live namespace lists.
+func notebookChildrenFrom(n *unstructured.Unstructured, sets []appsv1.StatefulSet, pods []corev1.Pod) ([]appsv1.StatefulSet, []corev1.Pod) {
+	owned := []appsv1.StatefulSet{}
+	uids := map[types.UID]bool{n.GetUID(): true}
+	for _, st := range sets {
+		if st.Namespace == n.GetNamespace() && controlledBy(st.OwnerReferences, n.GetUID()) {
+			owned = append(owned, st)
+			uids[st.UID] = true
+		}
+	}
 	children := []corev1.Pod{}
-	for _, p := range pods.Items {
+	for _, p := range pods {
+		if p.Namespace != n.GetNamespace() {
+			continue
+		}
 		for uid := range uids {
 			if controlledBy(p.OwnerReferences, uid) {
 				children = append(children, p)
@@ -943,13 +953,17 @@ func (s *Service) notebookChildren(ctx context.Context, n *unstructured.Unstruct
 			}
 		}
 	}
-	return owned, children, nil
+	return owned, children
 }
 func (s *Service) notebookObserved(ctx context.Context, n *unstructured.Unstructured, stop bool, ops []patchOp) (bool, error) {
 	sets, pods, err := s.notebookChildren(ctx, n)
 	if err != nil {
 		return false, err
 	}
+	return notebookObservedFrom(n, stop, ops, sets, pods)
+}
+
+func notebookObservedFrom(n *unstructured.Unstructured, stop bool, ops []patchOp, sets []appsv1.StatefulSet, pods []corev1.Pod) (bool, error) {
 	if len(sets) != 1 {
 		return false, nil
 	}

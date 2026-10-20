@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"kubeflow-admin/internal/model"
@@ -42,6 +43,16 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 	if err != nil {
 		return out, safe(err)
 	}
+	// Fetch these once, not once (or twice) per notebook. The same observations
+	// populate the tables and lifecycle summaries; mutation paths do not use them.
+	pods, err := s.Typed.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return out, safe(err)
+	}
+	sts, err := s.Typed.AppsV1().StatefulSets("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return out, safe(err)
+	}
 	for _, n := range nb.Items {
 		state := "Starting"
 		if _, ok := n.GetAnnotations()[stoppedKey]; ok {
@@ -58,17 +69,14 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 			im, _ := m["image"].(string)
 			d["image."+cn] = im
 		}
-		observed, observeErr := s.notebookObserved(ctx, &n, false, nil)
+		sets, children := notebookChildrenFrom(&n, sts.Items, pods.Items)
+		_, stopped := n.GetAnnotations()[stoppedKey]
+		observed, observeErr := notebookObservedFrom(&n, stopped, nil, sets, children)
 		if observeErr != nil {
 			return out, observeErr
 		}
 		if observed {
 			state = "Running / Ready"
-		} else if _, stop := n.GetAnnotations()[stoppedKey]; stop {
-			stopped, observeErr := s.notebookObserved(ctx, &n, true, nil)
-			if observeErr != nil {
-				return out, observeErr
-			}
 			if stopped {
 				state = "Stopped"
 			}
@@ -119,12 +127,18 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 		}
 		add("StorageClass", "", v.Name, string(v.UID), "", d)
 	}
-	pods, err := s.Typed.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return out, safe(err)
-	}
 	for _, p := range pods.Items {
-		d := map[string]string{"node": p.Spec.NodeName}
+		d := map[string]string{"node": p.Spec.NodeName, "liveUsage": "not available"}
+		if owner := podControllerOwner(&p); owner != "" {
+			d["owner"] = owner
+		}
+		ready, readyContainers, totalContainers := podReadiness(&p)
+		d["ready"] = strconv.FormatBool(ready)
+		d["containers"] = fmt.Sprintf("%d/%d ready", readyContainers, totalContainers)
+		d["restarts"] = strconv.Itoa(podRestartTotal(&p))
+		for key, value := range podResourceDetails(&p) {
+			d[key] = value
+		}
 		for _, c := range p.Status.Conditions {
 			if c.Status == "False" {
 				d["condition."+string(c.Type)] = c.Reason
@@ -139,11 +153,7 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 				d["terminated."+c.Name] = c.State.Terminated.Reason
 			}
 		}
-		add("Pod", p.Namespace, p.Name, string(p.UID), string(p.Status.Phase), d)
-	}
-	sts, err := s.Typed.AppsV1().StatefulSets("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return out, safe(err)
+		out.Resources = append(out.Resources, model.Resource{Kind: "Pod", Namespace: p.Namespace, Name: p.Name, UID: string(p.UID), Owner: d["owner"], State: string(p.Status.Phase), Details: d})
 	}
 	for _, v := range sts.Items {
 		add("StatefulSet", v.Namespace, v.Name, string(v.UID), fmt.Sprintf("%d ready", v.Status.ReadyReplicas), nil)
@@ -198,4 +208,92 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 	}
 	out.Warnings = []string{"Filesystem usage and storage-backend capacity are not available from Kubernetes inventory.", "Notebook CR dry-run does not validate controller-generated Pod admission or scheduling."}
 	return out, nil
+}
+
+func podControllerOwner(p *corev1.Pod) string {
+	c := metav1.GetControllerOf(p)
+	if c == nil {
+		return ""
+	}
+	return c.Kind + "/" + c.Name
+}
+
+func podReadiness(p *corev1.Pod) (bool, int, int) {
+	ready := false
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			ready = true
+		}
+	}
+	readyContainers := 0
+	for _, c := range p.Status.ContainerStatuses {
+		if c.Ready {
+			readyContainers++
+		}
+	}
+	return ready, readyContainers, len(p.Spec.Containers)
+}
+
+func podRestartTotal(p *corev1.Pod) int {
+	total := 0
+	for _, c := range p.Status.ContainerStatuses {
+		total += int(c.RestartCount)
+	}
+	return total
+}
+
+// podResourceDetails reports declared requests/limits, never live usage. It
+// sums regular containers, applies ordinary init maxima and adds Pod overhead.
+// It is a table summary, not an admission or scheduling calculation.
+func podResourceDetails(p *corev1.Pod) map[string]string {
+	requests := corev1.ResourceList{}
+	limits := corev1.ResourceList{}
+	for _, c := range p.Spec.Containers {
+		for name, q := range c.Resources.Requests {
+			cur := requests[name]
+			cur.Add(q)
+			requests[name] = cur
+		}
+		for name, q := range c.Resources.Limits {
+			cur := limits[name]
+			cur.Add(q)
+			limits[name] = cur
+		}
+	}
+	for _, c := range p.Spec.InitContainers {
+		for name, q := range c.Resources.Requests {
+			if cur, ok := requests[name]; !ok || q.Cmp(cur) > 0 {
+				requests[name] = q.DeepCopy()
+			}
+		}
+		for name, q := range c.Resources.Limits {
+			if cur, ok := limits[name]; !ok || q.Cmp(cur) > 0 {
+				limits[name] = q.DeepCopy()
+			}
+		}
+	}
+	for name, q := range p.Spec.Overhead {
+		for _, target := range []corev1.ResourceList{requests, limits} {
+			cur := target[name]
+			cur.Add(q)
+			target[name] = cur
+		}
+	}
+	out := map[string]string{}
+	for _, item := range []struct {
+		key   string
+		name  corev1.ResourceName
+		table corev1.ResourceList
+	}{
+		{"requested.cpu", corev1.ResourceCPU, requests},
+		{"requested.memory", corev1.ResourceMemory, requests},
+		{"limit.cpu", corev1.ResourceCPU, limits},
+		{"limit.memory", corev1.ResourceMemory, limits},
+	} {
+		q := item.table[item.name]
+		if q.Sign() > 0 {
+			out[item.key] = q.String()
+		}
+	}
+	return out
 }

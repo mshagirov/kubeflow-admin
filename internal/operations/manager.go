@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -45,6 +44,10 @@ type Manager struct {
 	lastPlanCleanup time.Time
 }
 
+// historyCleanupInterval is frequent enough to keep logical history bounded but
+// each pass deletes only small batches. Request paths never wait for it.
+const historyCleanupInterval = time.Minute
+
 func New(ctx context.Context, cfg config.Config, s *store.Store, k Backend) (*Manager, error) {
 	return newManager(ctx, cfg, s, k)
 }
@@ -55,6 +58,9 @@ func newManager(ctx context.Context, cfg config.Config, s *store.Store, k Backen
 	if !s.AcquireWorker() {
 		return nil, errors.New("an operation worker already owns this database")
 	}
+	// Direct config.Config values in tests and the operator path use the same
+	// conservative retention defaults.
+	cfg.History = cfg.History.WithDefaults()
 	ctx, cancel := context.WithCancel(ctx)
 	m := &Manager{cfg: cfg, s: s, k: k, ctx: ctx, cancel: cancel, queue: make(chan task, 32)}
 	fail := func(err error) (*Manager, error) { cancel(); s.ReleaseWorker(); return nil, err }
@@ -85,6 +91,10 @@ func newManager(ctx context.Context, cfg config.Config, s *store.Store, k Backen
 	}
 	m.wg.Add(1)
 	go m.worker()
+	// One background janitor performs bounded retention and is canceled and
+	// waited for by Close, like the operation worker.
+	m.wg.Add(1)
+	go m.janitor()
 	return m, nil
 }
 func terminal(s string) bool { return s == "succeeded" || s == "failed" || s == "needs-review" }
@@ -150,7 +160,7 @@ func (m *Manager) Plan(ctx context.Context, actor model.Identity, a model.Action
 		return model.Plan{}, err
 	}
 	now := time.Now().UTC()
-	plan := model.Plan{ID: planID, Actor: actor.Key(), CreatedAt: now, ExpiresAt: now.Add(5 * time.Minute), Prepared: p}
+	plan := model.Plan{ID: planID, Actor: actor.Key(), ActorDisplay: actor.DisplayName(), CreatedAt: now, ExpiresAt: now.Add(5 * time.Minute), Prepared: p}
 	if err := m.s.Put(ctx, "plans", plan.ID, plan); err != nil {
 		return model.Plan{}, storageError(err)
 	}
@@ -171,7 +181,7 @@ func (m *Manager) cleanupExpiredPlans(ctx context.Context) {
 	}
 	m.lastPlanCleanup = now
 	m.cleanupMu.Unlock()
-	cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(ctx, store.DefaultCleanupTimeout)
 	defer cancel()
 	if err := m.s.CleanupPlans(cleanupCtx, now); err != nil {
 		m.cleanupMu.Lock()
@@ -179,6 +189,59 @@ func (m *Manager) cleanupExpiredPlans(ctx context.Context) {
 		m.cleanupMu.Unlock()
 		// Cleanup is best-effort; do not put raw driver error text in logs.
 		slog.Warn("expired plan cleanup failed; retained plans will be retried")
+	}
+}
+
+func historyPolicy(h config.History) store.HistoryPolicy {
+	return store.HistoryPolicy{
+		RetentionDays:       h.RetentionDays,
+		MaxAuditRecords:     h.MaxAuditRecords,
+		MaxAuditBytes:       h.MaxAuditBytes,
+		MaxOperationRecords: h.MaxOperationRecords,
+	}
+}
+
+// janitor owns periodic, bounded history retention. It never runs on a request
+// path and is stopped and waited for by Close.
+func (m *Manager) janitor() {
+	defer m.wg.Done()
+	// Run one pass after startup without delaying recovery or serving. It is
+	// bounded and transactional, like later passes.
+	m.cleanupHistory(m.ctx)
+	ticker := time.NewTicker(historyCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			m.cleanupHistory(m.ctx)
+		}
+	}
+}
+
+func (m *Manager) cleanupHistory(ctx context.Context) {
+	// Audit pruning and operation compaction each get an independent 500ms
+	// transaction; the outer span only prevents a hung pass from accumulating.
+	cleanupCtx, cancel := context.WithTimeout(ctx, 2*store.DefaultCleanupTimeout)
+	defer cancel()
+	result, err := m.s.CleanupHistory(cleanupCtx, historyPolicy(m.cfg.History), time.Now())
+	if err != nil {
+		var integrity *store.IntegrityError
+		if errors.As(err, &integrity) {
+			slog.Error("history retention stopped on an integrity failure; operator reconciliation required", "reason", integrity.Reason)
+			return
+		}
+		// Best effort, no raw driver/OS text in logs. The next interval retries.
+		slog.Warn("bounded history retention did not complete; retained records will be retried")
+		return
+	}
+	if result.PurgedExpired > 0 || result.PurgedUnderPressure > 0 || result.CompactedOperations > 0 || result.RedactedAcceptanceLedger > 0 {
+		slog.Info("bounded history retention completed",
+			"purgedExpired", result.PurgedExpired,
+			"purgedUnderPressure", result.PurgedUnderPressure,
+			"compactedOperations", result.CompactedOperations,
+			"redactedAcceptanceLedger", result.RedactedAcceptanceLedger)
 	}
 }
 
@@ -218,6 +281,9 @@ func (m *Manager) Submit(ctx context.Context, actor model.Identity, planID, key 
 	if len(m.queue) == cap(m.queue) {
 		return model.Operation{}, errors.New("operation queue full; retry later")
 	}
+	// Admission, including audit row/byte pressure and the exact new accepted row
+	// size, is enforced atomically by CreateOperationWithPolicy after idempotent
+	// retries have resolved.
 	a := plan.Prepared.Action
 	target := store.PrimaryTarget(a)
 	opID, err := id()
@@ -225,8 +291,8 @@ func (m *Manager) Submit(ctx context.Context, actor model.Identity, planID, key 
 		return model.Operation{}, err
 	}
 	now := time.Now().UTC()
-	op := model.Operation{ID: opID, PlanID: plan.ID, Actor: actor.Key(), Target: target, Action: a.Kind, State: "queued", Step: "queued", CreatedAt: now, UpdatedAt: now}
-	op, created, err := m.s.CreateOperation(ctx, op, plan, key)
+	op := model.Operation{ID: opID, PlanID: plan.ID, Actor: actor.Key(), ActorDisplay: actor.DisplayName(), Target: target, Action: a.Kind, State: "queued", Step: "queued", CreatedAt: now, UpdatedAt: now}
+	op, created, err := m.s.CreateOperationWithPolicy(ctx, op, plan, key, historyPolicy(m.cfg.History))
 	if err != nil {
 		return model.Operation{}, storageError(err)
 	}
@@ -338,6 +404,9 @@ func (m *Manager) run(t task) bool {
 	err := checkpoint("validating")
 	if err == nil {
 		err = m.k.Execute(ctx, t.plan.Prepared, checkpoint)
+	} else {
+		// No backend execution or cluster write has started.
+		err = errors.Join(model.ErrRejectedBeforeMutation, err)
 	}
 	// A backend that returns nil after cancellation cannot report success.
 	if err == nil && ctx.Err() != nil {
@@ -349,6 +418,13 @@ func (m *Manager) run(t task) bool {
 	if err == nil {
 		op.State = "succeeded"
 		op.Step = "verified"
+	} else if errors.Is(err, model.ErrRejectedBeforeMutation) {
+		// A definite API rejection (for example PDB/403/409 before the eviction or
+		// patch request changed anything) is a failed operation. Finishing as
+		// failed releases its target locks, so a corrected preview can proceed.
+		op.State = "failed"
+		op.Step = "rejected"
+		op.Error = "The cluster API rejected the request before any change was applied. Nothing was changed; correct the reported precondition, authenticate and preview again."
 	} else {
 		op.State = "needs-review"
 		op.Error = safeError(err) + " Inspect actual cluster state; a notebook may be stopped or storage partially provisioned. No rollback or automatic replay was performed. Targets remain locked pending explicit reconciliation."
@@ -386,11 +462,18 @@ func storageError(err error) error {
 		// Preserve the typed, actionable integrity failure so operators can act.
 		return integrity
 	}
+	var budget *store.BudgetError
+	if errors.As(err, &budget) {
+		return budget
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		return store.ErrNotFound
 	}
 	if errors.Is(err, store.ErrConflict) {
 		return store.ErrConflict
+	}
+	if errors.Is(err, store.ErrInvalidTarget) {
+		return store.ErrInvalidTarget
 	}
 	return errors.New("durable operation storage unavailable")
 }
@@ -409,25 +492,29 @@ func (m *Manager) Get(ctx context.Context, id string) (model.Operation, error) {
 	return op, nil
 }
 func (m *Manager) List(ctx context.Context) ([]model.Operation, error) {
-	return list[model.Operation](ctx, m.s, "operations")
-}
-func (m *Manager) Audit(ctx context.Context) ([]model.Audit, error) {
-	return list[model.Audit](ctx, m.s, "audit")
-}
-func list[T any](ctx context.Context, s *store.Store, bucket string) ([]T, error) {
-	raw, err := s.List(ctx, bucket, 1000)
+	ops, err := m.s.RecentOperations(ctx, store.RecentHistoryLimit)
 	if err != nil {
 		return nil, storageError(err)
 	}
-	out := []T{}
-	for _, r := range raw {
-		var v T
-		if err := json.Unmarshal(r, &v); err != nil {
-			return nil, storageError(err)
-		}
-		out = append(out, v)
+	return ops, nil
+}
+func (m *Manager) Audit(ctx context.Context) ([]model.Audit, error) {
+	audit, err := m.s.RecentAuditWithPolicy(ctx, historyPolicy(m.cfg.History), store.RecentHistoryLimit)
+	if err != nil {
+		return nil, storageError(err)
 	}
-	return out, nil
+	return audit, nil
+}
+
+// HistoryStats exposes effective retention limits and the residual safety
+// ledger/tombstone usage so HTTP handlers can state truncation and residual
+// storage honestly. Logical budgets do not cap physical SQLite/WAL files.
+func (m *Manager) HistoryStats(ctx context.Context) (store.HistoryStats, error) {
+	stats, err := m.s.HistoryStats(ctx, historyPolicy(m.cfg.History))
+	if err != nil {
+		return store.HistoryStats{}, storageError(err)
+	}
+	return stats, nil
 }
 func (m *Manager) Close() {
 	m.closeOnce.Do(func() {

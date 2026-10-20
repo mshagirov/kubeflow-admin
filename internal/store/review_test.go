@@ -203,7 +203,7 @@ func TestMultiTargetLockAndReviewRetention(t *testing.T) {
 	ctx := context.Background()
 	makeOp := func(id, pvc, pv string) (model.Operation, model.Plan) {
 		p := model.Plan{ID: id, Actor: "issuer|admin", Prepared: model.Prepared{Action: model.Action{Kind: "pv.reserve-and-claim", Namespace: "alice", Name: pvc, PVName: pv}}}
-		return model.Operation{ID: "op-" + id, PlanID: id, Actor: p.Actor, Target: "pvc:alice/" + pvc, State: "queued"}, p
+		return model.Operation{ID: "op-" + id, PlanID: id, Actor: p.Actor, Target: "pvc:alice/" + pvc, Action: p.Prepared.Action.Kind, State: "queued"}, p
 	}
 	op, p := makeOp("first", "claim", "pv-a")
 	if _, _, err := s.CreateOperation(ctx, op, p, "first-key"); err != nil {
@@ -224,7 +224,7 @@ func TestMultiTargetLockAndReviewRetention(t *testing.T) {
 	if _, _, err := s.CreateOperation(ctx, next, plan, "next-key"); !errors.Is(err, ErrConflict) {
 		t.Fatal("review released PV lock", err)
 	}
-	if prior, created, err := s.CreateOperation(ctx, model.Operation{ID: "retry", PlanID: p.ID, Actor: p.Actor, Target: op.Target, State: "queued"}, p, "first-key"); err != nil || created || prior.ID != op.ID || prior.State != "needs-review" {
+	if prior, created, err := s.CreateOperation(ctx, model.Operation{ID: "retry", PlanID: p.ID, Actor: p.Actor, Target: op.Target, Action: p.Prepared.Action.Kind, State: "queued"}, p, "first-key"); err != nil || created || prior.ID != op.ID || prior.State != "needs-review" {
 		t.Fatal("review retry not idempotent", prior, created, err)
 	}
 }

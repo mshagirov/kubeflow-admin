@@ -62,6 +62,34 @@ func TestDatabaseOptions(t *testing.T) {
 	}
 }
 
+func TestHistoryAndLoggingLimits(t *testing.T) {
+	c, err := load(t, valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.PodRestarts || c.Logging.Path != "" || c.History.WithDefaults().RetentionDays != 90 {
+		t.Fatal("unsafe feature or retention defaults")
+	}
+	for _, mutate := range []func(*Config){
+		func(c *Config) { c.History.RetentionDays = 91 },
+		func(c *Config) { c.History.MaxAuditRecords = -1 },
+		func(c *Config) { c.History.MaxAuditBytes = 1 },
+		func(c *Config) { c.History.MaxOperationRecords = 1 },
+		func(c *Config) { c.Logging.MaxSizeMiB = -1 },
+		func(c *Config) { c.Logging.MaxBackups = 100 },
+		func(c *Config) { c.Logging.MaxAgeDays = 91 },
+		func(c *Config) { c.Logging.Path = "relative.log" },
+		func(c *Config) { c.Logging.Path = c.Database.Path },
+		func(c *Config) { c.Logging.Path = c.Database.Path + "-wal" },
+	} {
+		copy := c
+		mutate(&copy)
+		if copy.Validate() == nil {
+			t.Fatal("unsafe history/logging configuration accepted")
+		}
+	}
+}
+
 func TestLoginSourceLimit(t *testing.T) {
 	for _, tc := range []struct {
 		name string

@@ -20,7 +20,7 @@ func planFor(kind, ns, name, pv string) model.Plan {
 }
 
 func queuedOp(plan model.Plan, id, target string) model.Operation {
-	return model.Operation{ID: id, PlanID: plan.ID, Actor: plan.Actor, Target: target, State: "queued", CreatedAt: time.Now()}
+	return model.Operation{ID: id, PlanID: plan.ID, Actor: plan.Actor, Target: target, Action: plan.Prepared.Action.Kind, State: "queued", CreatedAt: time.Now(), UpdatedAt: time.Now()}
 }
 
 // A malformed JSON row must never abort cleanup of the remaining records. Before
@@ -216,12 +216,18 @@ func TestMissingAcceptedAuditFailsClosed(t *testing.T) {
 	if _, _, err := s.CreateOperation(ctx, op, plan, "idempotency-key-audit"); err != nil {
 		t.Fatal(err)
 	}
+	// Acceptance evidence lives in the immutable safety ledger; visible audit is
+	// presentation history and may be purged. Remove both to simulate genuinely
+	// missing evidence.
+	if _, err := s.db.Exec(`DELETE FROM operation_acceptance WHERE operation_id=?`, op.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Delete(ctx, "audit", op.ID+"-accepted"); err != nil {
 		t.Fatal(err)
 	}
 	op.State = "applying"
 	if err := s.Checkpoint(ctx, op, model.Audit{ID: "cp"}); !errors.Is(err, ErrIntegrity) {
-		t.Fatal("missing accepted audit not a typed integrity error", err)
+		t.Fatal("missing acceptance evidence not a typed integrity error", err)
 	}
 	// Fail closed: the operation is unchanged and no audit was fabricated.
 	var got model.Operation

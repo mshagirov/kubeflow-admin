@@ -4,13 +4,16 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"html/template"
 	"io"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,9 +37,11 @@ type pageView struct {
 	Config   pageConfig
 }
 type pageIdentity struct {
-	Email   string
-	Subject string
-	CSRF    string
+	Email             string
+	Subject           string
+	CSRF              string
+	DisplayName       string
+	NotificationScope string
 }
 type pageConfig struct {
 	Features  pageFeatures
@@ -47,6 +52,7 @@ type pageFeatures struct {
 	WritesEnabled bool
 	StaticStorage bool
 	PVCExpansion  bool
+	PodRestarts   bool
 }
 type pageNotebooks struct {
 	ControllerContractConfirmed bool
@@ -72,12 +78,13 @@ type pageTemplate struct {
 // storage class/template names.
 func buildPageView(identity model.Identity, cfg config.Config) pageView {
 	v := pageView{
-		Identity: pageIdentity{Email: identity.Email, Subject: identity.Subject, CSRF: identity.CSRF},
+		Identity: pageIdentity{Email: identity.Email, Subject: identity.Subject, CSRF: identity.CSRF, DisplayName: identity.DisplayName(), NotificationScope: identity.NotificationScope},
 		Config: pageConfig{
 			Features: pageFeatures{
 				WritesEnabled: cfg.Features.WritesEnabled,
 				StaticStorage: cfg.Features.StaticStorage,
 				PVCExpansion:  cfg.Features.PVCExpansion,
+				PodRestarts:   cfg.Features.PodRestarts,
 			},
 			Notebooks: pageNotebooks{
 				ControllerContractConfirmed: cfg.Notebooks.ControllerContractConfirmed,
@@ -146,6 +153,7 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 			backendFailure(w, e, false)
 			return
 		}
+		s.historyHeaders(w, "recent-plus-unresolved")
 		respond(w, 200, v)
 	})
 	private.HandleFunc("GET /api/v1/operations/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -162,12 +170,13 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 			backendFailure(w, e, false)
 			return
 		}
+		s.historyHeaders(w, "recent-audit-events")
 		respond(w, 200, v)
 	})
 	private.HandleFunc("POST /logout", logout)
 	private.HandleFunc("POST /auth/logout", logout)
 	tmpl := template.Must(template.ParseFS(assets, "assets/index.html"))
-	for _, path := range []string{"/{$}", "/profiles", "/storage", "/notebooks", "/operations", "/audit"} {
+	for _, path := range []string{"/{$}", "/profiles", "/storage", "/notebooks", "/pods", "/history", "/operations", "/audit"} {
 		private.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {
 			identity, ok := s.identity(r.Context())
 			if !ok {
@@ -180,6 +189,11 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 				return
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			// Native form POSTs can acquire Origin: null under no-referrer
+			// (notably in Firefox). Preserve origin for same-origin submissions
+			// without disclosing dashboard paths to external sites. OIDC callback
+			// and other responses retain their stricter no-referrer policy.
+			w.Header().Set("Referrer-Policy", "same-origin")
 			_, _ = w.Write(page.Bytes())
 		})
 	}
@@ -222,12 +236,20 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 				return
 			}
 			w.Header().Set("Content-Type", mime.TypeByExtension("."+strings.Split(name, ".")[1]))
-			w.Header().Set("Cache-Control", "public, max-age=3600")
-			_, _ = w.Write(b)
+			hash := sha256.Sum256(b)
+			w.Header().Set("ETag", `"`+hex.EncodeToString(hash[:])+`"`)
+			w.Header().Set("Cache-Control", "no-cache")
+			http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(b))
 		})
 	}
 	root.Handle("/", protect(private))
 	return security(root)
+}
+
+func (s *server) historyHeaders(w http.ResponseWriter, window string) {
+	w.Header().Set("X-History-Limit", "1000")
+	w.Header().Set("X-History-Window", window)
+	w.Header().Set("X-History-Retention-Days", strconv.Itoa(s.cfg.History.WithDefaults().RetentionDays))
 }
 
 func security(next http.Handler) http.Handler {

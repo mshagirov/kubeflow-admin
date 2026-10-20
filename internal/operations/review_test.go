@@ -358,7 +358,7 @@ func TestStartupFailsClosedOnOrphanedActiveClaim(t *testing.T) {
 	m.Close()
 	ctx := context.Background()
 	p := model.Plan{ID: "orphan-plan", Actor: actor.Key(), Prepared: model.Prepared{Action: model.Action{Kind: "notebook.stop", Namespace: "alice", Name: "orphan"}}}
-	op := model.Operation{ID: "orphan-op", PlanID: p.ID, Actor: p.Actor, Target: "notebook:alice/orphan", State: "queued"}
+	op := model.Operation{ID: "orphan-op", PlanID: p.ID, Actor: p.Actor, Target: "notebook:alice/orphan", Action: p.Prepared.Action.Kind, State: "queued"}
 	if _, _, err := s.CreateOperation(ctx, op, p, "orphan-idempotency-key"); err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ func TestStartupFailsClosedOnOrphanedActiveClaim(t *testing.T) {
 	}
 	// Fail closed: a fresh request for the same canonical target is still locked.
 	newPlan := model.Plan{ID: "new-plan", Actor: p.Actor, Prepared: p.Prepared}
-	fresh := model.Operation{ID: "new-op", PlanID: newPlan.ID, Actor: p.Actor, Target: "notebook:alice/orphan", State: "queued"}
+	fresh := model.Operation{ID: "new-op", PlanID: newPlan.ID, Actor: p.Actor, Target: "notebook:alice/orphan", Action: newPlan.Prepared.Action.Kind, State: "queued"}
 	if _, _, err := s.CreateOperation(ctx, fresh, newPlan, "new-idempotency-key1"); !errors.Is(err, store.ErrConflict) {
 		t.Fatal("orphan lock was silently released", err)
 	}
@@ -386,7 +386,7 @@ func TestStartupQueuedAcceptanceIsReviewedAndLocked(t *testing.T) {
 	m, s, actor := setup(t, &fakeBackend{})
 	m.Close()
 	p := model.Plan{ID: "durable-plan", Actor: actor.Key(), Prepared: model.Prepared{Action: model.Action{Kind: "notebook.stop", Namespace: "alice", Name: "lab"}}}
-	op := model.Operation{ID: "durable-op", PlanID: p.ID, Actor: p.Actor, Target: "notebook:alice/lab", State: "queued"}
+	op := model.Operation{ID: "durable-op", PlanID: p.ID, Actor: p.Actor, Target: "notebook:alice/lab", Action: p.Prepared.Action.Kind, State: "queued"}
 	if _, _, err := s.CreateOperation(context.Background(), op, p, "durable-key"); err != nil {
 		t.Fatal(err)
 	}

@@ -271,7 +271,10 @@ re-validation.
 both the configured session minutes and the ID-token expiry (and never more
 than a hard ceiling such as 15 minutes); validate issuer and subject on every
 request; re-check the admin group/subject allowlist so removing an admin takes
-effect immediately; logout revokes; periodic cleanup never touches audit rows.
+effect immediately; logout revokes; authentication cleanup touches only auth
+records. A separate bounded-history janitor implements audit retention (up to
+90 days and the configured row/byte budgets), preserving durable safety evidence
+and idempotency independently of the visible History window.
 
 **Write tests:** expired/forged/revoked sessions rejected; policy change
 disables a live session; cleanup runs at most once per minute.

@@ -7,9 +7,11 @@ info:
     browser session, then GET /api/v1/me for the CSRF value. Every unsafe request
     needs the configured HTTPS Origin (or same-origin Referer) and X-CSRF-Token.
     POST requests accept a single strict JSON object up to 64 KiB. Plan previews
-    require enabled writes and server dry-run privileges; no cluster mutation is
+    require enabled writes and applicable validation privileges; no cluster mutation is
     committed until an actor-bound unexpired plan is submitted. No arbitrary
-    Kubernetes manifests, proxy, deletion or operation replay endpoints exist.
+    Kubernetes manifests, proxy, unrestricted deletion or operation replay endpoints exist.
+    The separately gated pod.restart action performs normal PDB-aware eviction
+    of a validated Notebook-managed Pod only; no forced deletion is supported.
     This describes the implemented subset, not all routes from design plans.
 servers:
   - url: /
@@ -155,7 +157,7 @@ paths:
       summary: Node projections (advertised extended-resource allocatable, no addresses)
   /api/v1/plans:
     post:
-      summary: Prepare typed action, validate dependencies and server dry-run
+      summary: Prepare typed action and validate dependencies (dry-run where supported)
       parameters:
         - {$ref: '#/components/parameters/CSRF'}
         - {$ref: '#/components/parameters/Origin'}
@@ -177,10 +179,19 @@ paths:
         default: {$ref: '#/components/responses/Error'}
   /api/v1/operations:
     get:
-      summary: Recent operations (bounded server-side list, no pagination contract)
+      summary: Recent operation window plus bounded unresolved operations
       responses:
         '200':
           description: Operations
+          headers:
+            X-History-Limit:
+              description: Maximum ordinary recent records; unresolved operations are added separately
+              schema: {type: integer, example: 1000}
+            X-History-Window:
+              schema: {type: string, example: recent-plus-unresolved}
+            X-History-Retention-Days:
+              description: Upper retention horizon; row/byte pressure may retain less
+              schema: {type: integer, maximum: 90}
           content:
             application/json:
               schema:
@@ -233,10 +244,18 @@ paths:
         default: {$ref: '#/components/responses/Error'}
   /api/v1/audit:
     get:
-      summary: Recent audit records (bounded server-side list, not full archive)
+      summary: Recent audit events within retention and storage budgets (not full archive)
       responses:
         '200':
           description: Audit records
+          headers:
+            X-History-Limit:
+              schema: {type: integer, example: 1000}
+            X-History-Window:
+              schema: {type: string, example: recent-audit-events}
+            X-History-Retention-Days:
+              description: Upper retention horizon; row/byte pressure may retain less
+              schema: {type: integer, maximum: 90}
           content:
             application/json:
               schema:
@@ -315,6 +334,8 @@ components:
         issuer: {type: string}
         subject: {type: string}
         email: {type: string}
+        username: {type: string, description: Provider presentation claim; never an authorization key}
+        notificationScope: {type: string, description: Non-secret random per-session notification dismissal scope}
         groups: {type: array, nullable: true, items: {type: string}}
         authenticatedAt: {type: string, format: date-time}
         expiresAt: {type: string, format: date-time}
@@ -327,10 +348,10 @@ components:
       properties:
         kind:
           type: string
-          enum: [profile.create, profile.quota.change, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, notebook.start, notebook.stop, notebook.edit]
+          enum: [profile.create, profile.quota.change, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, notebook.start, notebook.stop, notebook.edit, pod.restart]
         namespace: {type: string}
         name: {type: string}
-        reason: {type: string}
+        reason: {type: string, maxLength: 500, description: 'Administrator input only; required and nonblank for pod.restart'}
         owner: {type: string, description: 'Exact Kubeflow owner identity, not an LDAP account creation'}
         quota: {type: object, additionalProperties: {type: string}}
         storageClass: {type: string}
@@ -372,6 +393,7 @@ components:
         summary: {type: string}
         warnings: {type: array, nullable: true, items: {type: string}}
         changes: {type: array, items: {$ref: '#/components/schemas/Change'}}
+        parentNotebook: {type: string, description: Server-validated parent used for pod restart locking}
         data:
           type: object
           additionalProperties: true
@@ -389,6 +411,7 @@ components:
       properties:
         id: {type: string}
         actor: {type: string, description: Issuer and subject identity key}
+        actorDisplay: {type: string, description: Presentation label captured at acceptance; never authorization}
         createdAt: {type: string, format: date-time}
         expiresAt: {type: string, format: date-time}
         prepared: {$ref: '#/components/schemas/Prepared'}
@@ -399,6 +422,8 @@ components:
         id: {type: string}
         planID: {type: string}
         actor: {type: string}
+        actorDisplay: {type: string}
+        historyExpired: {type: boolean, description: Compact idempotency record retained after history expiration}
         target: {type: string}
         action: {type: string}
         state: {type: string, description: Durable state; incomplete recovery becomes needs-review}
@@ -412,6 +437,7 @@ components:
       properties:
         id: {type: string}
         actor: {type: string}
+        actorDisplay: {type: string}
         action: {type: string}
         target: {type: string}
         result: {type: string}

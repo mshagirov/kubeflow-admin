@@ -30,6 +30,8 @@ ALLOWED = {
     ("", "persistentvolumeclaims"): {"get", "list", "create", "patch"},
     # GPU notebook planning must read the referenced RuntimeClass; get only.
     ("node.k8s.io", "runtimeclasses"): {"get"},
+    # Explicit optional pod-restart workflow uses PDB-aware eviction only.
+    ("", "pods/eviction"): {"create"},
 }
 EXPECTED_ROLES = {
     "kubeflow-admin-read": {key: {"get", "list"} for key in READ_RESOURCES},
@@ -41,6 +43,7 @@ EXPECTED_ROLES = {
     },
     "kubeflow-admin-static-storage": {("", "persistentvolumes"): {"create", "patch"}},
     "kubeflow-admin-pvc-expansion": {("", "persistentvolumeclaims"): {"patch"}},
+    "kubeflow-admin-pod-restarts": {("", "pods/eviction"): {"create"}},
 }
 
 def check(path):
@@ -56,6 +59,8 @@ def check(path):
                 assert not rule.get("nonResourceURLs"), rule
                 for group in rule["apiGroups"]:
                     for resource in rule["resources"]:
+                        if resource == "pods/eviction":
+                            assert path.name == "pod-restarts", "eviction grant must stay separately opt-in"
                         actual.setdefault((group, resource), set()).update(rule["verbs"])
                         assert set(rule["verbs"]) <= ALLOWED.get((group, resource), set()), rule
                         if path.name in ("base", "local-storage"):

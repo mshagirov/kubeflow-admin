@@ -43,3 +43,15 @@ features:
   writesEnabled: false
   staticStorage: false
   pvcExpansion: false
+  podRestarts: false
+history:
+  retentionDays: 90
+  maxAuditRecords: 50000
+  maxAuditBytes: 67108864
+  maxOperationRecords: 100000
+logging:
+  # Empty path keeps JSON slog output on stdout; kubelet rotates container logs.
+  path: ''
+  maxSizeMiB: 10
+  maxBackups: 5
+  maxAgeDays: 7

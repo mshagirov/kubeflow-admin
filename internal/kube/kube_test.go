@@ -322,6 +322,9 @@ func TestStalePreviewAndCheckpointFailureNeverWrite(t *testing.T) {
 			if err == nil {
 				t.Fatal("accepted stale plan/failed checkpoint")
 			}
+			if !errors.Is(err, model.ErrRejectedBeforeMutation) {
+				t.Fatalf("known read-only rejection would strand locks: %v", err)
+			}
 			assertNoWrites(t, api)
 		})
 	}

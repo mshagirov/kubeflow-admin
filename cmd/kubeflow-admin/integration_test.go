@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -71,7 +72,7 @@ func TestAuthenticatedApplicationWorkflow(t *testing.T) {
 			n := nonce
 			nonceMu.Unlock()
 			header, _ := json.Marshal(map[string]string{"alg": "RS256", "kid": "test"})
-			body, _ := json.Marshal(map[string]any{"iss": issuer, "sub": "test-admin", "aud": "kubeflow-admin", "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "nonce": n, "groups": []string{"platform-admins"}, "email": "admin@example.org"})
+			body, _ := json.Marshal(map[string]any{"iss": issuer, "sub": "test-admin", "aud": "kubeflow-admin", "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(), "nonce": n, "groups": []string{"platform-admins"}, "email": "admin@example.org", "preferred_username": "test-admin"})
 			raw := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(body)
 			h := sha256.Sum256([]byte(raw))
 			sig, e := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, h[:])
@@ -186,10 +187,16 @@ func TestAuthenticatedApplicationWorkflow(t *testing.T) {
 		b, _ := io.ReadAll(callback.Body)
 		t.Fatalf("callback %d: %s", callback.StatusCode, b)
 	}
+	if callback.Header.Get("Referrer-Policy") != "no-referrer" {
+		t.Fatal("callback must not disclose authorization parameters")
+	}
 	var identity model.Identity
 	me := request("GET", "/api/v1/me", nil, "")
 	if err = json.NewDecoder(me.Body).Decode(&identity); err != nil || me.StatusCode != 200 || identity.CSRF == "" {
 		t.Fatal("identity", me.StatusCode, err)
+	}
+	if identity.Username != "test-admin" || identity.NotificationScope == "" || identity.NotificationScope == identity.CSRF {
+		t.Fatal("missing display identity or independent notification scope")
 	}
 	readiness := request("GET", "/readyz", nil, "")
 	if readiness.StatusCode != 200 {
@@ -198,6 +205,9 @@ func TestAuthenticatedApplicationWorkflow(t *testing.T) {
 	page := request("GET", "/notebooks", nil, "")
 	if page.StatusCode != 200 {
 		t.Fatal("page", page.StatusCode)
+	}
+	if page.Header.Get("Referrer-Policy") != "same-origin" {
+		t.Fatal("dashboard must preserve origin for native logout forms")
 	}
 	// Exercise the real authentication -> web -> manager -> adapter boundary;
 	// injecting errors directly into web-only fakes cannot catch manager masking.
@@ -244,10 +254,16 @@ func TestAuthenticatedApplicationWorkflow(t *testing.T) {
 	if err = json.NewDecoder(response.Body).Decode(&plan); err != nil || response.StatusCode != 201 {
 		t.Fatal("plan", response.StatusCode, err, plan)
 	}
+	if plan.ActorDisplay != identity.DisplayName() {
+		t.Fatal("preview lacks readable actor label")
+	}
 	response = request("POST", "/api/v1/operations", map[string]string{"planID": plan.ID, "idempotencyKey": "integration-operation-key"}, identity.CSRF)
 	var op model.Operation
 	if err = json.NewDecoder(response.Body).Decode(&op); err != nil || response.StatusCode != 202 {
 		t.Fatal("submit", response.StatusCode, err)
+	}
+	if op.ActorDisplay != identity.DisplayName() {
+		t.Fatal("accepted operation lacks captured actor label")
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -263,7 +279,34 @@ func TestAuthenticatedApplicationWorkflow(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	logout := request("POST", "/auth/logout", map[string]string{}, identity.CSRF)
+	// Exercise the actual HTML form path (no X-CSRF-Token header), including
+	// rejection of null origins and wrong tokens before successful revocation.
+	var logout *http.Response
+	for _, tc := range []struct {
+		origin, token string
+		status        int
+	}{
+		{"null", identity.CSRF, 403},
+		{app.URL, "wrong", 403},
+		{app.URL, identity.CSRF, 303},
+	} {
+		r, err := http.NewRequest("POST", app.URL+"/auth/logout",
+			strings.NewReader(url.Values{"csrf": {tc.token}}.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.Header.Set("Origin", tc.origin)
+		r.Header.Set("Sec-Fetch-Site", "same-origin")
+		logout, err = client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		logout.Body.Close()
+		if logout.StatusCode != tc.status {
+			t.Fatalf("form logout origin=%s: status=%d want=%d", tc.origin, logout.StatusCode, tc.status)
+		}
+	}
 	if logout.StatusCode != 303 {
 		t.Fatal("logout", logout.StatusCode)
 	}

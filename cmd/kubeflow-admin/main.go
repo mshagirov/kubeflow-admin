@@ -14,6 +14,7 @@ import (
 	"kubeflow-admin/internal/auth"
 	"kubeflow-admin/internal/config"
 	"kubeflow-admin/internal/kube"
+	"kubeflow-admin/internal/logging"
 	"kubeflow-admin/internal/operations"
 	"kubeflow-admin/internal/store"
 	"kubeflow-admin/internal/web"
@@ -46,6 +47,17 @@ func run() error {
 	defer cancel()
 	// Keep database, journal and lock files private regardless of tooling.
 	syscall.Umask(0077)
+	logOutput, err := logging.Setup(cfg.Logging)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// Keep terminal startup/shutdown errors visible after closing a file sink.
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+		if err := logOutput.Close(); err != nil {
+			slog.Error("log output close failed", "error", err)
+		}
+	}()
 	s, err := store.OpenWithJournal(cfg.Database.Path, cfg.Database.JournalMode, cfg.Database.AllowUnverifiedFilesystem)
 	if err != nil {
 		return err

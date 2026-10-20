@@ -380,8 +380,10 @@ func TestBrowserPayloadAndPreviewLogic(t *testing.T) {
 	if err != nil {
 		t.Skip("Node is required for the local browser-logic test")
 	}
-	if output, err := exec.Command(node, "testdata/logic_test.cjs").CombinedOutput(); err != nil {
-		t.Fatalf("browser logic: %v\n%s", err, output)
+	for _, script := range []string{"testdata/logic_test.cjs", "testdata/navigation_test.cjs"} {
+		if output, err := exec.Command(node, script).CombinedOutput(); err != nil {
+			t.Fatalf("browser logic %s: %v\n%s", script, err, output)
+		}
 	}
 }
 

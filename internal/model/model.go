@@ -2,23 +2,54 @@ package model
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"time"
+	"unicode"
 )
+
+// ErrRejectedBeforeMutation is used only when the backend can establish that
+// the API rejected an action before any mutation occurred. Ambiguous transport
+// failures must never use it.
+var ErrRejectedBeforeMutation = errors.New("action rejected before mutation")
 
 type Identity struct {
 	// SessionID is the server-only hash of the opaque browser credential. It is
 	// never serialized to a browser, plan, audit record, or operation.
-	SessionID       string    `json:"-"`
-	Issuer          string    `json:"issuer"`
-	Subject         string    `json:"subject"`
-	Email           string    `json:"email"`
-	Groups          []string  `json:"groups"`
-	AuthenticatedAt time.Time `json:"authenticatedAt"`
-	ExpiresAt       time.Time `json:"expiresAt"`
-	CSRF            string    `json:"csrf,omitempty"`
+	SessionID         string    `json:"-"`
+	Issuer            string    `json:"issuer"`
+	Subject           string    `json:"subject"`
+	Email             string    `json:"email"`
+	Username          string    `json:"username,omitempty"`
+	NotificationScope string    `json:"notificationScope,omitempty"`
+	Groups            []string  `json:"groups"`
+	AuthenticatedAt   time.Time `json:"authenticatedAt"`
+	ExpiresAt         time.Time `json:"expiresAt"`
+	CSRF              string    `json:"csrf,omitempty"`
 }
 
 func (i Identity) Key() string { return i.Issuer + "|" + i.Subject }
+
+// DisplayName is a presentation label from signed provider claims, never an
+// authorization key. Historical records capture it at acceptance time.
+func (i Identity) DisplayName() string {
+	for _, value := range []string{i.Username, i.Email, i.Subject} {
+		value = strings.TrimSpace(strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+				return -1
+			}
+			return r
+		}, value))
+		if value != "" {
+			runes := []rune(value)
+			if len(runes) > 160 {
+				runes = runes[:160]
+			}
+			return string(runes)
+		}
+	}
+	return "Unknown administrator"
+}
 
 // Action is deliberately typed: no arbitrary Kubernetes manifests or field paths.
 type Action struct {
@@ -58,6 +89,7 @@ type Prepared struct {
 	Summary         string   `json:"summary"`
 	Warnings        []string `json:"warnings"`
 	Changes         []Change `json:"changes,omitempty"`
+	ParentNotebook  string   `json:"parentNotebook,omitempty"`
 	// Data must contain only safe, narrow edit/dependency evidence, never whole Pod templates.
 	Data json.RawMessage `json:"data,omitempty"`
 }
@@ -70,34 +102,38 @@ type Change struct {
 }
 
 type Plan struct {
-	ID        string    `json:"id"`
-	Actor     string    `json:"actor"`
-	CreatedAt time.Time `json:"createdAt"`
-	ExpiresAt time.Time `json:"expiresAt"`
-	Prepared  Prepared  `json:"prepared"`
+	ID           string    `json:"id"`
+	Actor        string    `json:"actor"`
+	ActorDisplay string    `json:"actorDisplay,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	ExpiresAt    time.Time `json:"expiresAt"`
+	Prepared     Prepared  `json:"prepared"`
 }
 type Operation struct {
-	ID        string    `json:"id"`
-	PlanID    string    `json:"planID"`
-	Actor     string    `json:"actor"`
-	Target    string    `json:"target"`
-	Action    string    `json:"action"`
-	State     string    `json:"state"`
-	Step      string    `json:"step"`
-	Error     string    `json:"error,omitempty"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID             string    `json:"id"`
+	PlanID         string    `json:"planID"`
+	Actor          string    `json:"actor"`
+	ActorDisplay   string    `json:"actorDisplay,omitempty"`
+	HistoryExpired bool      `json:"historyExpired,omitempty"`
+	Target         string    `json:"target"`
+	Action         string    `json:"action"`
+	State          string    `json:"state"`
+	Step           string    `json:"step"`
+	Error          string    `json:"error,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 type Audit struct {
-	ID          string    `json:"id"`
-	Actor       string    `json:"actor"`
-	Action      string    `json:"action"`
-	Target      string    `json:"target"`
-	Result      string    `json:"result"`
-	OperationID string    `json:"operationID,omitempty"`
-	Reason      string    `json:"reason,omitempty"`
-	Changes     []Change  `json:"changes,omitempty"`
-	Time        time.Time `json:"time"`
+	ID           string    `json:"id"`
+	Actor        string    `json:"actor"`
+	ActorDisplay string    `json:"actorDisplay,omitempty"`
+	Action       string    `json:"action"`
+	Target       string    `json:"target"`
+	Result       string    `json:"result"`
+	OperationID  string    `json:"operationID,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
+	Changes      []Change  `json:"changes,omitempty"`
+	Time         time.Time `json:"time"`
 }
 type Resource struct {
 	Kind      string            `json:"kind"`

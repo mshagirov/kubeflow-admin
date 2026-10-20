@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -26,6 +27,15 @@ type work struct {
 	pv       *corev1.PersistentVolume
 	ops      []patchOp
 	delayed  bool
+
+	// Pod restart targets are kept separate from Notebook edit targets: the
+	// restart path needs the validated owner chain, node and stable fingerprint
+	// without acquiring Notebook mutation semantics.
+	pod            *corev1.Pod
+	podSet         *appsv1.StatefulSet
+	podNotebook    *unstructured.Unstructured
+	podNode        *corev1.Node
+	podFingerprint string
 }
 
 func (s *Service) Prepare(ctx context.Context, a model.Action) (model.Prepared, error) {
@@ -48,10 +58,15 @@ func (s *Service) build(ctx context.Context, a model.Action) (*work, error) {
 	if len(a.Reason) > 1024 {
 		return nil, errors.New("reason is too long")
 	}
+	if a.Kind == "pod.restart" && !s.Config.Features.PodRestarts {
+		return nil, errors.New("pod restarts are disabled")
+	}
 	w := &work{ev: s.newEvidence()}
 	w.prepared.Action = a
 	w.prepared.Summary = a.Kind + " " + a.Namespace + "/" + a.Name
-	w.prepared.Warnings = []string{"API dry-run does not prove controller reconciliation or available storage/compute capacity."}
+	if a.Kind != "pod.restart" {
+		w.prepared.Warnings = []string{"API dry-run does not prove controller reconciliation or available storage/compute capacity."}
+	}
 	if a.Kind == "profile.create" || a.Kind == "profile.quota.change" {
 		if a.Namespace != "" && a.Namespace != a.Name {
 			return nil, errors.New("Profile namespace must match its name")
@@ -95,6 +110,10 @@ func (s *Service) build(ctx context.Context, a model.Action) (*work, error) {
 			}
 			w.ops = ops
 			w.prepared.Warnings = append(w.prepared.Warnings, "Stopping loses running kernels, processes, writable container layers and emptyDir contents. PVC data is not deleted.")
+		case "pod.restart":
+			if err := s.preparePodRestart(ctx, a, w); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, errors.New("unsupported action kind")
 		}
@@ -315,26 +334,38 @@ func (s *Service) prepareProfile(ctx context.Context, a model.Action, w *work) e
 // Execute only accepts a server-owned Prepared record. Preview evidence is
 // checked against a complete fresh validation and server dry-run before writes.
 func (s *Service) Execute(ctx context.Context, p model.Prepared, cp func(string) error) error {
+	if p.Action.Kind == "pod.restart" {
+		return s.executePodRestart(ctx, p, cp)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	fresh, err := s.Prepare(ctx, p.Action)
 	if err != nil {
-		return err
+		return errors.Join(model.ErrRejectedBeforeMutation, err)
 	}
 	if fresh.TargetUID != p.TargetUID || fresh.ResourceVersion != p.ResourceVersion || string(fresh.Data) != string(p.Data) {
-		return ErrConflict
+		return errors.Join(model.ErrRejectedBeforeMutation, ErrConflict)
 	}
 	w, err := s.build(ctx, p.Action)
 	if err != nil {
-		return err
+		return errors.Join(model.ErrRejectedBeforeMutation, err)
 	}
 	if w.prepared.TargetUID != p.TargetUID || w.prepared.ResourceVersion != p.ResourceVersion || string(w.prepared.Data) != string(p.Data) {
-		return ErrConflict
+		return errors.Join(model.ErrRejectedBeforeMutation, ErrConflict)
+	}
+	firstCheckpoint := true
+	guardedCheckpoint := func(step string) error {
+		err := checkpoint(cp, step)
+		if firstCheckpoint && err != nil {
+			return errors.Join(model.ErrRejectedBeforeMutation, err)
+		}
+		firstCheckpoint = false
+		return err
 	}
 	if strings.HasPrefix(p.Action.Kind, "notebook.") {
-		return s.executeNotebook(ctx, w, cp)
+		return s.executeNotebook(ctx, w, guardedCheckpoint)
 	}
-	return s.executeStorageOrProfile(ctx, w, cp)
+	return s.executeStorageOrProfile(ctx, w, guardedCheckpoint)
 }
 
 func (s *Service) checkEvidence(ctx context.Context, ns string, old evidence) error {

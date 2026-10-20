@@ -1,0 +1,23 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflow-admin-pod-restarts
+rules:
+  # policy/v1 eviction is the only Pod mutation this workflow performs. It
+  # deliberately does not grant pods delete, pods/status, or any workload write.
+  - apiGroups: ['']
+    resources: [pods/eviction]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeflow-admin-pod-restarts
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeflow-admin-pod-restarts
+subjects:
+  - kind: ServiceAccount
+    name: kubeflow-admin
+    namespace: kubeflow-admin

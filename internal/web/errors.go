@@ -37,6 +37,15 @@ func backendFailure(w http.ResponseWriter, err error, validation bool) {
 	case errors.Is(err, store.ErrConflict):
 		failure(w, 409, "operation_conflict", "An operation already claims this plan, key or target. Check Operations before preparing another plan.", false)
 		return
+	case errors.Is(err, store.ErrHistoryBudget):
+		failure(w, 503, "history_capacity_exceeded", "History capacity is exhausted. Ask the operator to review retention, disk capacity and unresolved operations before accepting new changes.", false)
+		return
+	case errors.Is(err, store.ErrInvalidTarget):
+		failure(w, 422, "invalid_target", "The prepared action does not have a valid resource and parent target. Refresh and prepare a new plan.", false)
+		return
+	case errors.Is(err, store.ErrIntegrity):
+		failure(w, 503, "operation_integrity_error", "Durable operation evidence is inconsistent. Stop new changes and ask the operator to reconcile the database with actual cluster state.", false)
+		return
 	case errors.Is(err, store.ErrNotFound):
 		failure(w, 404, "not_found", "The requested plan or operation was not found. Refresh the list or prepare a new plan.", false)
 		return
@@ -105,6 +114,29 @@ Notebook writes require a confirmed installed controller contract
 Notebook is terminating
 unsupported Notebook API contract
 unsupported action kind
+pod restarts are disabled
+Pod restarts require a confirmed installed Notebook controller contract
+a nonempty reason is required for pod restart
+Pod has no stable UID
+Pod is terminating
+mirror and static Pods cannot be restarted
+Pod is not running
+Pod is not managed by a controller
+Pod has an ambiguous controller owner chain
+only StatefulSet-managed Notebook Pods are supported
+Pod owner has no stable UID
+Pod owner chain changed; prepare a new plan
+StatefulSet is terminating
+StatefulSet has no desired replica
+StatefulSet has no desired revision
+Pod has no controller revision
+StatefulSet is not controlled by a Notebook
+parent Notebook is stopped; start it before restarting its Pod
+Pod is not assigned to a Node
+assigned Node is terminating
+assigned Node is not Ready
+assigned Node is unschedulable
+assigned Node is unreachable or not ready
 a positive Kubernetes quantity is required
 nonempty quota required; removing quotas is unsupported
 unsupported quota resource

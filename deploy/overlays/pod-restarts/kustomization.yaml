@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../writes
+  - rbac.yaml
+# Opt-in only; never included by all-features automatically. Also set
+# features.podRestarts: true (and keep writesEnabled true) after an operator
+# reviews the added pods/eviction permission. The ClusterRole is intentionally
+# limited to create pods/eviction: no pods/delete and no zero-grace fallback.
+# For a disposable pilot, bind this role into only the selected Profile
+# namespaces instead of the shipped cluster-wide binding.
