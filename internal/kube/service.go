@@ -1,5 +1,7 @@
 // Package kube implements the deliberately restricted Kubernetes adapter. It never
-// accepts manifests, reads Secrets, deletes objects, or writes child workloads.
+// accepts manifests, reads Secrets, or writes child workloads. The separately
+// gated Profile deletion workflow deletes only a reviewed Profile; Kubernetes
+// controllers and garbage collection handle its owned namespace and contents.
 package kube
 
 import (
@@ -9,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"sort"
 	"strings"
@@ -25,6 +28,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/transport"
 	"kubeflow-admin/internal/config"
 )
 
@@ -58,6 +62,10 @@ func New(c config.Config) (*Service, error) {
 	}
 	r.Timeout = c.RequestTimeout()
 	r.UserAgent = "kubeflow-admin/1"
+	// The write retry guard is installed on the shared configuration before
+	// either client is built, so the typed and the dynamic client behave the
+	// same way: the client library never replays a write.
+	r.WrapTransport = disableWriteAutoRetry(r.WrapTransport)
 	t, err := kubernetes.NewForConfig(r)
 	if err != nil {
 		return nil, err
@@ -67,6 +75,81 @@ func New(c config.Config) (*Service, error) {
 		return nil, err
 	}
 	return &Service{Config: c, Typed: t, Dynamic: d, PollInterval: time.Second}, nil
+}
+
+// retryAfterHeader is the response header client-go uses to decide whether a
+// request may be replayed.
+const retryAfterHeader = "Retry-After"
+
+// disableWriteAutoRetry composes the write retry guard with the transport
+// wrapper the configuration already carries.
+//
+// The guard sits directly above the TLS transport and below the configured
+// wrapper, so the authentication, the TLS and the configured wrapper
+// semantics are unchanged: the guard only removes the one response header
+// that makes client-go replay a request, and only for a write.
+func disableWriteAutoRetry(existing transport.WrapperFunc) transport.WrapperFunc {
+	guard := func(rt http.RoundTripper) http.RoundTripper {
+		return &writeRetryGuardRoundTripper{rt: rt}
+	}
+	return transport.Wrappers(guard, existing)
+}
+
+// writeRetryGuardRoundTripper removes the Retry-After response header from
+// the response of a write request.
+//
+// client-go replays any request whose response carries a Retry-After header
+// and a 429 or 5xx status, whatever the method is. That is safe for a read
+// and unsafe for a write: the first attempt may already have been applied by
+// the API server, and the replayed attempt then fails with a conflict or
+// another error that no longer describes what the first attempt did. The
+// replayed conflict would be read as a definite refusal of a change that may
+// in fact have been applied.
+//
+// The guard does not read, replace or log the response body, and it does not
+// change the status code, the other headers or the error the caller sees. It
+// only removes the header that makes the client library replay the request.
+// A read keeps its retry: the guard leaves a safe method completely alone.
+type writeRetryGuardRoundTripper struct {
+	rt http.RoundTripper
+}
+
+// RoundTrip performs the request and strips the retry instruction from the
+// response of a write.
+func (t *writeRetryGuardRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.rt.RoundTrip(req)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	if safeRequestMethod(req.Method) || !retryAfterStatus(resp.StatusCode) {
+		return resp, nil
+	}
+	if len(resp.Header.Values(retryAfterHeader)) == 0 {
+		return resp, nil
+	}
+	// The header is removed from a copy of the response: the original
+	// response and its body stay untouched, and the body is never read here.
+	header := resp.Header.Clone()
+	header.Del(retryAfterHeader)
+	stripped := *resp
+	stripped.Header = header
+	return &stripped, nil
+}
+
+// safeRequestMethod reports whether a request method may be replayed without
+// changing what the server applied.
+func safeRequestMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	return false
+}
+
+// retryAfterStatus reports whether client-go treats a status code as
+// retryable when the response carries a Retry-After header.
+func retryAfterStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
 }
 
 func (s *Service) Check(ctx context.Context) error {
@@ -163,45 +246,79 @@ func (s *Service) namespacePolicy(ns string) error {
 	}
 	return nil
 }
+
+// namespaceState is the heartbeat-stable subset of a namespace that decides
+// Profile ownership: its identity, its phase, its controller references and
+// the owner annotation the Profile controller maintains. It never carries
+// labels, annotations other than the owner, or any workload content.
+type namespaceState struct {
+	UID         types.UID
+	Phase       corev1.NamespacePhase
+	Owners      []metav1.OwnerReference
+	Owner       string
+	Terminating bool
+}
+
+// stableNamespace reads a namespace and returns its stable ownership subset.
+// It is the single source of the namespace identity used by the Profile scope
+// check and by the Profile update convergence check, so a namespace replaced
+// between preview and execution is detected instead of adopted.
+func (s *Service) stableNamespace(ctx context.Context, ns string) (namespaceState, error) {
+	n, err := s.Typed.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+	if err != nil {
+		return namespaceState{}, safe(err)
+	}
+	return namespaceState{
+		UID:         n.UID,
+		Phase:       n.Status.Phase,
+		Owners:      n.OwnerReferences,
+		Owner:       n.Annotations["owner"],
+		Terminating: n.DeletionTimestamp != nil,
+	}, nil
+}
 func (s *Service) scope(ctx context.Context, ns string, e *evidence) error {
+	_, _, err := s.scopeState(ctx, ns, e)
+	return err
+}
+
+// scopeState validates the Profile scope of a namespace and records the
+// reviewed namespace identity. It returns the Profile it validated together
+// with the stable namespace subset, so a caller never reads either object a
+// second time: one read cannot mix the evidence of two different objects.
+func (s *Service) scopeState(ctx context.Context, ns string, e *evidence) (namespaceState, *unstructured.Unstructured, error) {
 	if err := s.namespacePolicy(ns); err != nil {
-		return err
+		return namespaceState{}, nil, err
 	}
 	p, err := s.Dynamic.Resource(Profiles).Get(ctx, ns, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("matching Profile required: %w", safe(err))
+		return namespaceState{}, nil, fmt.Errorf("matching Profile required: %w", safe(err))
 	}
 	if p.GetDeletionTimestamp() != nil {
-		return errors.New("Profile is terminating")
+		return namespaceState{}, nil, errors.New("Profile is terminating")
 	}
 	owner, _, _ := unstructured.NestedString(p.Object, "spec", "owner", "name")
 	kind, _, _ := unstructured.NestedString(p.Object, "spec", "owner", "kind")
 	if owner == "" || kind != "User" {
-		return errors.New("unsupported Profile owner contract")
+		return namespaceState{}, nil, errors.New("unsupported Profile owner contract")
 	}
-	n, err := s.Typed.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+	state, err := s.stableNamespace(ctx, ns)
 	if err != nil {
-		return safe(err)
+		return namespaceState{}, nil, err
 	}
-	if n.DeletionTimestamp != nil || n.Status.Phase != corev1.NamespaceActive {
-		return errors.New("namespace is not active")
+	if state.Terminating || state.Phase != corev1.NamespaceActive {
+		return namespaceState{}, nil, errors.New("namespace is not active")
 	}
-	if p.GetUID() == "" || !controlledBy(n.OwnerReferences, p.GetUID()) || n.Annotations["owner"] != owner {
-		return errors.New("namespace ownership does not match its Profile")
+	if p.GetUID() == "" || !controlledBy(state.Owners, p.GetUID()) || state.Owner != owner {
+		return namespaceState{}, nil, errors.New("namespace ownership does not match its Profile")
 	}
 	e.add("Profile", "", ns, struct {
 		UID  types.UID
 		Spec any
 	}{p.GetUID(), p.Object["spec"]})
-	e.add("Namespace", "", ns, struct {
-		UID    types.UID
-		Phase  corev1.NamespacePhase
-		Owners []metav1.OwnerReference
-		Owner  string
-	}{n.UID, n.Status.Phase, n.OwnerReferences, n.Annotations["owner"]})
+	e.add("Namespace", "", ns, state)
 	q, err := s.Typed.CoreV1().ResourceQuotas(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return safe(err)
+		return namespaceState{}, nil, safe(err)
 	}
 	type quotaPolicy struct {
 		Name string
@@ -216,7 +333,7 @@ func (s *Service) scope(ctx context.Context, ns string, e *evidence) error {
 	e.add("ResourceQuotaList", ns, "", qp)
 	l, err := s.Typed.CoreV1().LimitRanges(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return safe(err)
+		return namespaceState{}, nil, safe(err)
 	}
 	type limitPolicy struct {
 		Name string
@@ -229,7 +346,7 @@ func (s *Service) scope(ctx context.Context, ns string, e *evidence) error {
 	}
 	sort.Slice(lp, func(i, j int) bool { return lp[i].Name < lp[j].Name })
 	e.add("LimitRangeList", ns, "", lp)
-	return nil
+	return state, p, nil
 }
 
 type patchOp struct {

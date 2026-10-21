@@ -2,6 +2,86 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
+## Profile workflows and resource drawers — 21 October 2026
+
+This release adds unique DNS-1123/63-character Profile names with explicit
+dot/underscore suggestions, prefilled quota editing, Profile metadata/quotas,
+namespace resource drilldown, resource-detail drawers and clear-filter controls.
+The sidebar includes `© 2026 Murat Shagirov` after the source link; the runtime
+image also includes the MIT license at `/LICENSE`.
+
+Implementation used **MiniMax M3.1 Flash Free** on OpenCode Go with default
+thinking. Intermediate reviews used **DeepSeek V4.1 Flash** with max thinking;
+the lead performed final review, integration and additional regression fixes.
+
+Important reviewed boundaries:
+
+- The operator approved **read-only owners** after upstream v1.10 source
+  review showed that in-place owner transfer breaks controller reconciliation.
+  The API rejects transfers; the app never patches namespace ownership or RBAC.
+- Quota forms bind to the observed Profile name/UID, owner and canonical hard
+  map. Stale/replaced targets are refused. Integer/zero values round-trip;
+  unmanaged quota keys are preserved. The deprecated `profile.quota.change`
+  alias requires the same guard; old unguarded clients must reload/upgrade.
+  Configuration-digest stability does not waive conservative preview/execution
+  UID/resourceVersion checks. An authorized client's desired quota is still an
+  explicit change, reviewed in the server's before/after preview.
+- Profile deletion is separately disabled by default. Only a conditional
+  background Profile DELETE is issued; normal controller/garbage collection
+  removes its owned namespace. Both must disappear before success. Namespace
+  fences block other app mutations while deletion is unresolved; ambiguous
+  outcomes retain the locks and are never replayed automatically.
+- Namespace/PV/PVC direct deletion and finalizer removal remain unavailable.
+  PVC cascade can irreversibly destroy Delete-policy backing data; retained
+  storage and snapshot content follow their own policies. This is not a wipe.
+- The Python validation-tools `certifi` pin and hashes were updated to
+  `2026.10.19` for GHSA-6q48-6c7w-9gw2, which failed the previous CI run.
+
+No cluster was changed. The disposable-pilot checks in
+[UI workflow acceptance](ui-workflow-acceptance.md) remain operator work.
+Artifact identity and final verification results are recorded with publication.
+
+### Release verification (21 October 2026)
+
+- `GOTOOLCHAIN=go1.27.3 GOMAXPROCS=2 go test -mod=readonly -race -p 1 -count=1 ./...`:
+  all ten packages passed. The initial parallel run hit the existing 500 ms
+  auth/plan-cleanup test deadline under concurrent build load; five isolated
+  uncached runs passed, followed by the complete sequential-package race run.
+  No production timeout was increased.
+- `go vet -mod=readonly ./...`, `go mod verify`, both JavaScript regression
+  scripts, `bash -n scripts/discover.sh` and whitespace checks passed.
+- API parity, five Python tests, OpenAPI validation and all nine manifest
+  variants passed. Strict kubeconform validation also passed for every variant.
+- `govulncheck@v1.1.4 ./...`: no reachable vulnerabilities found.
+- Trivy **0.76.0**, digest-pinned in CI, reported zero HIGH/CRITICAL source
+  dependency vulnerabilities, detected secrets or manifest misconfigurations.
+  The previous 0.67.2 scanner could not load some current policy modules;
+  refreshing the pin removed those compatibility errors without disabling
+  policy checks. Ignored local binaries, Git data, virtualenv and private site
+  material are not part of the source release scan.
+- The Overview explanation panels are removed. `ui.footerText` defaults empty
+  and permits bounded, sanitized branding HTML; scripts, inline styles and
+  unsafe URL schemes are not supported. Logos are browser requests, not
+  server-side fetches. The footer, its safe page projection and CSP have
+  regression coverage.
+- All **20** configured real-Chrome profile/UI checks passed at 390px and
+  1280px, with no horizontal overflow or JavaScript errors. The browser fixture
+  now uses real relative timestamps; its previous fixed expiry correctly
+  caused the app to block stale plans after the pause. The added expired-plan
+  regression confirms the submit control remains disabled and no operation
+  is sent. Synthetic checks do not prove real Kubernetes reconciliation.
+- Real HTTP/client-go regressions verify that `Retry-After` cannot silently
+  replay unsafe Kubernetes writes and turn an uncertain first write into a
+  misleading later rejection. GET retries remain enabled; response bodies,
+  status codes, authentication and TLS are unchanged.
+- Offline reconciliation requires an explicit valid mode and fails before
+  config/DB/server startup for incomplete or contradictory recovery flags.
+  Successful GET responses without an object UID also fail closed. The
+  stopped-app, backup, same-cluster and immutable-evidence requirements are
+  documented in [operations](operations.md#offline-reconciliation-of-a-profile-deletion).
+
+Image publication receipts follow once complete.
+
 ## Sidebar and security refresh — 21 October 2026
 
 - Removed the sidebar's status dot and `Administrative control plane` label;

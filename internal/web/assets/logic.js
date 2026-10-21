@@ -3,19 +3,68 @@
 // the browser. No network access, credentials or Kubernetes manifests live here.
 ((root) => {
   const kinds = { "profile.quota": "profile.quota.change", "pvc.create": "pvc.create.dynamic", "pv.nfs.create": "storage.create.static", "pv.reserve": "pv.reserve-and-claim" };
+  // A profile action carries only the fields its kind defines. Anything else in
+  // the form (storage settings, a resource version, a stale confirmation) is
+  // dropped before the request leaves the browser. A namespace is optional and
+  // is only kept when it is consistent with the Profile name.
+  // Both quota paths are guarded the same way: the legacy alias keeps its
+  // deprecated kind, but it no longer bypasses the owner and precondition
+  // guard that profile.update requires.
+  const guardedProfileKinds = new Set(["profile.update", "profile.quota.change"]);
+  const profileActionFields = {
+    "profile.update": ["kind", "name", "namespace", "owner", "quota", "baseConfigDigest", "reason"],
+    "profile.quota.change": ["kind", "name", "namespace", "owner", "quota", "baseConfigDigest", "reason"],
+    "profile.delete": ["kind", "name", "reason", "confirmName"]
+  };
+  function keepProfileFields(action) {
+    const allowed = profileActionFields[action.kind];
+    if (!allowed) return action;
+    for (const key of Object.keys(action)) if (!allowed.includes(key)) delete action[key];
+    if (action.namespace && action.namespace !== action.name) delete action.namespace;
+    return action;
+  }
   function buildAction(entries, options = {}) {
+    const settings = options || {};
     const action = {}, quota = {};
-    for (const [name, value] of entries) {
-      if (value === "" || name === "restart") continue;
-      if (name.startsWith("quota.")) quota[name.slice(6)] = value;
+    for (const [name, value] of entries || []) {
+      if (value === "" || value === null || value === undefined || name === "restart") continue;
+      if (name.startsWith("quota.")) {
+        // An empty quota key is never a quota entry.
+        const key = name.slice(6);
+        if (!key) continue;
+        quota[key] = value;
+      }
       else action[name] = name === "gpuCount" ? Number(value) : value;
     }
     action.kind = kinds[action.kind] || action.kind;
     if (Object.keys(quota).length) action.quota = quota;
-    if (action.kind === "profile.quota.change") delete action.owner;
+    if (action.kind === "profile.quota.change" || action.kind === "profile.update") {
+      // The owner is read-only: the installed Profile controller cannot
+      // transfer it, so the current owner is sent back exactly as it was
+      // observed, never trimmed or rewritten. The configuration precondition
+      // travels with the request and is never rendered. The legacy alias
+      // keeps its deprecated kind but is guarded exactly like an update; a
+      // caller that omits the guard is encoded as it is and the server
+      // refuses it.
+      action.owner = String(action.owner ?? "");
+      action.baseConfigDigest = String(action.baseConfigDigest ?? "");
+      if (!action.owner) delete action.owner;
+      if (!action.baseConfigDigest) delete action.baseConfigDigest;
+    }
+    if (action.kind === "profile.delete") {
+      // Deletion is confirmed by an exact name match plus a mandatory reason.
+      // The confirmation is sent exactly as typed: it is never trimmed or
+      // otherwise normalized, so a padded or differently cased name is refused
+      // instead of silently corrected.
+      action.reason = String(action.reason || "").trim();
+      action.confirmName = String(action.confirmName ?? "");
+      delete action.owner;
+      delete action.quota;
+      delete action.baseConfigDigest;
+    }
     if (action.kind === "notebook.edit") {
-      action.restart = !!options.restart;
-      if (options.replaceMounts) action.mounts = options.mounts || [];
+      action.restart = !!settings.restart;
+      if (settings.replaceMounts) action.mounts = settings.mounts || [];
     }
     if (action.kind === "pod.restart") {
       action.reason = String(action.reason || "").trim();
@@ -26,11 +75,11 @@
       // FormData materializes a checked checkbox as "on"; normalize it.
       const formForce = action.force === true || action.force === "true" || action.force === "on";
       action.reason = String(action.reason || "").trim();
-      action.force = !!options.force || formForce;
+      action.force = !!settings.force || formForce;
       delete action.namespace;
       delete action.owner;
     }
-    return action;
+    return keepProfileFields(action);
   }
   function scopedResources(resources, namespace) {
     const volumes = new Set(resources.filter(r => r.kind === "PersistentVolumeClaim" && r.namespace === namespace).map(r => r.details?.volume));
@@ -46,7 +95,7 @@
     storageClass: "Storage class", size: "Requested capacity", accessMode: "Access mode", pvName: "PV name", template: "Approved template", subdirectory: "Relative NFS subdirectory",
     container: "Named container", image: "Image", cpuRequest: "CPU request", cpuLimit: "CPU limit", memoryRequest: "Memory request", memoryLimit: "Memory limit",
     gpuPreset: "GPU preset", gpuCount: "GPU count", mounts: "Replacement PVC mounts", restart: "Restart after edit",
-    force: "Force"
+    force: "Force", confirmName: "Confirmation name"
   };
   function previewFields(plan) {
     const p = plan.prepared, action = p.action;
@@ -54,7 +103,11 @@
     if (p.parentNotebook) fields.push(["Parent Notebook", p.parentNotebook]);
     // Only typed server-owned action fields are a change preview. Prepared.Data
     // is internal revalidation evidence, not a diff and never rendered here.
+    // The configuration precondition is a request guard, not a preview field:
+    // it has no label, so its raw hash never reaches the console.
     for (const [key, label] of Object.entries(actionLabels)) {
+      // The guarded Profile previews state the owner as a read-only value.
+      if (key === "owner" && guardedProfileKinds.has(action.kind)) continue;
       if (Object.hasOwn(action, key)) fields.push([label, action[key]]);
     }
     if (action.kind === "notebook.edit") {
@@ -74,6 +127,19 @@
     }
     if (action.kind === "node.uncordon") {
       fields.push(["Uncordon effect", "Sets spec.unschedulable=false on the Node (the same effect as kubectl uncordon) and removes SchedulingDisabled so new Pods can be scheduled onto this node again."]);
+    }
+    if (guardedProfileKinds.has(action.kind)) {
+      const owner = Object.hasOwn(action, "owner") ? `${action.owner}. ` : "";
+      fields.push(["Current owner (read-only)", `${owner}Owner transfer is unsupported by the installed Profile controller; the current owner is read-only. Only quotas are changed.`]);
+      fields.push(["Quota keys", "Only the listed quota keys are sent. Supply every existing quota key with its current value. Removing a quota key is unsupported."]);
+    }
+    if (action.kind === "profile.delete") {
+      fields.push(["Deletion request", "Requests the deletion of the Profile itself, guarded by its UID and resource version. The console never deletes the namespace directly and never removes a finalizer to force a deletion."]);
+      fields.push(["Namespace cleanup", "The Profile controller and namespace garbage collection remove the namespace once its ownership is verified. Cleanup cannot skip namespaced objects: everything inside the namespace goes with it, including objects the Profile does not own."]);
+      fields.push(["Deletion result", "The operation succeeds only after the Profile and its namespace are both absent. A namespace that stays in deletion with an unresolved finalizer is left for the operator and is never reported as a completed deletion."]);
+      fields.push(["Storage and data", "The namespace cleanup deletes the volume claims inside it. A Delete reclaim policy lets the storage controller delete the backing volume, which can be irreversible. A Retain reclaim policy is not protection: the backend lifecycle or a later operator delete can still remove the volume."]);
+      fields.push(["Snapshots and external data", "A namespaced VolumeSnapshot is deleted with its namespace, and the snapshot content behind it follows its own Delete or Retain policy. Retained volumes, volume snapshots and external storage such as NFS exports or object storage can keep their data. The console never wipes backend data itself."]);
+      fields.push(["Confirmation", `The confirmation name must match the profile name "${action.name}" character for character. The console sends it exactly as typed and never trims it.`]);
     }
     return fields;
   }
@@ -268,6 +334,134 @@
     // when a namespace filter is active on another page.
     return (Array.isArray(resources) ? resources : []).filter(resource => resource.kind === "Profile");
   }
+
+  // ---- Profile naming, form values and deletion confirmation --------------
+  // A Profile name is also its namespace name, so it must be a Kubernetes
+  // DNS-1123 label: at most 63 characters of lowercase alphanumerics and
+  // hyphens, starting and ending with an alphanumeric.
+  const profileNameMaxLength = 63;
+  const profileNamePattern = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
+  // Names already taken by a Profile or by a namespace. An existing namespace
+  // cannot be adopted by a new Profile, so it reserves the name as well.
+  function profileExistingNames(existing) {
+    const names = new Set();
+    const items = existing instanceof Set ? [...existing] : Array.isArray(existing) ? existing : existing ? [existing] : [];
+    for (const item of items) {
+      if (typeof item === "string") { if (item) names.add(item); continue; }
+      if (!item || typeof item !== "object") continue;
+      if ((!item.kind || item.kind === "Profile" || item.kind === "Namespace") && item.name) names.add(item.name);
+    }
+    return names;
+  }
+  // Dots and underscores are the only replacements offered. The typed name is
+  // never rewritten by this helper; a replacement is a suggestion that the
+  // administrator must apply explicitly.
+  function profileNameSuggestion(text) {
+    return String(text ?? "").replace(/[._]+/g, "-");
+  }
+  // profileNameValidation(name, existing, options) -> { name, valid, message,
+  // suggestion, duplicate }. "existing" accepts profile names, a Set of names
+  // or observed resources. options.allowExisting keeps an already used name
+  // valid, which an update or a deletion of that same profile needs.
+  function profileNameValidation(name, existing, options = {}) {
+    const settings = options || {};
+    const text = String(name ?? "");
+    const taken = profileExistingNames(existing);
+    const result = { name: text, valid: false, message: "", suggestion: "", duplicate: false };
+    if (!text.trim()) { result.message = "Profile name is required."; return result; }
+    if (text.length > profileNameMaxLength) {
+      result.message = `Profile names are limited to ${profileNameMaxLength} characters.`;
+      return result;
+    }
+    const hasDot = text.includes(".");
+    const hasUnderscore = text.includes("_");
+    const hasUpper = /[A-Z]/.test(text);
+    const hasSpace = /\s/.test(text);
+    const hasOther = /[^a-z0-9._\-\s]/.test(text);
+    const edgeHyphen = text.startsWith("-") || text.endsWith("-");
+    if (hasDot || hasUnderscore) {
+      result.message = hasUpper
+        ? "Profile names cannot contain dots or underscores; use hyphens and lowercase letters instead."
+        : "Profile names cannot contain dots or underscores; use hyphens instead.";
+    } else if (hasUpper) {
+      result.message = "Profile names must be lowercase.";
+    } else if (hasSpace) {
+      result.message = "Profile names cannot contain spaces.";
+    } else if (hasOther) {
+      result.message = "Profile names allow only lowercase letters, digits and hyphens.";
+    } else if (edgeHyphen) {
+      result.message = "Profile names must start and end with a lowercase letter or digit.";
+    }
+    // A suggestion is offered only when it is itself a valid, unused label.
+    const suggestion = (hasDot || hasUnderscore) ? profileNameSuggestion(text) : "";
+    if (suggestion && suggestion.length <= profileNameMaxLength && profileNamePattern.test(suggestion) && !taken.has(suggestion)) {
+      result.suggestion = suggestion;
+    }
+    if (result.message) return result;
+    if (settings.allowExisting !== true && taken.has(text)) {
+      result.duplicate = true;
+      result.message = `A Profile named "${text}" already exists; choose a different name.`;
+      return result;
+    }
+    result.valid = true;
+    return result;
+  }
+  // The narrow quota projection of a Profile: details.quota.<resource key>.
+  function profileQuotaValues(resource) {
+    const details = resource?.details || {};
+    const values = {};
+    for (const key of Object.keys(details).sort()) {
+      if (!key.startsWith("quota.")) continue;
+      const value = details[key];
+      if (value === undefined || value === null) continue;
+      values[key.slice(6)] = String(value);
+    }
+    return values;
+  }
+  // The configuration precondition is an internal request guard. It travels
+  // with a Profile update and is read from the observation only to be sent
+  // back, so its raw hash is never rendered and never searchable.
+  const profileInternalDetailKeys = new Set(["configDigest"]);
+  function visibleResourceDetails(resource) {
+    const details = resource?.details || {};
+    const visible = {};
+    for (const key of Object.keys(details).sort()) {
+      if (profileInternalDetailKeys.has(key)) continue;
+      visible[key] = details[key];
+    }
+    return visible;
+  }
+  // Form values of one observed Profile: the exact owner identity, the
+  // observed quota keys and the internal configuration precondition, and
+  // nothing else. Keys match the form field names, so the result can be
+  // submitted as the same typed entries.
+  // The owner is a legacy identity that is kept exactly as it was observed:
+  // it is never trimmed, rewritten or replaced.
+  // baseConfigDigest is an internal request precondition: it travels with the
+  // request untouched and is never rendered or edited.
+  function profileFormValues(resource) {
+    const details = resource?.details || {};
+    const owner = String(resource?.owner ?? "") || String(details.owner ?? "");
+    const values = { name: String(resource?.name ?? ""), owner };
+    for (const [key, value] of Object.entries(profileQuotaValues(resource))) values["quota." + key] = value;
+    const digest = String(details.configDigest ?? "");
+    if (digest) values.baseConfigDigest = digest;
+    return values;
+  }
+  // A deletion needs a mandatory reason and an exact name confirmation. The
+  // confirmation is compared character for character: surrounding whitespace or
+  // a different case is a mismatch, never a sanitized match.
+  function profileDeleteValidation(name, inputs = {}) {
+    const values = inputs || {};
+    const target = String(name ?? "");
+    const reason = String(values.reason ?? "").trim();
+    const confirmName = String(values.confirmName ?? "");
+    if (!target.trim()) return { valid: false, message: "Select the profile to delete." };
+    if (!reason) return { valid: false, message: "A reason is required to delete a profile." };
+    if (!confirmName) return { valid: false, message: `Type "${target}" to confirm the deletion.` };
+    if (confirmName !== target) return { valid: false, message: `The confirmation does not match the profile name "${target}". Type it exactly.` };
+    return { valid: true, message: "" };
+  }
   const namespaceResourceDefs = [
     { kind: "Notebook", label: "Notebooks", href: "/notebooks" },
     { kind: "Pod", label: "Pods", href: "/pods" },
@@ -442,6 +636,7 @@
     sortRows, searchMatch, filterRows, paginate,
     parseTarget, actorLabel, groupAudit,
     namespaceOptions, profileNames, profileSummary, profileResources,
+    profileNameMaxLength, profileNameValidation, profileFormValues, profileQuotaValues, profileDeleteValidation, visibleResourceDetails,
     namespaceResources, formatAge, workspaceHealthSummary,
     routeFor, queryNamespace, hrefFor, historyHref, needsRefresh,
     notificationID, shouldRememberDismissals, dismissalStorageKey,

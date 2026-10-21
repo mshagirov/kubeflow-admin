@@ -1,0 +1,44 @@
+# The only mutation this overlay grants is deleting one kubeflow.org Profile.
+# It is a separate, operator-reviewed opt-in: the read-only base is unchanged
+# and this role is never included by the all-features overlay.
+#
+# Deliberately NOT granted here:
+#   - no namespaces delete, so the console cannot delete a namespace directly;
+#     the namespace is removed only as the Profile's owned child, by the
+#     installed Profile controller and Kubernetes garbage collection;
+#   - no persistentvolumes / persistentvolumeclaims / pods delete;
+#   - no kubeflow.org/profiles update, patch or create;
+#   - no profiles/finalizers (or any other finalizer subresource) update or
+#     patch, so a stuck deletion cannot be forced through this grant.
+#
+# The grant is cluster-wide because a Profile is a cluster-scoped object.
+# A Role cannot grant access to a cluster-scoped resource, so the pilot
+# restriction is made with resourceNames on the ClusterRole: list only the
+# disposable pilot Profile name and keep the ClusterRoleBinding. Copy this
+# file into the site overlay and edit the resourceNames list there.
+#
+# resourceNames restricts which Profiles may be deleted. It does not restrict
+# fields, and it does not bound the namespace cascade that follows the Profile
+# deletion: enforce field-level and cascade bounds with admission policy and
+# cluster-scoped namespace protection, not with RBAC.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflow-admin-profile-deletion
+rules:
+  - apiGroups: [kubeflow.org]
+    resources: [profiles]
+    verbs: [delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeflow-admin-profile-deletion
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeflow-admin-profile-deletion
+subjects:
+  - kind: ServiceAccount
+    name: kubeflow-admin
+    namespace: kubeflow-admin

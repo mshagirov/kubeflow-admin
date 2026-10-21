@@ -1,6 +1,10 @@
 "use strict";
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const logic = require("../assets/logic.js");
+const root = path.join(__dirname, "..", "assets");
+const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 const {buildAction, scopedResources, containerNames, previewFields} = logic;
 const base = [["kind", "notebook.edit"], ["namespace", "team"], ["name", "work"], ["container", "main"], ["cpuRequest", "500m"], ["memoryLimit", "4Gi"], ["image", ""], ["gpuCount", ""], ["gpuPreset", ""]];
 const unchanged = buildAction(base);
@@ -15,7 +19,30 @@ assert.deepEqual(buildAction(base, {replaceMounts:true,mounts:[mount]}).mounts, 
 for (const [form, backend] of [["profile.create","profile.create"],["profile.quota","profile.quota.change"],["pvc.create","pvc.create.dynamic"],["pvc.expand","pvc.expand"],["pv.nfs.create","storage.create.static"],["pv.reserve","pv.reserve-and-claim"],["notebook.start","notebook.start"],["notebook.stop","notebook.stop"]]) {
   assert.equal(buildAction([["kind",form]]).kind,backend);
 }
-assert.deepEqual(buildAction([["kind","profile.quota"],["owner","unused"],["quota.requests.cpu","2"],["quota.requests.memory",""]]), {kind:"profile.quota.change",quota:{"requests.cpu":"2"}});
+// The Profile quota count fields accept a deliberate zero hard limit. The
+// server enforces a non-negative quantity, so a native minimum of one would
+// make the browser refuse every update of a Profile that limits a count to
+// zero. The count fields stay integer valued.
+const profileQuotaInputs = [...html.matchAll(/<input[^>]*data-profile-quota="([^"]+)"[^>]*>/g)].map(match => ({ key: match[1], tag: match[0] }));
+for (const key of ["pods", "persistentvolumeclaims"]) {
+  const input = profileQuotaInputs.find(entry => entry.key === key);
+  assert.ok(input, "the profile quota field " + key + " exists");
+  assert.ok(input.tag.includes('min="0"'), "the profile quota field " + key + " accepts a zero hard limit");
+  assert.ok(input.tag.includes('step="1"'), "the profile quota field " + key + " stays an integer");
+}
+for (const entry of profileQuotaInputs.filter(item => item.key.startsWith("requests.") && item.tag.includes('type="number"'))) {
+  assert.ok(entry.tag.includes('min="0"'), "the profile GPU quota field " + entry.key + " accepts a zero hard limit");
+  assert.ok(entry.tag.includes('step="1"'), "the profile GPU quota field " + entry.key + " stays an integer");
+}
+assert.equal(html.includes('type="number" min="1"'), false, "no profile quota field still demands a minimum of one");
+assert.ok(html.includes('<input name="size" placeholder="20Gi">'), "the storage size field keeps its own contract");
+assert.equal(html.includes('name="size" type="number"'), false, "the storage size field is not turned into a count field");
+// The legacy Profile quota alias keeps its deprecated kind, but it is guarded
+// like profile.update: the exact current owner and the configuration
+// precondition travel with the request.
+assert.deepEqual(buildAction([["kind","profile.quota"],["name","team"],["owner","alice@example.test"],["baseConfigDigest","sha256:9f2b1c"],["quota.requests.cpu","2"],["quota.requests.memory",""]]),
+  {kind:"profile.quota.change",name:"team",owner:"alice@example.test",baseConfigDigest:"sha256:9f2b1c",quota:{"requests.cpu":"2"}},
+  "the legacy alias keeps its kind and carries the guard");
 assert.equal(buildAction([["kind","profile.create"],["owner","CaseSensitive-Username"]]).owner,"CaseSensitive-Username");
 assert.deepEqual(buildAction([["kind","pod.restart"],["namespace","team"],["name","work-0"],["reason","  recover stalled kernel  "]]), {kind:"pod.restart",namespace:"team",name:"work-0",reason:"recover stalled kernel"});
 assert.deepEqual(buildAction([["kind","node.cordon"],["namespace","team"],["owner","ignored"],["name","worker-1"],["reason","  drain maintenance  "]]), {kind:"node.cordon",name:"worker-1",reason:"drain maintenance",force:false});
@@ -286,4 +313,179 @@ assert.equal(sortedOnce.sortKey, "state"); assert.equal(sortedOnce.sortDir, "asc
 const sortedTwice = logic.nextSort(sortedOnce,"state");
 assert.equal(sortedTwice.sortDir, "desc"); assert.equal(sortedTwice.page, 1);
 assert.equal(initial.sortKey, "name", "table state helpers are pure");
-console.log("Dashboard action, exact preview, typed sorting, target grammar, profile counts, audit grouping and navigation tests passed.");
+// Profile names are Kubernetes DNS-1123 labels and must be unique. A typed name
+// is never rewritten: a replacement is only offered as a suggestion.
+const takenProfiles = ["team", "other"];
+const validName = logic.profileNameValidation("research-team", takenProfiles);
+assert.equal(validName.valid, true);
+assert.equal(validName.message, "");
+assert.equal(validName.suggestion, "", "a valid name never carries a suggestion");
+assert.equal(logic.profileNameMaxLength, 63);
+const label63 = "a".repeat(63);
+assert.equal(logic.profileNameValidation(label63, takenProfiles).valid, true, "63 characters is a valid label length");
+const label64 = "a".repeat(64);
+const tooLong = logic.profileNameValidation(label64, takenProfiles);
+assert.equal(tooLong.valid, false, "64 characters is too long");
+assert.ok(tooLong.message.includes("63"), "the length limit is stated");
+assert.equal(tooLong.suggestion, "");
+assert.equal(logic.profileNameValidation("-team", takenProfiles).valid, false, "a leading hyphen is invalid");
+assert.ok(logic.profileNameValidation("-team", takenProfiles).message.includes("start and end"));
+assert.equal(logic.profileNameValidation("team-", takenProfiles).valid, false, "a trailing hyphen is invalid");
+assert.equal(logic.profileNameValidation("Team", takenProfiles).valid, false, "uppercase is invalid");
+assert.ok(logic.profileNameValidation("Team", takenProfiles).message.includes("lowercase"));
+assert.equal(logic.profileNameValidation("my team", takenProfiles).valid, false, "whitespace is invalid");
+assert.equal(logic.profileNameValidation("my/team", takenProfiles).valid, false, "other symbols are invalid");
+assert.equal(logic.profileNameValidation("team--x", takenProfiles).valid, true, "inner consecutive hyphens are allowed");
+assert.equal(logic.profileNameValidation("a", takenProfiles).valid, true, "a single character is a valid label");
+assert.equal(logic.profileNameValidation("1team", takenProfiles).valid, true, "a leading digit is a valid label");
+assert.equal(logic.profileNameValidation("9".repeat(63), takenProfiles).valid, true, "63 digits are a valid label");
+assert.equal(logic.profileNameValidation("9".repeat(64), takenProfiles).valid, false, "64 digits are too long");
+assert.equal(logic.profileNameValidation("", takenProfiles).valid, false);
+assert.ok(logic.profileNameValidation("", takenProfiles).message.includes("required"));
+assert.equal(logic.profileNameValidation(null, null, null).valid, false, "a null name and null options are safe");
+assert.equal(logic.profileNameValidation("team", null, null).valid, true, "null options never throw");
+assert.equal(logic.profileNameValidation("team", null, {allowExisting:true}).valid, true, "null names are safe");
+const dotted = logic.profileNameValidation("my.team", takenProfiles);
+assert.equal(dotted.valid, false, "a dotted name is never accepted");
+assert.equal(dotted.suggestion, "my-team", "the exact hyphen replacement is offered");
+assert.equal(dotted.name, "my.team", "the typed name is never rewritten");
+assert.equal(dotted.duplicate, false);
+assert.equal(logic.profileNameValidation("my_team", takenProfiles).suggestion, "my-team");
+assert.equal(logic.profileNameValidation("my..team", takenProfiles).suggestion, "my-team");
+assert.equal(logic.profileNameValidation("my.team", ["my-team"]).suggestion, "", "a suggestion that is already taken is not offered");
+assert.equal(logic.profileNameValidation("my.team", []).valid, false, "a suggestion never makes the typed name valid");
+const duplicate = logic.profileNameValidation("team", takenProfiles);
+assert.equal(duplicate.valid, false, "an existing profile name cannot be reused");
+assert.equal(duplicate.duplicate, true);
+assert.ok(duplicate.message.includes("already exists"));
+assert.equal(logic.profileNameValidation("team", [{kind:"Profile",name:"team"}]).valid, false, "observed profiles reserve their names");
+assert.equal(logic.profileNameValidation("team", [{kind:"Namespace",name:"team"}]).valid, false, "an existing namespace cannot be adopted");
+assert.equal(logic.profileNameValidation("team", [{kind:"Notebook",name:"team",namespace:"x"}]).valid, true, "unrelated resources do not reserve a profile name");
+assert.equal(logic.profileNameValidation("team", new Set(["team"])).valid, false, "a set of names is accepted");
+assert.equal(logic.profileNameValidation("team", takenProfiles, {allowExisting:true}).valid, true, "an update may address an existing profile");
+assert.equal(logic.profileNameValidation("team", takenProfiles, {allowExisting:true}).duplicate, false);
+assert.equal(logic.profileNameValidation("team", takenProfiles, {allowExisting:true}).suggestion, "");
+
+// Profile form values come from the narrow owner and quota projection only.
+const profileResource = {kind:"Profile",name:"team",owner:"alice@example.test",
+  details:{apiVersion:"kubeflow.org/v1",ownerKind:"User","quota.requests.cpu":"4","quota.requests.memory":"8Gi"}};
+const formValues = logic.profileFormValues(profileResource);
+assert.equal(formValues.name, "team");
+assert.equal(formValues.owner, "alice@example.test");
+assert.equal(formValues["quota.requests.cpu"], "4");
+assert.equal(formValues["quota.requests.memory"], "8Gi");
+assert.deepEqual(logic.profileQuotaValues(profileResource), {"requests.cpu":"4","requests.memory":"8Gi"});
+assert.deepEqual(logic.profileFormValues({kind:"Profile",name:"team"}), {name:"team",owner:""});
+assert.equal(logic.profileFormValues({kind:"Profile",name:"team",owner:"  bob@example.test  "}).owner, "  bob@example.test  ", "an observed owner is kept exactly, never trimmed");
+assert.equal(logic.profileFormValues({kind:"Profile",name:"team",owner:"Legacy-Owner"}).owner, "Legacy-Owner", "a legacy owner identity is kept exactly");
+assert.equal(logic.profileFormValues({kind:"Profile",name:"team",owner:"",details:{owner:"carol@example.test"}}).owner, "carol@example.test");
+assert.equal(Object.hasOwn(logic.profileFormValues({kind:"Profile",name:"team",details:{ownerKind:"User"}}), "quota.requests.cpu"), false, "absent quota keys stay absent");
+assert.equal(Object.hasOwn(logic.profileFormValues({kind:"Profile",name:"team",details:{ownerKind:"User"}}), "baseConfigDigest"), false, "an absent precondition stays absent");
+
+// The configuration precondition travels with the request and is never shown.
+const digestedProfile = {kind:"Profile",name:"team",owner:"alice@example.test",
+  details:{apiVersion:"kubeflow.org/v1",ownerKind:"User",configDigest:"sha256:9f2b1c",resourceVersion:"42","quota.requests.cpu":"4"}};
+const digestValues = logic.profileFormValues(digestedProfile);
+assert.equal(digestValues.baseConfigDigest, "sha256:9f2b1c", "the precondition is a form value");
+assert.equal(digestValues.owner, "alice@example.test");
+assert.equal(digestValues["quota.requests.cpu"], "4");
+// The precondition is never a visible detail.
+assert.deepEqual(logic.visibleResourceDetails(digestedProfile), {apiVersion:"kubeflow.org/v1",ownerKind:"User",resourceVersion:"42","quota.requests.cpu":"4"}, "the precondition hash is not a visible detail");
+assert.equal(Object.hasOwn(logic.visibleResourceDetails(digestedProfile), "configDigest"), false);
+assert.equal(logic.visibleResourceDetails({kind:"Notebook",name:"work",details:{"image.main":"image"}})["image.main"], "image", "other resources keep their visible details");
+const updateFromValues = logic.buildAction([["kind","profile.update"], ...Object.entries(digestValues)]);
+assert.equal(updateFromValues.baseConfigDigest, "sha256:9f2b1c", "the precondition round-trips into the request");
+assert.equal(updateFromValues.owner, "alice@example.test", "the unchanged owner round-trips into the request");
+assert.deepEqual(updateFromValues.quota, {"requests.cpu":"4"});
+
+// A profile update carries the owner and the quotas; a quota-only change
+// keeps its existing shape and still drops the owner.
+assert.deepEqual(logic.buildAction([["kind","profile.update"],["name","team"],["owner","alice@example.test"],["quota.requests.cpu","4"],["quota.requests.memory",""]]),
+  {kind:"profile.update",name:"team",owner:"alice@example.test",quota:{"requests.cpu":"4"}});
+assert.deepEqual(logic.buildAction([["kind","profile.update"],["name","team"],["quota.requests.cpu","4"]]),
+  {kind:"profile.update",name:"team",quota:{"requests.cpu":"4"}}, "an empty owner field is not sent");
+assert.equal(logic.buildAction([["kind","profile.update"],["name","team"],["owner","Legacy-Owner"]]).owner, "Legacy-Owner", "a legacy owner identity is sent exactly");
+assert.equal(logic.buildAction([["kind","profile.update"],["name","team"],["owner","  legacy@example.test  "]]).owner, "  legacy@example.test  ", "an owner is never trimmed on an update");
+// A legacy caller that omits the guard is encoded exactly as it is; the
+// server refuses that request, so the console never pretends it is valid.
+assert.deepEqual(logic.buildAction([["kind","profile.quota"],["quota.requests.cpu","2"]]),
+  {kind:"profile.quota.change",quota:{"requests.cpu":"2"}}, "an unguarded legacy caller is only encoded, not a valid server operation");
+assert.equal(logic.buildAction([["kind","profile.quota"],["owner","alice@example.test"],["baseConfigDigest","sha256:9f2b1c"]]).owner, "alice@example.test", "the legacy alias preserves the raw owner");
+assert.equal(logic.buildAction([["kind","profile.quota"],["owner","  legacy@example.test  "]]).owner, "  legacy@example.test  ", "the legacy alias never trims the owner");
+const noisyLegacy = logic.buildAction([["kind","profile.quota"],["name","team"],["owner","alice@example.test"],["baseConfigDigest","sha256:9f2b1c"],["quota.requests.cpu","4"],["storageClass","team-class"],["resourceVersion","42"],["confirmName","team"],["namespace","team"]]);
+assert.deepEqual(Object.keys(noisyLegacy).sort(), ["baseConfigDigest","kind","name","namespace","owner","quota"], "the legacy alias carries only its own fields");
+assert.equal(noisyLegacy.storageClass, undefined, "a stale storage field is stripped from the legacy alias");
+assert.equal(noisyLegacy.resourceVersion, undefined, "a stale resource version is stripped from the legacy alias");
+assert.equal(noisyLegacy.confirmName, undefined, "a stale confirmation is stripped from the legacy alias");
+assert.equal(logic.buildAction([["kind","profile.quota"],["name","team"],["namespace","other"]]).namespace, undefined, "an inconsistent namespace is dropped from the legacy alias");
+const deleteAction = logic.buildAction([["kind","profile.delete"],["name","team"],["reason","  decommission  "],["confirmName","team"],["owner","alice@example.test"],["quota.requests.cpu","4"]]);
+assert.deepEqual(deleteAction, {kind:"profile.delete",name:"team",reason:"decommission",confirmName:"team"});
+assert.equal(Object.hasOwn(deleteAction,"owner"), false, "a deletion carries no owner");
+assert.equal(Object.hasOwn(deleteAction,"quota"), false, "a deletion carries no quota");
+// A profile action carries only the fields its kind defines.
+const noisyUpdate = logic.buildAction([["kind","profile.update"],["name","team"],["owner","alice@example.test"],["quota.requests.cpu","4"],["baseConfigDigest","sha256:9f2b1c"],["reason","rebalance"],["storageClass","team-class"],["resourceVersion","42"],["confirmName","team"],["namespace","team"]]);
+assert.deepEqual(Object.keys(noisyUpdate).sort(), ["baseConfigDigest","kind","name","namespace","owner","quota","reason"], "an update carries only its own fields");
+assert.equal(noisyUpdate.namespace, "team", "a namespace consistent with the profile name is kept");
+assert.equal(logic.buildAction([["kind","profile.update"],["name","team"],["namespace","other"]]).namespace, undefined, "an inconsistent namespace is dropped");
+assert.deepEqual(Object.keys(logic.buildAction([["kind","profile.delete"],["name","team"],["reason","decommission"],["confirmName","team"],["owner","alice@example.test"],["quota.requests.cpu","4"],["baseConfigDigest","sha256:9f2b1c"],["namespace","team"]])).sort(), ["confirmName","kind","name","reason"], "a deletion carries only its own fields");
+const staleDigestDelete = logic.buildAction([["kind","profile.delete"],["name","team"],["reason","decommission"],["confirmName","team"],["baseConfigDigest","sha256:9f2b1c"]]);
+assert.equal(Object.hasOwn(staleDigestDelete,"baseConfigDigest"), false, "a deletion drops a stale precondition");
+assert.equal(staleDigestDelete.confirmName, "team", "the exact confirmation survives the stripped fields");
+// The confirmation is typed exactly: it is never trimmed, so a padded or
+// differently cased name reaches the server unchanged and is refused there.
+assert.equal(logic.buildAction([["kind","profile.delete"],["name","team"],["reason","decommission"],["confirmName"," team "]]).confirmName, " team ", "a padded confirmation is sent unchanged");
+assert.equal(logic.buildAction([["kind","profile.delete"],["name","team"],["reason","decommission"],["confirmName","Team"]]).confirmName, "Team", "a differently cased confirmation is sent unchanged");
+assert.equal(logic.buildAction([["kind","profile.delete"],["name","team"],["reason","  decommission  "]]).reason, "decommission", "the reason is trimmed");
+
+// A deletion needs a mandatory reason and an exact name confirmation.
+assert.equal(logic.profileDeleteValidation("team",{reason:"",confirmName:"team"}).valid, false);
+assert.ok(logic.profileDeleteValidation("team",{reason:"",confirmName:"team"}).message.includes("reason"));
+assert.equal(logic.profileDeleteValidation("team",{reason:"cleanup",confirmName:""}).valid, false);
+assert.equal(logic.profileDeleteValidation("team",{reason:"cleanup",confirmName:"other"}).valid, false);
+assert.ok(logic.profileDeleteValidation("team",{reason:"cleanup",confirmName:"other"}).message.includes("does not match"));
+assert.equal(logic.profileDeleteValidation("team",{reason:"cleanup",confirmName:" team "}).valid, false, "a padded confirmation is refused, not sanitized");
+assert.equal(logic.profileDeleteValidation("team",{reason:"cleanup",confirmName:"Team"}).valid, false, "a differently cased confirmation is refused");
+assert.equal(logic.profileDeleteValidation("team",{reason:"cleanup",confirmName:"team"}).valid, true);
+assert.equal(logic.profileDeleteValidation("team",{reason:"cleanup",confirmName:"team"}).message, "");
+assert.equal(logic.profileDeleteValidation("team", null).valid, false, "null inputs are safe");
+assert.equal(logic.profileDeleteValidation(null, {reason:"cleanup",confirmName:"team"}).valid, false, "a null profile name is safe");
+assert.equal(logic.buildAction(null, null).kind, undefined, "a null entry list and null options are safe");
+assert.deepEqual(logic.buildAction([["kind","profile.update"],["name","team"],["quota.requests.cpu","4"],["quota.","5"]]).quota, {"requests.cpu":"4"}, "an empty quota key is never a quota entry");
+
+// The legacy quota alias previews the same read-only owner contract and never
+// renders the internal precondition hash.
+const legacyPreview = JSON.stringify(logic.previewFields({...plan,prepared:{...plan.prepared,action:logic.buildAction([["kind","profile.quota"],["name","team"],["owner","alice@example.test"],["baseConfigDigest","sha256:9f2b1c"],["quota.requests.cpu","2"]])}}));
+assert.ok(legacyPreview.includes("profile.quota.change"), "the legacy alias keeps its deprecated kind in the preview");
+assert.ok(legacyPreview.includes("Current owner (read-only)"));
+assert.ok(legacyPreview.includes("Owner transfer is unsupported by the installed Profile controller; the current owner is read-only. Only quotas are changed."));
+assert.equal(legacyPreview.includes("Owner identity"), false, "the legacy preview has no owner edit label");
+assert.equal(legacyPreview.includes("sha256:9f2b1c"), false, "the legacy preview never shows the precondition hash");
+assert.ok(legacyPreview.includes("Quota keys") && legacyPreview.includes("alice@example.test"), "the legacy preview still shows the owner and the quota contract");
+
+// Plan previews explain an update and warn about an incomplete deletion.
+const updatePreview = JSON.stringify(logic.previewFields({...plan,prepared:{...plan.prepared,action:updateFromValues}}));
+assert.ok(updatePreview.includes("alice@example.test") && updatePreview.includes("Quota targets"));
+assert.ok(updatePreview.includes("Current owner (read-only)"));
+assert.ok(updatePreview.includes("Owner transfer is unsupported by the installed Profile controller; the current owner is read-only. Only quotas are changed."));
+assert.equal(updatePreview.includes("Owner comparison"), false, "the preview never suggests an owner change");
+assert.equal(updatePreview.includes("sha256:9f2b1c"), false, "the internal precondition hash is never rendered");
+const deletePreview = JSON.stringify(logic.previewFields({...plan,prepared:{...plan.prepared,action:deleteAction}}));
+assert.ok(deletePreview.includes("Confirmation name") && deletePreview.includes("team"));
+assert.ok(deletePreview.includes("Requests the deletion"), "the preview asks for a deletion, it does not claim a direct removal");
+assert.ok(deletePreview.includes("UID and resource version") && deletePreview.includes("never deletes the namespace directly"));
+assert.ok(deletePreview.includes("never removes a finalizer"));
+assert.ok(deletePreview.includes("cannot skip namespaced objects"), "namespace cleanup does not spare unowned namespaced objects");
+assert.ok(deletePreview.includes("only after the Profile and its namespace are both absent"), "success requires both objects to be gone");
+assert.ok(deletePreview.includes("unresolved finalizer") && deletePreview.includes("left for the operator"), "a stalled cleanup is left for the operator");
+assert.ok(deletePreview.includes("Deletes the volume claims inside it") || deletePreview.includes("deletes the volume claims inside it"), "namespace cleanup deletes the claims");
+assert.ok(deletePreview.includes("Delete reclaim policy") && deletePreview.includes("irreversible"));
+assert.ok(deletePreview.includes("Retain reclaim policy is not protection"), "a Retain policy is not protection from the backend lifecycle or a later operator delete");
+assert.ok(deletePreview.includes("namespaced VolumeSnapshot is deleted with its namespace"), "a namespaced snapshot goes with the namespace");
+assert.ok(deletePreview.includes("snapshot content behind it follows its own Delete or Retain policy"), "the snapshot content keeps its own policy");
+assert.ok(deletePreview.includes("NFS") && deletePreview.includes("external storage"));
+assert.ok(deletePreview.includes("never wipes backend data"));
+assert.equal(deletePreview.includes("The server removes the Profile and the namespace"), false, "the preview never claims a direct namespace removal");
+assert.equal(deletePreview.includes("guaranteed"), false, "the preview never promises a complete erase");
+assert.equal(deletePreview.includes("permanently deleted"), false);
+assert.equal(deletePreview.includes("all data is removed"), false);
+console.log("Dashboard action, exact preview, typed sorting, target grammar, profile counts, profile naming, audit grouping and navigation tests passed.");

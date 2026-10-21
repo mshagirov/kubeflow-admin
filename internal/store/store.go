@@ -15,6 +15,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 	"kubeflow-admin/internal/model"
@@ -217,6 +218,12 @@ func (s *Store) migrate(ctx context.Context) error {
 	// Never commit a version bump (or any backfill) over active work whose safety
 	// evidence, operation record or primary lock set is inconsistent.
 	if err := validateActiveHistory(ctx, tx); err != nil {
+		return err
+	}
+	// A Profile deletion that lost its namespace fence would let another
+	// mutation enter the namespace while the cascade is unresolved, so the
+	// database must not be opened with such a gap.
+	if err := validateNamespaceFenceLocks(ctx, tx); err != nil {
 		return err
 	}
 	if version != schemaVersion {
@@ -551,9 +558,19 @@ func (s *Store) cleanupRecords(ctx context.Context, buckets []string, deletes ..
 	return tx.Commit()
 }
 
+// profileDeleteKind is the typed destructive Profile action. It is the only
+// delete action in the system: there is no namespace delete action. Deleting a
+// Profile cascades into the namespace the Profile controller owns, so the
+// whole namespace is fenced while the deletion is unresolved.
+const profileDeleteKind = "profile.delete"
+
 // PrimaryTarget is the canonical lock name derived from the server-owned action.
 // It is the only primary target a caller may claim; accepting an arbitrary
 // caller primary would let a plan lock unrelated PVC/PV/object targets.
+//
+// A Profile action keeps the profile:<name> primary target, including the
+// destructive profile.delete action. The namespace the cascade reaches is a
+// separate, additional lock target (see Targets).
 func PrimaryTarget(a model.Action) string {
 	switch {
 	case a.Kind == "pod.restart":
@@ -585,10 +602,99 @@ func validTargetName(name string) bool {
 	return true
 }
 
+// validDNS1123Label reports whether v is a DNS-1123 label: at most 63
+// lowercase alphanumeric characters or interior hyphens, starting and ending
+// with an alphanumeric character. A Profile name is also the name of the
+// namespace the Profile controller creates for it, so a Profile name must
+// never be a path, a wildcard or any other namespace selector.
+func validDNS1123Label(v string) bool {
+	if v == "" || len(v) > 63 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-':
+			if i == 0 || i == len(v)-1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// actionNamespace returns the namespace an action mutates, or "" for a
+// cluster-scoped action. A Profile action mutates the namespace that carries
+// the Profile name, because the Profile controller creates and owns exactly
+// that namespace; the namespace is never taken from a field that is not the
+// server-owned action.
+func actionNamespace(a model.Action) string {
+	if strings.HasPrefix(a.Kind, "profile.") {
+		return a.Name
+	}
+	return a.Namespace
+}
+
+// fenceNamespace returns the namespace whose deletion fence an action must
+// respect, or "" when the action is cluster scoped or names an unusable
+// namespace. A malformed namespace never becomes a lock target: it cannot
+// match a real namespace fence and it cannot widen one.
+func fenceNamespace(a model.Action) string {
+	ns := actionNamespace(a)
+	if ns == "" || !validDNS1123Label(ns) {
+		return ""
+	}
+	return ns
+}
+
+// profileNamespaceFromTarget returns the Profile name of a canonical Profile
+// target ("profile:<name>").
+func profileNamespaceFromTarget(target string) (string, bool) {
+	name, ok := strings.CutPrefix(target, "profile:")
+	if !ok || !validDNS1123Label(name) {
+		return "", false
+	}
+	return name, true
+}
+
+// validateProfileDelete enforces the typed contract of the destructive Profile
+// action: the exact Profile name, the exact typed confirmation, no foreign
+// namespace and a recorded reason. A deletion whose target cannot be fenced is
+// refused before any claim or lock exists. Irrelevant fields (PVName,
+// ParentNotebook) are never turned into lock targets for this kind.
+func validateProfileDelete(a model.Action) error {
+	if !validDNS1123Label(a.Name) {
+		return ErrInvalidTarget
+	}
+	if a.ConfirmName != a.Name {
+		return ErrInvalidTarget
+	}
+	if a.Namespace != "" && a.Namespace != a.Name {
+		return ErrInvalidTarget
+	}
+	if strings.TrimSpace(a.Reason) == "" {
+		return ErrInvalidTarget
+	}
+	// The reason limit counts Unicode code points, like the API's documented
+	// maxLength and the backend's own limit.
+	if utf8.RuneCountInString(a.Reason) > 500 {
+		return ErrInvalidTarget
+	}
+	return nil
+}
+
 // Targets locks the canonical primary plus its selected PV; using only PVName
 // would allow two queued operations to mutate the same PVC using different PV
 // reservations. A restart also locks its validated parent Notebook so it cannot
 // race an edit or stop of that parent.
+//
+// A Profile deletion additionally locks the namespace the Profile owns. The
+// cascade removes every object in that namespace, so the whole namespace is
+// fenced for as long as the deletion is unresolved. The fence is derived only
+// from the validated Profile name: no other field can add a lock target.
 func Targets(p model.Plan) []string {
 	a := p.Prepared.Action
 	out := []string{PrimaryTarget(a)}
@@ -609,7 +715,68 @@ func Targets(p model.Plan) []string {
 	if a.Kind == "pod.restart" && validTargetName(a.Namespace) && validTargetName(p.Prepared.ParentNotebook) {
 		add("notebook:" + a.Namespace + "/" + p.Prepared.ParentNotebook)
 	}
+	if a.Kind == profileDeleteKind {
+		if ns := fenceNamespace(a); ns != "" {
+			add("namespace:" + ns)
+		}
+	}
 	return out
+}
+
+// checkNamespaceFence enforces the namespace fence in both directions for one
+// acceptance transaction.
+//
+// Direction one: an active namespace:<ns> deletion lock blocks every other
+// mutation that touches that namespace, whatever its own target is.
+//
+// Direction two: a Profile deletion is refused while any other active
+// mutation still targets the same namespace. The compared targets are exactly
+// the ordinary namespace-scoped primary targets (notebook:<ns>/..., pod:<ns>/...
+// and pvc:<ns>/...), the Profile target (profile:<ns>) and the namespace fence
+// target itself (namespace:<ns>). Cluster-scoped targets such as pv:<name>
+// and node:<name> are deliberately not compared: they are not namespace
+// scoped.
+//
+// The caller has already resolved an idempotent retry before this check, so a
+// retry of an accepted deletion keeps resolving to the same operation even
+// while the namespace stays fenced.
+func checkNamespaceFence(ctx context.Context, tx *sql.Tx, a model.Action, ns, operationID string) error {
+	var found int
+	// Direction one: a pending Profile deletion owns the namespace.
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM operation_targets WHERE target=? AND active=1 LIMIT 1`, "namespace:"+ns).Scan(&found)
+	if err == nil {
+		return ErrConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if a.Kind != profileDeleteKind {
+		return nil
+	}
+	// Direction two: a Profile deletion may not start while the namespace is
+	// still busy. The prefixes are compared with substr, never with LIKE, so a
+	// namespace can never act as a wildcard.
+	notebookPrefix := "notebook:" + ns + "/"
+	podPrefix := "pod:" + ns + "/"
+	pvcPrefix := "pvc:" + ns + "/"
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM operation_targets
+		WHERE active=1 AND operation_id<>? AND (
+			target=? OR target=?
+			OR substr(target,1,?)=? OR substr(target,1,?)=? OR substr(target,1,?)=?)
+		LIMIT 1`,
+		operationID,
+		"namespace:"+ns, "profile:"+ns,
+		len(notebookPrefix), notebookPrefix,
+		len(podPrefix), podPrefix,
+		len(pvcPrefix), pvcPrefix,
+	).Scan(&found)
+	if err == nil {
+		return ErrConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return nil
 }
 
 // CreateOperation atomically claims actor+idempotency key, immutable plan, all
@@ -644,6 +811,20 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 			return model.Operation{}, false, ErrInvalidTarget
 		}
 	}
+	// The typed Profile deletion is the only destructive Profile action. Its
+	// target must be exact, because the acceptance fences a whole namespace
+	// under that name.
+	if plan.Prepared.Action.Kind == profileDeleteKind {
+		if err := validateProfileDelete(plan.Prepared.Action); err != nil {
+			return model.Operation{}, false, err
+		}
+	}
+	// There is no namespace delete action. The Profile cascade owns the
+	// namespace it removes, so a direct namespace deletion is refused outright
+	// instead of being derived into an unrelated PVC-style lock target.
+	if plan.Prepared.Action.Kind == "namespace.delete" {
+		return model.Operation{}, false, ErrInvalidTarget
+	}
 	// The primary target must be exactly the canonical target of the server-owned
 	// plan action. Derived targets (for example a reserved PV) never substitute an
 	// arbitrary caller-supplied primary.
@@ -666,6 +847,12 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 	if err != nil {
 		return op, false, err
 	}
+	// Every statement of the acceptance runs on this transaction, never on the
+	// pool: the store keeps a single SQLite connection, so a query issued
+	// outside the transaction while this transaction holds that connection
+	// would wait for it instead of running. Each statement is a single row
+	// query that is fully consumed before the next one starts, so no result
+	// set is ever open while another statement runs.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return op, false, err
@@ -732,6 +919,17 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 			return op, false, err
 		}
 	}
+	// Namespace fence. A pending Profile deletion owns the whole namespace it
+	// cascades into, so every other mutation in that namespace is refused; and
+	// a Profile deletion is refused while another mutation in that namespace is
+	// still active. Both directions are evaluated inside this acceptance
+	// transaction, so two concurrent requests cannot both pass a stale read of
+	// the lock table.
+	if ns := fenceNamespace(plan.Prepared.Action); ns != "" {
+		if err := checkNamespaceFence(ctx, tx, plan.Prepared.Action, ns, op.ID); err != nil {
+			return op, false, err
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO operation_claims(id,actor,idem,plan_id,target) VALUES(?,?,?,?,?)`, op.ID, op.Actor, key, plan.ID, op.Target); err != nil {
 		return op, false, err
 	}
@@ -768,12 +966,35 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 }
 
 func (s *Store) Checkpoint(ctx context.Context, op model.Operation, audit model.Audit) error {
-	return s.updateOperation(ctx, op, audit, false)
+	return s.updateOperation(ctx, op, audit, false, nil)
 }
 func (s *Store) Finish(ctx context.Context, op model.Operation, audit model.Audit) error {
-	return s.updateOperation(ctx, op, audit, true)
+	return s.updateOperation(ctx, op, audit, true, nil)
 }
-func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit model.Audit, finish bool) error {
+
+// updateOperation applies one durable operation update in its own transaction.
+func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit model.Audit, finish bool, reconcile *profileDeleteReconciliation) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = s.updateOperationTx(ctx, tx, op, audit, finish, reconcile); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// updateOperationTx applies one durable operation update inside a caller's
+// transaction, so an offline reconciliation can read its evidence and write
+// its outcome atomically.
+//
+// reconcile is set only by the offline Profile deletion reconciliation. It
+// selects a private transition rule and adds the operator attribution to the
+// audit row. An ordinary Checkpoint or Finish can never resolve an uncertain
+// operation, and a reconciliation can never resolve anything except a
+// needs-review Profile deletion.
+func (s *Store) updateOperationTx(ctx context.Context, tx *sql.Tx, op model.Operation, audit model.Audit, finish bool, reconcile *profileDeleteReconciliation) error {
 	if audit.ID == "" {
 		return ErrConflict
 	}
@@ -787,14 +1008,9 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 	} else if op.State != "applying" {
 		return ErrConflict
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	var actor, planID, target string
 	var active int
-	err = tx.QueryRowContext(ctx, `SELECT actor,plan_id,target,active FROM operation_claims WHERE id=?`, op.ID).Scan(&actor, &planID, &target, &active)
+	err := tx.QueryRowContext(ctx, `SELECT actor,plan_id,target,active FROM operation_claims WHERE id=?`, op.ID).Scan(&actor, &planID, &target, &active)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -805,7 +1021,7 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 		return ErrConflict
 	}
 	var currentBytes []byte
-	if err := tx.QueryRowContext(ctx, `SELECT value FROM records WHERE bucket='operations' AND key=?`, op.ID).Scan(&currentBytes); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT value FROM records WHERE bucket='operations' AND key=?`, op.ID).Scan(&currentBytes); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return integrity("active operation claim has no operation record")
 		}
@@ -819,9 +1035,18 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 	// queued operation cannot be reported succeeded without an applying
 	// checkpoint, while shutdown (queued->failed) and crash recovery
 	// (queued/applying->needs-review) remain valid.
-	if !allowedTransition(current.State, op.State, finish) {
+	if reconcile != nil {
+		// The offline reconciliation has its own private rule. It never widens
+		// the transitions an ordinary Finish may make.
+		if !reconciledTransition(current.State, op.State) {
+			return ErrConflict
+		}
+	} else if !allowedTransition(current.State, op.State, finish) {
 		return ErrConflict
 	}
+	// The pre-delete checkpoint marker is monotonic: once a Profile delete
+	// request may have been issued, no later update may clear that proof.
+	op.ProfileDeleteCheckpointed = current.ProfileDeleteCheckpointed || op.ProfileDeleteCheckpointed
 	// Identity/action metadata belongs to the original claim, not caller input.
 	op.Action = current.Action
 	op.CreatedAt = current.CreatedAt
@@ -858,6 +1083,18 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 	audit.Time = op.UpdatedAt
 	audit.Reason = acceptedReason
 	audit.Changes = changes
+	if reconcile != nil {
+		// The reconciliation is a distinct, operator-attributed audit row. The
+		// accepted actor, display and reason stay exactly as they were
+		// accepted; the offline operator and the reconciliation reason are
+		// appended as a reviewed change of their own.
+		audit.Result = reconcile.Result
+		audit.Changes = append(append([]model.Change(nil), changes...), model.Change{
+			Field:  "Offline reconciliation",
+			Before: "accepted by " + op.Actor + " with reason: " + acceptedReason,
+			After:  "reconciled by " + reconcile.Operator + ": " + reconcile.Reason,
+		})
+	}
 	if err = put(ctx, tx, "operations", op.ID, op); err != nil {
 		return err
 	}
@@ -881,7 +1118,7 @@ func (s *Store) updateOperation(ctx context.Context, op model.Operation, audit m
 			}
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // allowedTransition reports whether a store update may move an operation from
@@ -931,12 +1168,69 @@ func (s *Store) IncompleteOperations(ctx context.Context) ([]model.Operation, er
 	return out, rows.Err()
 }
 
+// validateNamespaceFenceLocks verifies that every active Profile deletion still
+// holds the namespace fence lock that protects its namespace. The fence is the
+// only thing that keeps a concurrent mutation out of a namespace whose
+// deletion is unresolved, so a missing fence is an integrity error: the store
+// fails closed instead of accepting a mutation into that namespace.
+//
+// The evidence is the immutable acceptance ledger, which records the accepted
+// action and its canonical target for every active claim. A claim without
+// ledger evidence is reported by the acceptance evidence check instead.
+//
+// The check is one statement. The store keeps a single SQLite connection, so a
+// second query started while a result set was still open would wait for that
+// connection instead of running: the fence presence is therefore computed by
+// the join itself, and no statement is ever started inside an open result set.
+func validateNamespaceFenceLocks(ctx context.Context, q sqlQueryer) error {
+	rows, err := q.QueryContext(ctx, `SELECT c.id,a.target,(f.operation_id IS NOT NULL) AS fenced
+		FROM operation_claims c
+		JOIN operation_acceptance a ON a.operation_id=c.id
+		LEFT JOIN operation_targets f
+			ON f.operation_id=c.id AND f.active=1 AND f.target='namespace:'||substr(a.target,9)
+		WHERE c.active=1 AND a.action=?`, profileDeleteKind)
+	if err != nil {
+		return err
+	}
+	type deletion struct {
+		operationID string
+		target      string
+		fenced      bool
+	}
+	var deletions []deletion
+	for rows.Next() {
+		var d deletion
+		var fenced int
+		if err := rows.Scan(&d.operationID, &d.target, &fenced); err != nil {
+			rows.Close()
+			return err
+		}
+		d.fenced = fenced == 1
+		deletions = append(deletions, d)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, d := range deletions {
+		if _, ok := profileNamespaceFromTarget(d.target); !ok {
+			return integrity("an active Profile deletion does not have a canonical Profile target")
+		}
+		if !d.fenced {
+			return integrity("an active Profile deletion is missing its namespace fence lock")
+		}
+	}
+	return nil
+}
+
 // CheckIntegrity fails closed when durable operation state is internally
 // inconsistent: an active claim without its operation record, an active claim
 // whose operation is already terminal, an active claim without its immutable
-// accepted audit, or an active target lock with no active claim. Such state
-// cannot be repaired automatically without silently releasing locks or
-// inventing audit history, so the caller must stop for operator reconciliation.
+// accepted audit, an active target lock with no active claim, or an active
+// Profile deletion without its namespace fence lock. Such state cannot be
+// repaired automatically without silently releasing locks or inventing audit
+// history, so the caller must stop for operator reconciliation.
 // Locks are never released and no records are synthesized here.
 func (s *Store) CheckIntegrity(ctx context.Context) error {
 	var n int
@@ -947,6 +1241,9 @@ func (s *Store) CheckIntegrity(ctx context.Context) error {
 		return integrity(fmt.Sprintf("%d active operation claims exceed the safety limit of %d", n, MaxUnresolvedOperations))
 	}
 	if err := validateActiveHistory(ctx, s.db); err != nil {
+		return err
+	}
+	if err := validateNamespaceFenceLocks(ctx, s.db); err != nil {
 		return err
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_claims c JOIN records r ON r.bucket='operations' AND r.key=c.id WHERE c.active=1 AND json_extract(r.value,'$.state') IN ('succeeded','failed')`).Scan(&n); err != nil {
@@ -972,4 +1269,452 @@ func (s *Store) OperationForKey(ctx context.Context, actor, key, planID string) 
 		return op, ErrConflict
 	}
 	return decodeOperation(b)
+}
+
+// profile_reconcile.go holds the offline reconciliation of an uncertain
+// Profile deletion.
+//
+// A Profile deletion that reached an ambiguous outcome keeps its Profile and
+// namespace locks until an administrator resolves it. This file implements
+// the only supported resolution: an offline, read-only reconciliation that
+// derives a terminal outcome from evidence the application already recorded,
+// and from the operator's own observations of the cluster.
+//
+// The rules are deliberately narrow:
+//
+//   - Only a needs-review profile.delete operation that still holds both of
+//     its locks can be reconciled. Nothing else is reachable from here.
+//   - The cluster is only ever read. The reconciliation itself performs no
+//     cluster write of any kind; the caller supplies the observations.
+//   - Two derived outcomes exist and no more. Either the deletion is proven
+//     complete, or it is proven that no deletion request was ever issued.
+//   - An operation whose delete request may have been issued is never
+//     cancelled, no matter what the cluster currently shows. Such an
+//     operation needs the operator's own review and the normal cleanup path.
+//   - A normal Finish can never resolve an uncertain operation. The
+//     reconciliation has its own private transition rule.
+
+// ErrReconcileUnsupported reports that an offline reconciliation cannot be
+// derived from the available evidence. It never unlocks anything and never
+// changes durable state.
+var ErrReconcileUnsupported = errors.New("operation cannot be reconciled from the available evidence")
+
+// The accepted deletion evidence carries the reviewed identities. They are
+// read from the immutable acceptance ledger, never from live cluster state,
+// so a replacement object can never be adopted as the accepted one.
+const (
+	profileUIDChangeField              = "Profile UID"
+	profileResourceVersionChangeField  = "Profile resource version"
+	namespaceUIDChangeField            = "Namespace UID"
+	clusterUIDChangeField              = "Cluster UID"
+	profileReconcileVersionChangeField = "Profile deletion reconciliation version"
+	// profileReconcileVersion is the current accepted-evidence version. The
+	// cancellation path requires it: an acceptance record that predates the
+	// contract cannot prove that no write was ever started.
+	profileReconcileVersion = "1"
+)
+
+// ProfileDeleteReconcileOutcome enumerates the only supported derived
+// outcomes of an offline Profile deletion reconciliation.
+type ProfileDeleteReconcileOutcome string
+
+const (
+	// ProfileDeleteReconciledSucceeded is derived when two complete
+	// observations show that the Profile and its namespace are both gone.
+	ProfileDeleteReconciledSucceeded ProfileDeleteReconcileOutcome = "reconciled-succeeded"
+	// ProfileDeleteReconciledCancelled is derived when the durable evidence
+	// proves that no Profile delete request was ever issued, so the
+	// operation changed nothing and its locks may be released.
+	ProfileDeleteReconciledCancelled ProfileDeleteReconcileOutcome = "reconciled-cancelled"
+)
+
+// ProfileDeleteObservation is one complete observation of the two objects a
+// Profile deletion cascades into. An incomplete observation proves nothing
+// and is refused.
+type ProfileDeleteObservation struct {
+	// Complete reports that the Profile and the namespace were both read and
+	// that each read returned a definite answer.
+	Complete bool
+	// ProfileUID is the Profile's UID, empty when the Profile is absent.
+	ProfileUID string
+	// NamespaceUID is the namespace's UID, empty when the namespace is
+	// absent.
+	NamespaceUID string
+	// ClusterUID is the UID of the kube-system namespace of the cluster the
+	// observation was taken from. It must equal the accepted cluster
+	// identity: an observation taken against another cluster would report
+	// both objects as absent and would falsely complete an old deletion.
+	ClusterUID string
+}
+
+// ProfileDeleteReconcilePlan is the read-only evidence about one uncertain
+// Profile deletion. It is what the offline CLI shows the operator before any
+// change is proposed.
+type ProfileDeleteReconcilePlan struct {
+	// OperationID is the needs-review operation the evidence belongs to.
+	OperationID string
+	// Operation is the durable operation record.
+	Operation model.Operation
+	// ProfileName is the Profile the accepted deletion targeted.
+	ProfileName string
+	// ProfileUID, ProfileResourceVersion and NamespaceUID are the accepted
+	// identities read from the immutable acceptance evidence.
+	ProfileUID             string
+	ProfileResourceVersion string
+	NamespaceUID           string
+	// ClusterUID is the accepted identity of the cluster the deletion was
+	// prepared in: the UID of its kube-system namespace. Every observation
+	// must come from the same cluster, or the deletion of an old cluster
+	// could be reported as complete.
+	ClusterUID string
+	// ReconciliationVersion is the accepted-evidence version of the
+	// reconciliation contract. It is empty when the accepted evidence
+	// predates the contract.
+	ReconciliationVersion string
+	// MarkerPresent reports whether the durable operation record explicitly
+	// carries the pre-delete checkpoint marker. A record written before the
+	// marker existed decodes to false, so the absence of the field must
+	// never be read as "no write happened".
+	MarkerPresent bool
+	// NoWriteProven reports the durable proof that no Profile delete request
+	// was ever issued: the marker is present, it is false, and the accepted
+	// evidence carries the current reconciliation version.
+	NoWriteProven bool
+	// ActiveTargets are the lock targets the operation still holds.
+	ActiveTargets []string
+	// AcceptedActor, AcceptedActorDisplay and AcceptedReason are the
+	// immutable accepted identity and reason.
+	AcceptedActor        string
+	AcceptedActorDisplay string
+	AcceptedReason       string
+}
+
+// ProfileDeleteReconciliation is the structured evidence an offline operator
+// supplies to resolve one uncertain Profile deletion.
+type ProfileDeleteReconciliation struct {
+	// OperationID is the needs-review operation to resolve.
+	OperationID string
+	// Observations are the operator's complete observations of the Profile
+	// and the namespace it owns.
+	Observations []ProfileDeleteObservation
+	// Reason is the operator's reconciliation reason. It is recorded in the
+	// audit row.
+	Reason string
+	// Operator is the offline operator identity. It is recorded in the audit
+	// row.
+	Operator string
+}
+
+// profileDeleteReconciliation is the private operator attribution of one
+// offline reconciliation. It never replaces the accepted evidence.
+type profileDeleteReconciliation struct {
+	// Result is the derived audit result of the reconciliation.
+	Result string
+	// Operator is the offline operator identity.
+	Operator string
+	// Reason is the operator's reconciliation reason.
+	Reason string
+}
+
+// reconciledTransition reports whether a validated offline reconciliation may
+// move an operation to its derived terminal state.
+//
+// It is deliberately separate from allowedTransition: an ordinary Finish or
+// Checkpoint must never be able to resolve an uncertain operation, and a
+// reconciliation must never resolve anything but a needs-review Profile
+// deletion.
+func reconciledTransition(from, to string) bool {
+	if from != "needs-review" {
+		return false
+	}
+	return to == "succeeded" || to == "failed"
+}
+
+// operationHasProfileDeleteMarker reports whether the stored operation record
+// explicitly carries the pre-delete checkpoint marker.
+//
+// The marker is always serialized for a new operation, so a record without
+// the key was written before the contract existed. Such a record can never
+// prove that no write was started.
+func operationHasProfileDeleteMarker(raw []byte) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return false
+	}
+	_, ok := fields["profileDeleteCheckpointed"]
+	return ok
+}
+
+// PlanProfileDeleteReconciliation reads the durable evidence about one
+// uncertain Profile deletion. It never changes anything.
+func (s *Store) PlanProfileDeleteReconciliation(ctx context.Context, operationID string) (ProfileDeleteReconcilePlan, error) {
+	return planProfileDeleteReconciliation(ctx, s.db, operationID)
+}
+
+// planProfileDeleteReconciliation reads the durable evidence about one
+// uncertain Profile deletion inside a caller's transaction.
+func planProfileDeleteReconciliation(ctx context.Context, q sqlQueryer, operationID string) (ProfileDeleteReconcilePlan, error) {
+	plan := ProfileDeleteReconcilePlan{OperationID: operationID}
+	if operationID == "" {
+		return plan, ErrNotFound
+	}
+	var raw []byte
+	err := q.QueryRowContext(ctx, `SELECT value FROM records WHERE bucket='operations' AND key=?`, operationID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return plan, ErrNotFound
+	}
+	if err != nil {
+		return plan, err
+	}
+	op, err := decodeOperation(raw)
+	if err != nil {
+		return plan, err
+	}
+	plan.Operation = op
+	plan.MarkerPresent = operationHasProfileDeleteMarker(raw)
+	// An already resolved operation is not reconcilable: its claim and locks
+	// are gone.
+	var active int
+	err = q.QueryRowContext(ctx, `SELECT active FROM operation_claims WHERE id=?`, operationID).Scan(&active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return plan, ErrNotFound
+	}
+	if err != nil {
+		return plan, err
+	}
+	if active != 1 {
+		return plan, fmt.Errorf("%w: the operation no longer holds an active claim", ErrReconcileUnsupported)
+	}
+	rows, err := q.QueryContext(ctx, `SELECT target FROM operation_targets WHERE operation_id=? AND active=1`, operationID)
+	if err != nil {
+		return plan, err
+	}
+	// The targets are collected and the rows are closed before the next
+	// statement runs. The store holds a single connection, so an open row
+	// set would block the next query on the same connection.
+	for rows.Next() {
+		var target string
+		if err = rows.Scan(&target); err != nil {
+			rows.Close()
+			return plan, err
+		}
+		plan.ActiveTargets = append(plan.ActiveTargets, target)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return plan, err
+	}
+	rows.Close()
+	// The immutable acceptance evidence is the only source of the reviewed
+	// identities.
+	var acceptedActor, acceptedDisplay, acceptedAction, acceptedTarget, acceptedReason string
+	var acceptedChanges []byte
+	err = q.QueryRowContext(ctx, `SELECT actor,actor_display,action,target,reason,changes FROM operation_acceptance WHERE operation_id=?`, operationID).Scan(&acceptedActor, &acceptedDisplay, &acceptedAction, &acceptedTarget, &acceptedReason, &acceptedChanges)
+	if errors.Is(err, sql.ErrNoRows) {
+		return plan, fmt.Errorf("%w: the accepted evidence is missing", ErrReconcileUnsupported)
+	}
+	if err != nil {
+		return plan, err
+	}
+	plan.AcceptedActor = acceptedActor
+	plan.AcceptedActorDisplay = acceptedDisplay
+	plan.AcceptedReason = acceptedReason
+	if acceptedAction != profileDeleteKind {
+		return plan, fmt.Errorf("%w: only a Profile deletion can be reconciled", ErrReconcileUnsupported)
+	}
+	name, ok := strings.CutPrefix(acceptedTarget, "profile:")
+	if !ok || name == "" {
+		return plan, fmt.Errorf("%w: the accepted target is not a Profile", ErrReconcileUnsupported)
+	}
+	plan.ProfileName = name
+	changes, err := decodeChanges(acceptedChanges)
+	if err != nil {
+		return plan, err
+	}
+	uid, resourceVersion, namespaceUID, clusterUID, version, err := acceptedProfileDeleteIdentities(changes)
+	if err != nil {
+		return plan, err
+	}
+	plan.ProfileUID = uid
+	plan.ProfileResourceVersion = resourceVersion
+	plan.NamespaceUID = namespaceUID
+	plan.ClusterUID = clusterUID
+	plan.ReconciliationVersion = version
+	// The durable proof that no write was ever started. It needs all three
+	// parts: the field must be present, it must be false, and the accepted
+	// evidence must carry the current contract version.
+	plan.NoWriteProven = plan.MarkerPresent && !op.ProfileDeleteCheckpointed && plan.ReconciliationVersion == profileReconcileVersion
+	return plan, nil
+}
+
+// acceptedProfileDeleteIdentities reads the reviewed identities from the
+// immutable acceptance evidence.
+//
+// A missing or malformed identity fails closed. There is no fallback to live
+// cluster state: an identity that was not reviewed can never unlock anything.
+// The accepted cluster identity is required as well, because an observation
+// taken against another cluster reports both objects as absent and would
+// otherwise complete a deletion that never happened.
+func acceptedProfileDeleteIdentities(changes []model.Change) (uid, resourceVersion, namespaceUID, clusterUID, version string, err error) {
+	for _, c := range changes {
+		switch c.Field {
+		case profileUIDChangeField:
+			uid = strings.TrimSpace(c.Before)
+		case profileResourceVersionChangeField:
+			resourceVersion = strings.TrimSpace(c.Before)
+		case namespaceUIDChangeField:
+			namespaceUID = strings.TrimSpace(c.Before)
+		case clusterUIDChangeField:
+			clusterUID = strings.TrimSpace(c.Before)
+		case profileReconcileVersionChangeField:
+			version = strings.TrimSpace(c.Before)
+		}
+	}
+	if uid == "" || resourceVersion == "" || namespaceUID == "" {
+		return "", "", "", "", "", fmt.Errorf("%w: the accepted evidence does not carry the reviewed Profile identities", ErrReconcileUnsupported)
+	}
+	if clusterUID == "" {
+		return "", "", "", "", "", fmt.Errorf("%w: the accepted evidence does not carry the reviewed cluster identity", ErrReconcileUnsupported)
+	}
+	return uid, resourceVersion, namespaceUID, clusterUID, version, nil
+}
+
+// DeriveProfileDeleteOutcome decides the only supported derived outcome from
+// the accepted evidence and the operator's complete observations.
+//
+// It refuses every case it cannot prove:
+//
+//   - An incomplete observation proves nothing and is refused.
+//   - An object whose UID differs from the accepted UID is a different
+//     object, so the deletion cannot be reconciled as this one.
+//   - Observations that disagree with each other are refused.
+//   - A completed deletion needs two complete observations that both show
+//     the Profile and its namespace gone.
+//   - A cancellation needs the durable proof that no delete request was ever
+//     issued. Objects that are still present never prove that on their own.
+func DeriveProfileDeleteOutcome(plan ProfileDeleteReconcilePlan, observations []ProfileDeleteObservation) (ProfileDeleteReconcileOutcome, error) {
+	absent, present := 0, 0
+	for _, o := range observations {
+		if !o.Complete {
+			return "", fmt.Errorf("%w: an observation is incomplete", ErrReconcileUnsupported)
+		}
+		// Every observation must come from the accepted cluster. An
+		// observation taken against another cluster reports both objects as
+		// absent and would falsely complete an old deletion.
+		if o.ClusterUID == "" || o.ClusterUID != plan.ClusterUID {
+			return "", fmt.Errorf("%w: the observation was taken against another cluster", ErrReconcileUnsupported)
+		}
+		if o.ProfileUID != "" && o.ProfileUID != plan.ProfileUID {
+			return "", fmt.Errorf("%w: the Profile was replaced", ErrReconcileUnsupported)
+		}
+		if o.NamespaceUID != "" && o.NamespaceUID != plan.NamespaceUID {
+			return "", fmt.Errorf("%w: the namespace was replaced", ErrReconcileUnsupported)
+		}
+		if o.ProfileUID == "" && o.NamespaceUID == "" {
+			absent++
+			continue
+		}
+		present++
+	}
+	if absent+present == 0 {
+		return "", fmt.Errorf("%w: no complete observation was supplied", ErrReconcileUnsupported)
+	}
+	if absent > 0 && present > 0 {
+		return "", fmt.Errorf("%w: the observations disagree", ErrReconcileUnsupported)
+	}
+	if absent > 0 {
+		// The deletion completed. Two complete observations are required so
+		// a single failed or stale read cannot resolve an operation.
+		if absent < 2 {
+			return "", fmt.Errorf("%w: two complete observations are required", ErrReconcileUnsupported)
+		}
+		return ProfileDeleteReconciledSucceeded, nil
+	}
+	// The objects are still there. Only the durable marker may prove that no
+	// write was ever started; objects that merely look active never can.
+	if !plan.NoWriteProven {
+		return "", fmt.Errorf("%w: a Profile delete request may have been issued", ErrReconcileUnsupported)
+	}
+	return ProfileDeleteReconciledCancelled, nil
+}
+
+// ReconcileProfileDelete resolves one uncertain Profile deletion from the
+// operator's structured evidence.
+//
+// It performs no cluster write of any kind: the caller supplies the
+// observations, and this method revalidates them against the immutable
+// acceptance evidence before anything changes. The evidence read and the
+// outcome write happen in one transaction, so the derived outcome always
+// matches the evidence it was derived from.
+//
+// The transition is private on purpose. A normal Finish still cannot resolve
+// an uncertain operation, and this method still cannot resolve anything
+// except a needs-review Profile deletion that holds both of its locks.
+func (s *Store) ReconcileProfileDelete(ctx context.Context, req ProfileDeleteReconciliation) (model.Operation, error) {
+	if req.OperationID == "" {
+		return model.Operation{}, ErrNotFound
+	}
+	operator := strings.TrimSpace(req.Operator)
+	reason := strings.TrimSpace(req.Reason)
+	if operator == "" || reason == "" {
+		return model.Operation{}, fmt.Errorf("%w: an offline operator identity and a reconciliation reason are required", ErrReconcileUnsupported)
+	}
+	// The reason limit counts Unicode code points, like the API's documented
+	// maxLength and the backend's own limit. The reason contents are never
+	// echoed into an error.
+	if utf8.RuneCountInString(reason) > 500 {
+		return model.Operation{}, fmt.Errorf("%w: the reconciliation reason exceeds 500 characters", ErrReconcileUnsupported)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Operation{}, err
+	}
+	defer tx.Rollback()
+	plan, err := planProfileDeleteReconciliation(ctx, tx, req.OperationID)
+	if err != nil {
+		return model.Operation{}, err
+	}
+	if plan.Operation.State != "needs-review" {
+		return model.Operation{}, fmt.Errorf("%w: only a needs-review operation can be reconciled", ErrReconcileUnsupported)
+	}
+	if plan.Operation.Action != profileDeleteKind {
+		return model.Operation{}, fmt.Errorf("%w: only a Profile deletion can be reconciled", ErrReconcileUnsupported)
+	}
+	// Both the Profile and the namespace fence must still be held. A missing
+	// fence is not something this path may repair.
+	if !hasTarget(plan.ActiveTargets, "profile:"+plan.ProfileName) || !hasTarget(plan.ActiveTargets, "namespace:"+plan.ProfileName) {
+		return model.Operation{}, fmt.Errorf("%w: the Profile and namespace locks are not both held", ErrReconcileUnsupported)
+	}
+	outcome, err := DeriveProfileDeleteOutcome(plan, req.Observations)
+	if err != nil {
+		return model.Operation{}, err
+	}
+	op := plan.Operation
+	op.State = "succeeded"
+	op.Step = string(ProfileDeleteReconciledSucceeded)
+	op.Error = ""
+	if outcome == ProfileDeleteReconciledCancelled {
+		op.State = "failed"
+		op.Step = string(ProfileDeleteReconciledCancelled)
+		op.Error = "Offline reconciliation: no Profile deletion request was ever issued, so this operation changed nothing in the cluster."
+	}
+	op.UpdatedAt = time.Now().UTC()
+	reconcile := &profileDeleteReconciliation{Result: string(outcome), Operator: operator, Reason: reason}
+	if err = s.updateOperationTx(ctx, tx, op, model.Audit{ID: op.ID + "-reconciled", Time: op.UpdatedAt}, true, reconcile); err != nil {
+		return model.Operation{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return model.Operation{}, err
+	}
+	return op, nil
+}
+
+// hasTarget reports whether the exact target is held.
+func hasTarget(targets []string, want string) bool {
+	for _, t := range targets {
+		if t == want {
+			return true
+		}
+	}
+	return false
 }

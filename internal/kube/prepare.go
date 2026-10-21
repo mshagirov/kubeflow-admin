@@ -9,12 +9,10 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"kubeflow-admin/internal/model"
 )
 
@@ -27,6 +25,16 @@ type work struct {
 	pv       *corev1.PersistentVolume
 	ops      []patchOp
 	delayed  bool
+
+	// profileOwner and profileQuota capture the exact owner identity and hard
+	// quota map reviewed for a Profile update, so the live object can be
+	// revalidated against the plan immediately before the write.
+	profileOwner string
+	profileQuota map[string]any
+	// profileNamespace is the UID of the namespace reviewed for a Profile
+	// update. A namespace replaced between preview and execution is refused
+	// instead of adopted.
+	profileNamespace types.UID
 
 	// Pod restart targets are kept separate from Notebook edit targets: the
 	// restart path needs the validated owner chain, node and stable fingerprint
@@ -43,6 +51,9 @@ type work struct {
 }
 
 func (s *Service) Prepare(ctx context.Context, a model.Action) (model.Prepared, error) {
+	if a.Kind == "profile.delete" {
+		return s.prepareProfileDelete(ctx, a)
+	}
 	w, err := s.build(ctx, a)
 	if err != nil {
 		return model.Prepared{}, err
@@ -55,6 +66,14 @@ func (s *Service) Prepare(ctx context.Context, a model.Action) (model.Prepared, 
 func (s *Service) build(ctx context.Context, a model.Action) (*work, error) {
 	if !s.Config.Features.WritesEnabled {
 		return nil, errors.New("writes are disabled")
+	}
+	// A Profile name is also its namespace name and has its own grammar. It is
+	// checked first so an over-long or otherwise invalid Profile name is
+	// reported with its own reason, not as a generic object name failure.
+	if a.Kind == "profile.create" || a.Kind == "profile.update" {
+		if err := profileName(a.Name); err != nil {
+			return nil, err
+		}
 	}
 	if err := name(a.Name); err != nil {
 		return nil, err
@@ -80,10 +99,12 @@ func (s *Service) build(ctx context.Context, a model.Action) (*work, error) {
 		if err := s.prepareNodeCordon(ctx, a, w); err != nil {
 			return nil, err
 		}
-	} else if a.Kind == "profile.create" || a.Kind == "profile.quota.change" {
+	} else if a.Kind == "profile.create" || a.Kind == "profile.quota.change" || a.Kind == "profile.update" {
 		if a.Namespace != "" && a.Namespace != a.Name {
 			return nil, errors.New("Profile namespace must match its name")
 		}
+		// The Profile namespace is the Profile name and must satisfy the
+		// namespace scope policy before any Profile write is planned.
 		if err := s.namespacePolicy(a.Name); err != nil {
 			return nil, err
 		}
@@ -144,7 +165,7 @@ func (s *Service) dryRun(ctx context.Context, w *work) error {
 	case "profile.create":
 		_, err := s.Dynamic.Resource(Profiles).Create(ctx, w.profile, o)
 		return safe(err)
-	case "profile.quota.change":
+	case "profile.quota.change", "profile.update":
 		b, _ := json.Marshal(conditional(string(w.profile.GetUID()), w.profile.GetResourceVersion(), w.ops))
 		_, err := s.Dynamic.Resource(Profiles).Patch(ctx, w.profile.GetName(), types.JSONPatchType, b, metav1.PatchOptions{DryRun: o.DryRun})
 		return safe(err)
@@ -189,6 +210,54 @@ func quantity(s string) (resource.Quantity, error) {
 	return q, nil
 }
 
+// quotaQuantity validates a declared quota value. A ResourceQuota hard value
+// may legitimately be zero: it declares that the resource is not allowed at
+// all, and a deployed zero must round-trip unchanged so editing another quota
+// key is never blocked by it. A negative value is never valid. Requested
+// storage sizes keep the stricter positive rule of quantity().
+func quotaQuantity(s string) (resource.Quantity, error) {
+	q, err := resource.ParseQuantity(s)
+	if err != nil || q.Sign() < 0 {
+		return resource.Quantity{}, errors.New("a quota value must be a non-negative Kubernetes quantity")
+	}
+	return q, nil
+}
+
+// countQuotaKey reports whether a quota key counts objects instead of
+// measuring a resource. A Pod count, a claim count and a configured extended
+// device count are whole numbers: a fraction of a Pod is not a quota.
+func countQuotaKey(key string, presets []string) bool {
+	switch key {
+	case "pods", "persistentvolumeclaims":
+		return true
+	}
+	// The approved presets are the configured extended device resources, which
+	// are counted per device.
+	return has(presets, key)
+}
+
+// wholeQuantity reports whether a quota quantity is a whole number of objects.
+func wholeQuantity(q resource.Quantity) bool {
+	v, ok := q.AsInt64()
+	if !ok {
+		return false
+	}
+	return q.Cmp(*resource.NewQuantity(v, q.Format)) == 0
+}
+
+// quotaCountQuantity validates a declared count quota value. It is a whole,
+// non-negative number of objects.
+func quotaCountQuantity(key, raw string, presets []string) (resource.Quantity, error) {
+	q, err := quotaQuantity(raw)
+	if err != nil {
+		return resource.Quantity{}, err
+	}
+	if !wholeQuantity(q) {
+		return resource.Quantity{}, errors.New("a quota count must be a whole number of objects")
+	}
+	return q, nil
+}
+
 var builtinQuotaResources = []string{"requests.cpu", "limits.cpu", "requests.memory", "limits.memory", "requests.storage", "persistentvolumeclaims", "pods"}
 
 // supportedQuotaResource reports whether this adapter may author the hard key.
@@ -210,7 +279,15 @@ func quota(a map[string]string, presets []string) (map[string]any, error) {
 		if !supportedQuotaResource(k, presets) {
 			return nil, errors.New("unsupported quota resource")
 		}
-		q, err := quantity(v)
+		if countQuotaKey(k, presets) {
+			q, err := quotaCountQuantity(k, v, presets)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = q.String()
+			continue
+		}
+		q, err := quotaQuantity(v)
 		if err != nil {
 			return nil, err
 		}
@@ -240,19 +317,29 @@ func mergeQuota(existing map[string]any, requested map[string]string, presets []
 			if !ok {
 				return nil, errors.New("unsupported quota resource")
 			}
-			oldString, ok := old.(string)
+			// The declared value may be a string or an unquoted integer: the
+			// Profile CRD declares the hard map as int-or-string. An equivalent
+			// round-trip is preserved exactly, including its original value and
+			// type, so an operator-managed key is never rewritten.
+			oldText, ok := quotaValue(old)
 			if !ok {
 				return nil, errors.New("unsupported Profile quota shape")
 			}
-			if !quantityEqual(oldString, raw) {
+			if !quantityEqual(oldText, raw) {
 				return nil, errors.New("changing an unsupported quota key is unsupported")
 			}
 			out[k] = old
 			continue
 		}
-		q, err := quantity(raw)
+		q, err := quotaQuantity(raw)
 		if err != nil {
 			return nil, err
+		}
+		if countQuotaKey(k, presets) {
+			q, err = quotaCountQuantity(k, raw, presets)
+			if err != nil {
+				return nil, err
+			}
 		}
 		out[k] = q.String()
 	}
@@ -276,82 +363,13 @@ func quantityEqual(a, b string) bool {
 	qb, eb := resource.ParseQuantity(b)
 	return ea == nil && eb == nil && qa.Cmp(qb) == 0
 }
-func (s *Service) prepareProfile(ctx context.Context, a model.Action, w *work) error {
-	keys := []string{}
-	for _, p := range s.Config.Notebooks.GPUPresets {
-		keys = append(keys, "requests."+p.ResourceKey)
-	}
-	hard := map[string]any{}
-	var err error
-	if a.Kind == "profile.create" {
-		if len(a.Quota) > 0 {
-			hard, err = quota(a.Quota, keys)
-			if err != nil {
-				return err
-			}
-		}
-		if a.Owner == "" || len(a.Owner) > 253 || strings.TrimSpace(a.Owner) != a.Owner || strings.ContainsAny(a.Owner, "\r\n\t\x00") {
-			return errors.New("exact nonempty owner identity required")
-		}
-		if len(validation.IsDNS1123Label(a.Name)) > 0 {
-			return errors.New("Profile must have a namespace-compatible name")
-		}
-		if _, err = s.Dynamic.Resource(Profiles).Get(ctx, a.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-			if err == nil {
-				return ErrConflict
-			}
-			return safe(err)
-		}
-		if _, err = s.Typed.CoreV1().Namespaces().Get(ctx, a.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-			if err == nil {
-				return errors.New("existing namespaces cannot be adopted")
-			}
-			return safe(err)
-		}
-		spec := map[string]any{"owner": map[string]any{"kind": "User", "name": a.Owner}}
-		if len(hard) > 0 {
-			spec["resourceQuotaSpec"] = map[string]any{"hard": hard}
-		}
-		w.profile = &unstructured.Unstructured{Object: map[string]any{"apiVersion": "kubeflow.org/v1", "kind": "Profile", "metadata": map[string]any{"name": a.Name}, "spec": spec}}
-		w.prepared.Warnings = append(w.prepared.Warnings, "The exact owner identity is retained; directory existence is not verified.")
-		w.prepared.Warnings = append(w.prepared.Warnings, "Setup verification covers the Profile-owned active namespace, owner admin RoleBinding and requested quota; service-account and Istio policy contents are not independently verified.")
-	} else {
-		if len(a.Quota) == 0 {
-			return errors.New("quota removal is unsupported")
-		}
-		if err = s.scope(ctx, a.Name, &w.ev); err != nil {
-			return err
-		}
-		p, err := s.Dynamic.Resource(Profiles).Get(ctx, a.Name, metav1.GetOptions{})
-		if err != nil {
-			return safe(err)
-		}
-		old, _, err := unstructured.NestedMap(p.Object, "spec", "resourceQuotaSpec", "hard")
-		if err != nil {
-			return errors.New("unsupported Profile quota shape")
-		}
-		// Preserve operator/controller-managed keys this adapter does not
-		// understand instead of failing the whole change or dropping them.
-		hard, err = mergeQuota(old, a.Quota, keys)
-		if err != nil {
-			return err
-		}
-		w.profile = p
-		w.prepared.TargetUID = string(p.GetUID())
-		w.prepared.ResourceVersion = p.GetResourceVersion()
-		w.ev.Target = digest(p.Object["spec"])
-		if _, found, _ := unstructured.NestedMap(p.Object, "spec", "resourceQuotaSpec"); !found {
-			w.ops = []patchOp{{"add", "/spec/resourceQuotaSpec", map[string]any{"hard": hard}}}
-		} else {
-			w.ops = []patchOp{{"add", "/spec/resourceQuotaSpec/hard", hard}}
-		}
-	}
-	return nil
-}
 
 // Execute only accepts a server-owned Prepared record. Preview evidence is
 // checked against a complete fresh validation and server dry-run before writes.
 func (s *Service) Execute(ctx context.Context, p model.Prepared, cp func(string) error) error {
+	if p.Action.Kind == "profile.delete" {
+		return s.executeProfileDelete(ctx, p, cp)
+	}
 	if p.Action.Kind == "pod.restart" {
 		return s.executePodRestart(ctx, p, cp)
 	}
@@ -385,6 +403,12 @@ func (s *Service) Execute(ctx context.Context, p model.Prepared, cp func(string)
 	}
 	if strings.HasPrefix(p.Action.Kind, "notebook.") {
 		return s.executeNotebook(ctx, w, guardedCheckpoint)
+	}
+	if p.Action.Kind == "profile.update" || p.Action.Kind == "profile.quota.change" {
+		return s.executeProfileUpdate(ctx, w, guardedCheckpoint)
+	}
+	if p.Action.Kind == "profile.create" {
+		return s.executeProfileCreate(ctx, w, guardedCheckpoint)
 	}
 	return s.executeStorageOrProfile(ctx, w, guardedCheckpoint)
 }

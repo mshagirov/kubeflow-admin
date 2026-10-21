@@ -55,7 +55,7 @@ Consequently:
 
 ## Dynamic PVCs and expansion
 
-For a new dynamically provisioned workspace, choose an approved class explicitly; do not create a PV yourself. Review Delete versus Retain behavior before choosing a class. No app workflow deletes a PVC/PV.
+For a new dynamically provisioned workspace, choose an approved class explicitly; do not create a PV yourself. Review Delete versus Retain behavior before choosing a class. The app never directly deletes a PVC/PV. The separately enabled Profile deletion workflow can cascade through its owned namespace and delete every PVC inside it: a Delete reclaim policy can irreversibly delete backing volumes, while Retain-policy PVs and external storage data may remain. Never use Profile deletion as storage cleanup; see [workflow acceptance](ui-workflow-acceptance.md).
 
 With `volumeBindingMode: WaitForFirstConsumer`, the operation reports creation success while the claim is still `Pending`: the PVC cannot bind until a consuming Pod is scheduled, and the app never creates that Pod. This is creation success only, not provisioning verification — no volume exists yet, and real binding, capacity and backend behavior remain unproven until the operator schedules a workload and observes the bound claim.
 

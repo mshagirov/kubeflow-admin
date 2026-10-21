@@ -62,6 +62,21 @@ type crAPI struct {
 	patches [][]patchOp
 	dryRuns int
 	after   func(*unstructured.Unstructured)
+	// Optional failure injection for the live PATCH path. The server dry-run
+	// is never affected, so a plan can still be prepared against a fixture
+	// whose live patch fails.
+	patchStatus  int
+	patchReason  metav1.StatusReason
+	patchMessage string
+	patchRaw     string
+	// Optional failure injection for the live create path.
+	createStatus  int
+	createReason  metav1.StatusReason
+	createMessage string
+	createRaw     string
+	// getHook may replace the object served for a read. It proves that a plan
+	// is built from one consistent read instead of two.
+	getHook func(resource string, n *unstructured.Unstructured) *unstructured.Unstructured
 }
 
 func key(resource, ns, n string) string { return resource + "/" + ns + "/" + n }
@@ -69,6 +84,11 @@ func (c *crAPI) put(r string, n *unstructured.Unstructured) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.objects[key(r, n.GetNamespace(), n.GetName())] = n.DeepCopy()
+}
+func (c *crAPI) remove(r, ns, n string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.objects, key(r, ns, n))
 }
 func (c *crAPI) get(r, ns, n string) *unstructured.Unstructured {
 	c.mu.Lock()
@@ -122,12 +142,28 @@ func (c *crAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status(404, metav1.StatusReasonNotFound, "missing")
 			return
 		}
+		if c.getHook != nil {
+			if replaced := c.getHook(resourceName, n); replaced != nil {
+				n = replaced
+			}
+		}
 		_ = json.NewEncoder(w).Encode(n.Object)
 		return
 	}
 	var obj *unstructured.Unstructured
 	var ops []patchOp
 	if r.Method == http.MethodPatch {
+		if r.URL.Query().Get("dryRun") != metav1.DryRunAll {
+			if c.patchRaw != "" {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(c.patchRaw))
+				return
+			}
+			if c.patchStatus != 0 {
+				status(c.patchStatus, c.patchReason, c.patchMessage)
+				return
+			}
+		}
 		old := c.objects[k]
 		if old == nil {
 			status(404, metav1.StatusReasonNotFound, "missing")
@@ -152,6 +188,17 @@ func (c *crAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal(b, &ops)
 	} else if r.Method == http.MethodPost {
+		if r.URL.Query().Get("dryRun") != metav1.DryRunAll {
+			if c.createRaw != "" {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(c.createRaw))
+				return
+			}
+			if c.createStatus != 0 {
+				status(c.createStatus, c.createReason, c.createMessage)
+				return
+			}
+		}
 		obj = &unstructured.Unstructured{}
 		if err := json.NewDecoder(r.Body).Decode(&obj.Object); err != nil {
 			status(400, metav1.StatusReasonBadRequest, "invalid object")
@@ -212,6 +259,20 @@ func boundPVC(n string) *corev1.PersistentVolumeClaim {
 func boundPV(n string) *corev1.PersistentVolume {
 	return &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: n, UID: types.UID("pv-" + n), ResourceVersion: "1"}, Spec: corev1.PersistentVolumeSpec{StorageClassName: "approved", PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain, AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}, ClaimRef: &corev1.ObjectReference{Name: n, Namespace: "alice", UID: types.UID("pvc-" + n)}, PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: "csi.example.vendor", VolumeHandle: "existing-" + n}}}, Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound}}
 }
+
+// legacyQuotaAction builds the guarded legacy quota action: the observed
+// owner identity and the reviewed configuration digest. The legacy kind is
+// the same guarded write under its old name.
+func legacyQuotaAction(t *testing.T, api *crAPI, name string, quota map[string]string) model.Action {
+	t.Helper()
+	p := api.get("profiles", "", name)
+	if p == nil {
+		t.Fatalf("profile %s missing", name)
+	}
+	owner, _, _ := unstructured.NestedString(p.Object, "spec", "owner", "name")
+	return model.Action{Kind: "profile.quota.change", Name: name, Owner: owner, Quota: quota, BaseConfigDigest: profileConfigDigest(p)}
+}
+
 func assertNoWrites(t *testing.T, a *crAPI) {
 	t.Helper()
 	if len(a.writes) != 0 {
@@ -706,7 +767,7 @@ func TestQuotaChangePreservesExistingUnknownKeys(t *testing.T) {
 	api.put("profiles", p)
 	// 5120Mi is the same quantity as 5Gi for the operator-managed key; a
 	// round-tripped unchanged value must be accepted and preserved verbatim.
-	w, err := s.build(context.Background(), model.Action{Kind: "profile.quota.change", Name: "alice", Quota: map[string]string{"requests.cpu": "4", "requests.ephemeral-storage": "5120Mi"}})
+	w, err := s.build(context.Background(), legacyQuotaAction(t, api, "alice", map[string]string{"requests.cpu": "4", "requests.ephemeral-storage": "5120Mi"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -736,7 +797,7 @@ func TestQuotaChangeRejectsUnsafeEdits(t *testing.T) {
 		{"change-unsupported", map[string]any{"requests.cpu": "2", "requests.ephemeral-storage": "5Gi"}, map[string]string{"requests.cpu": "2", "requests.ephemeral-storage": "6Gi"}, "changing an unsupported quota key is unsupported"},
 		{"remove-all", map[string]any{"requests.cpu": "2"}, map[string]string{}, "quota removal is unsupported"},
 		{"remove-supported", map[string]any{"requests.cpu": "2", "requests.memory": "1Gi"}, map[string]string{"requests.cpu": "3"}, "quota key removal is unsupported by this adapter"},
-		{"bad-quantity", map[string]any{"requests.cpu": "2"}, map[string]string{"requests.cpu": "-1"}, "a positive Kubernetes quantity is required"},
+		{"bad-quantity", map[string]any{"requests.cpu": "2"}, map[string]string{"requests.cpu": "-1"}, "a quota value must be a non-negative Kubernetes quantity"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -746,7 +807,7 @@ func TestQuotaChangeRejectsUnsafeEdits(t *testing.T) {
 				t.Fatal(err)
 			}
 			api.put("profiles", p)
-			_, err := s.build(context.Background(), model.Action{Kind: "profile.quota.change", Name: "alice", Quota: tc.requested})
+			_, err := s.build(context.Background(), legacyQuotaAction(t, api, "alice", tc.requested))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("want error containing %q, got %v", tc.want, err)
 			}
@@ -1096,7 +1157,7 @@ func TestExecuteProfileQuotaChangePreservesUnknownKeys(t *testing.T) {
 			_, _ = k.CoreV1().ResourceQuotas(obj.GetName()).Update(ctx, q, metav1.UpdateOptions{})
 		}
 	}
-	prepared, err := s.Prepare(ctx, model.Action{Kind: "profile.quota.change", Name: "alice", Quota: map[string]string{"requests.cpu": "4"}})
+	prepared, err := s.Prepare(ctx, legacyQuotaAction(t, api, "alice", map[string]string{"requests.cpu": "4"}))
 	if err != nil {
 		t.Fatal(err)
 	}

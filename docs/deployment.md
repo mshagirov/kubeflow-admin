@@ -12,7 +12,7 @@ Still required: dedicated admin hostname/DNS, public issuer URL and trusted CA, 
 
 ## 2. Prepare a real site overlay and DB disk
 
-Base uses the default StorageClass; local disks keep the WAL default, while BeeGFS requires `journalMode: delete` plus `allowUnverifiedFilesystem: true` — follow [database requirements](database.md), including the global-lock and remote-fsync verification, before setting either. Use the republished 0.1.0 image pinned below. The group placeholder still requires configuration. For an optional **node-local** deployment instead:
+Base uses the default StorageClass; local disks keep the WAL default, while BeeGFS requires `journalMode: delete` plus `allowUnverifiedFilesystem: true` — follow [database requirements](database.md), including the global-lock and remote-fsync verification, before setting either. Use the release image built, published and scanned from this source (section 4), pinned by its fresh registry digest in the site overlay. The historical 0.1.0 image is not this release. The group placeholder still requires configuration. For an optional **node-local** deployment instead:
 
 1. Select a durable node and record its exact `kubernetes.io/hostname` label (not an assumed DNS name). On that node, select an existing local ext4/XFS filesystem with sufficient capacity, proper locking and durable fsync; do not use a network mount, symlink, ephemeral boot disk or notebook data directory.
 2. As the node operator, prepare a **new dedicated** `/var/lib/kubeflow-admin-db` directory. After confirming it is absent and the parent is the intended filesystem, `sudo install -d -o 65532 -g 65532 -m 0700 /var/lib/kubeflow-admin-db`. Do not recursively chown existing data. Verify permissions, free space, backup and node-loss recovery.
@@ -44,9 +44,60 @@ EOF
 
 The historical `docker.io/muratshagirov/kubeflow-admin:0.1.0` image (linux/amd64) does **not** include these review fixes. Its old digest is recorded only in [historical verification](verification.md), not recommended as the fixed release. Build, publish and scan the reviewed source (section 4), then replace the overlay's placeholder with the fresh registry digest. Do not assume a tag or a previous digest represents current source.
 
-Configure `deploy/site/config.yaml` strictly against `internal/config/config.go`, **not** the older design-plan schema. Set `server.publicURL` to the HTTPS origin (no path), issuer/client, exact admin groups or subjects, approved user classes/images/presets, protected namespaces and preferably a single pilot `allowedNamespaces` entry. `adminSubjects` contains exact `sub` strings and is bound to the configured issuer. Keep every `features` switch false (including `podRestarts` and `nodeCordon`) and `controllerContractConfirmed` false initially. Pod restart additionally needs its separate, namespace-scoped eviction permission and a disposable pilot; see [Pods](pods.md). Node cordon/uncordon needs a separately reviewed `nodes/patch` grant: the supplied overlay covers all Nodes, and Kubernetes RBAC cannot restrict the patched fields (named Nodes can be restricted with `resourceNames`); see [Nodes](nodes.md). Add every site's system namespace to the protected list. Config is read at startup; the generated ConfigMap name changes trigger a restart. Never put credentials in it.
+Configure `deploy/site/config.yaml` strictly against `internal/config/config.go`, **not** the older design-plan schema. Set `server.publicURL` to the HTTPS origin (no path), issuer/client, exact admin groups or subjects, approved user classes/images/presets, protected namespaces and preferably a single pilot `allowedNamespaces` entry. `adminSubjects` contains exact `sub` strings and is bound to the configured issuer. Keep every `features` switch false (including `podRestarts`, `nodeCordon` and `profileDeletion`) and `controllerContractConfirmed` false initially. Pod restart additionally needs its separate, namespace-scoped eviction permission and a disposable pilot; see [Pods](pods.md). Node cordon/uncordon needs a separately reviewed `nodes/patch` grant: the supplied overlay covers all Nodes, and Kubernetes RBAC cannot restrict the patched fields (named Nodes can be restricted with `resourceNames`); see [Nodes](nodes.md). Profile deletion needs a separately reviewed `kubeflow.org/profiles` `delete` grant and the `profileDeletion` opt-in; see section 7. Add every site's system namespace to the protected list. Config is read at startup; the generated ConfigMap name changes trigger a restart. Never put credentials in it.
+
+Profile ownership is **immutable** in the installed Profile controller: it refuses an owner change and guards the existing namespace before reconciling quota or role bindings (see the upstream owner-immutability issue). The console therefore edits **quotas only** in `profile.update`. The pre-filled owner is shown read-only, and any request whose owner differs from the current one is refused as an unsupported contract rather than applied as a broken write.
+
+New Profiles (`profile.create`) require an **email-formatted** owner value, and the check is syntax only — the console performs **no** identity-provider or LDAP registration lookup, so a well-formed address may still be unregistered. Existing Profiles whose owner is a configured username keep working: `profile.update` accepts them **while the owner is left unmodified**, so there is no universal email-format rejection on update. Owner transfer, owner migration and custom owner controllers are a separate future workflow; do not delete or rewrite existing data to satisfy the email rule.
+
+Profile creation refuses an observed existing Profile or namespace and checks
+again immediately before creation. Namespace and Profile creation are separate
+API calls, not an atomic reservation: coordinate external namespace writers.
+A competing namespace can still prevent controller convergence and leave an
+operation needing review; the app never rolls it back by deleting resources.
 
 For an already operator-provisioned safe DB PVC, adapt the base PVC to that exact class/binding before apply instead. Existing PVC binding/class fields are generally immutable: do not overwrite a live claim to switch backend. Follow backup/migration recovery procedures.
+
+### 2.1 Optional console footer text
+
+The console footer is deployment configuration, not a shipped sentence. It is **empty by default**: without the key the console renders no footer element at all, so a deployment never shows a sentence it did not ask for.
+
+A site that wants a footer sets exactly one key, `ui.footerText`, in its `config.yaml` — the file the `kubeflow-admin-config` ConfigMap is generated from (see the site overlay above). The value is plain text or a small amount of HTML for branding:
+
+```yaml
+ui:
+  footerText: |
+    <p><strong>Acme Platform</strong> · Changes are audited by the platform team · Support: platform-team@example.org</p>
+    <a href="https://support.acme.example">Support portal</a>
+    <img src="https://cdn.acme.example/logo.png" alt="Acme logo" width="120" height="40">
+```
+
+The value is **sanitized** against a strict allowlist before it is rendered (see `internal/footer`). Unsafe content is removed, not escaped into view:
+
+- **Allowed elements:** `p`, `span`, `div`, `br`, `strong`, `em`, `b`, `i`, `ul`, `ol`, `li`, `a`, `img`.
+- **Allowed attributes:** `href` and `title` on `a`; `src`, `alt`, `title`, `width` and `height` on `img`. An `alt`/`title` is truncated to 200 characters; a `width`/`height` is dropped unless it is a plain number of at most 1024 pixels. A company logo needs an `alt`: give the image the text a screen reader should announce.
+- **Link destinations:** `http`, `https` or a relative path. Every other scheme (`javascript:`, `data:`, `vbscript:`, `mailto:`, …) is removed with the attribute that carried it.
+- **Image sources:** `http`, `https` or a relative path. Scheme-relative sources (`//cdn.example/logo.png`) become HTTPS. Hosts must be valid ASCII DNS names (punycode is supported) or IP literals with a valid optional port; credentials, wildcards and policy metacharacters are refused. A `data:` image is removed.
+- **Everything else is removed:** `script`, `style`, `iframe`, `object`, `embed` and `form` elements with their content, event handlers (`onclick`, `onerror`, …), inline CSS, raw SVG, `data:` URLs and every attribute that is not listed above.
+- **Links are hardened:** every footer link is rendered as `target="_blank" rel="noopener noreferrer"`, so the opened page gets neither a handle on the console window nor a referrer.
+
+A plain-text value keeps working exactly as before: it is escaped and shown as text. A value that sanitizes to nothing — an empty value, whitespace only, or markup that is entirely removed — renders **no footer element at all**, never an empty placeholder.
+
+The value is **bounded**: at most **16384 characters**, counted in runes (Unicode code points), not bytes. A longer value is refused at startup.
+
+An external image is a **browser request**. The console renders the reference and nothing else: it never fetches the image, so there is no server-side fetch and no server-side request forgery surface. The operator's browser requests the URL the deployment configured, which means that image host sees the request and the administrator's address. Use a company-controlled URL, and treat the image host as a third party that learns when an administrator opens the console. The page's `Content-Security-Policy` names exactly the image hosts the configured footer references — a deployment without a footer keeps the shipped policy, and a deployment with one opens only the host it configured.
+
+The footer carries no capability, no permission and no secret, so it is not a place for credentials.
+
+The configuration is read **once at startup**. Changing the ConfigMap alone does **not** reload the application: the running Pod keeps the previous footer until it is restarted. Re-apply the rendered manifests (the generated ConfigMap name changes with its content) and restart the Pods — the generated ConfigMap name change rolls the Deployment, but a Pod that is not replaced keeps the old value. Wait for the rollout and confirm the new footer in the browser:
+
+```sh
+kubectl --context YOUR_CONTEXT apply -f rendered.yaml
+kubectl --context YOUR_CONTEXT -n kubeflow-admin rollout restart deployment/kubeflow-admin
+kubectl --context YOUR_CONTEXT -n kubeflow-admin rollout status deployment/kubeflow-admin --timeout=180s
+```
+
+If the deployment does not roll (for example because the ConfigMap content and the Pod template are unchanged), the explicit `rollout restart` is what applies the new footer.
 
 ## 3. Register OIDC and install its secret
 
@@ -97,9 +148,100 @@ Use HTTPS to test admin login, non-admin denial, inventory including existing no
 Then, on a disposable **pre-existing test profile/notebook/PVC** with backups and no valuable running computation:
 
 1. Independently verify controller 1.10 start/stop annotation and culling behavior, installed schema, child UID ownership, admission restrictions and driver behavior. A CR dry-run cannot validate the generated Pod or controller convergence.
-2. Restrict `policy.allowedNamespaces` to the pilot. Copy `deploy/overlays/writes/rbac.yaml` to `deploy/site/writes-rbac.yaml` and add `writes-rbac.yaml` under the site's `resources`. Set `features.writesEnabled: true`, `notebooks.controllerContractConfirmed: true` only after verification. Base remains supplied once by local-storage. For static/expansion also copy those overlays' exact RBAC files under distinct site filenames and enable only the corresponding feature after policy/backend review; do not stack bases or duplicate resources.
+2. Restrict `policy.allowedNamespaces` to the pilot. Copy `deploy/overlays/writes/rbac.yaml` to `deploy/site/writes-rbac.yaml` and add `writes-rbac.yaml` under the site's `resources`. Set `features.writesEnabled: true`, `notebooks.controllerContractConfirmed: true` only after verification. Keep the base supplied exactly once by whichever base or local-storage resource the site uses. For static/expansion also copy those overlays' exact RBAC files under distinct site filenames and enable only the corresponding feature after policy/backend review; do not stack bases or duplicate resources.
 3. Render/review/apply; preview stop/start, inspect warnings, execute once, poll the durable operation and confirm real Pod disappearance/readiness plus audit attribution. Test expired/stale previews, double submission, non-admin/CSRF denials and crash recovery without automatic replay.
-4. Pilot dynamic storage/profile quota/edits separately, then approved NFS/static CSI and expansion only when supported. The implemented expansion action requires a verified bound CSI volume with a driver matching the StorageClass; a plain NFS PV remains unsupported even if its class reports expansion. Verify non-app fields and user data remain intact. No app cleanup/delete workflow exists; operator cleanup needs a separate reviewed data/reclaim plan.
+4. Pilot dynamic storage/profile quota/edits separately, then approved NFS/static CSI and expansion only when supported. The implemented expansion action requires a verified bound CSI volume with a driver matching the StorageClass; a plain NFS PV remains unsupported even if its class reports expansion. Verify non-app fields and user data remain intact. There is no arbitrary cleanup workflow: only the separately gated `profile.delete` deletes a Profile and cascades to its namespace (section 7). Other workflows can also irreversibly lose volatile state. Operator cleanup of PVCs, PVs and backend data needs a separate reviewed data/reclaim plan.
 5. Widen namespace scope deliberately only after evidence is recorded. RBAC patch rights are not field-limited; enforce privileged workload/service-account/volume and PV-source restrictions through existing admission policy. Static PV backend uniqueness cannot be enforced atomically by this app (or by a CEL admission rule alone): keep exactly one application writer and a site-owned cluster-wide registration/coordination process covering every privileged writer, as described in [storage](storage.md).
 
 Turning feature flags off stops new UI/API writes but does not revoke RBAC or undo mutations. Removing overlays from a Kustomization and applying does **not** remove existing ClusterRoleBindings; revoke the exact optional bindings separately through the platform operator after reviewing in-flight work. Never use broad prune/delete to downgrade.
+
+## 7. Profile deletion — separate opt-in, irreversible
+
+`profile.delete` is the only action that deletes a Profile and cascades to its namespace. Other workflows can also irreversibly lose volatile state. Deletion is deliberately narrow: one typed action, one directly deleted resource (the `kubeflow.org` Profile), one permission (`delete`), and two explicit gates. There is no HTTP `DELETE` endpoint, no namespace-delete action, no volume-delete action and no generic cleanup route.
+
+### 7.1 The two gates
+
+| Gate | Where | Effect when off |
+| --- | --- | --- |
+| `features.writesEnabled: true` | `deploy/site/config.yaml` | Every write is refused; the deletion control is not offered |
+| `features.profileDeletion: true` | `deploy/site/config.yaml` | `profile.delete` is refused by the API with a policy error before any plan is created |
+
+Both must be true. The flag is **not** implied by `writesEnabled`, and the shipped base config keeps `profileDeletion: false`. The console also projects the capability to the browser only when both are enabled, so the browser never offers a capability the API would refuse.
+
+### 7.2 Installing the permission without stacking bases
+
+`deploy/overlays/profile-deletion/` grants exactly one verb on one resource:
+
+```yaml
+  - apiGroups: [kubeflow.org]
+    resources: [profiles]
+    verbs: [delete]
+```
+
+It grants **no** `namespaces`, `persistentvolumes`, `persistentvolumeclaims` or `pods` delete, and **no** finalizer update or patch. The read-only base is unchanged, and `deploy/overlays/all-features/` does **not** include this overlay — the delete permission is never granted by a broad feature bundle.
+
+Because the base must appear exactly once in a rendered site overlay, copy the RBAC file into the site directory instead of stacking overlays:
+
+```sh
+cp deploy/overlays/profile-deletion/rbac.yaml deploy/site/profile-deletion-rbac.yaml
+```
+
+Then add `profile-deletion-rbac.yaml` under the site's `resources` **once**, next to the other copied RBAC files, and do not list `deploy/overlays/profile-deletion/` itself (it would add the base a second time). The same rule as the other overlays: the base is supplied once, and no resource is duplicated.
+
+### 7.3 Restricting the grant to a disposable pilot
+
+A Profile is a **cluster-scoped** object, so a namespaced `Role` cannot grant access to it and a `RoleBinding` grants nothing for it. The way to narrow the grant is `resourceNames` on the **ClusterRole**, bound by a ClusterRoleBinding:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflow-admin-profile-deletion
+rules:
+  - apiGroups: [kubeflow.org]
+    resources: [profiles]
+    resourceNames: [REPLACE_WITH_DISPOSABLE_PILOT_PROFILE]
+    verbs: [delete]
+```
+
+`resourceNames` **does** restrict which Profiles may be deleted: a delete request for any other name is denied by the API server. Edit the copied `deploy/site/profile-deletion-rbac.yaml` this way for the pilot, and keep the unrestricted list only for a reviewed, fully disposable scope.
+
+What `resourceNames` does **not** do is bound the work that follows the deletion. It restricts no field, and it does not stop the namespace cascade that the Profile deletion triggers. Bound those with cluster-scoped namespace protection and existing admission policy, not with RBAC.
+
+### 7.4 Verify the installed controller and ownership first
+
+Before enabling the opt-in, independently confirm with your own tooling:
+
+1. The installed Profile controller owns the namespace it created for a Profile (owner reference plus the `owner` annotation) and performs the normal cleanup when the Profile is deleted.
+2. Kubernetes garbage collection removes the Profile's owned namespace and the namespaced objects inside it.
+3. The pilot Profile is disposable, its namespace contains no valuable data, and the owner has been told.
+
+A deletion that the controller does not clean up leaves a namespace in `Terminating` with no automated recovery path.
+
+### 7.5 What the deletion actually does — and does not do
+
+**Namespace ownership is a deployment prerequisite, not an atomic transaction.**
+Before enabling deletion, restrict namespace creation/updates and Profile owner
+reference assignment to the reviewed Profile controller and coordinated
+platform operators. Admission must prevent a Profile from owning another
+namespace, prevent cross-namespace Profile owner references on resources, and
+prevent replacement/reparenting during deletion (including stale controller
+reconciliation). Do not recreate a Profile under the same name during cleanup.
+Use an enforced maintenance window if other privileged writers cannot be fenced.
+
+The app checks the namespace UID/ownership and refuses additional namespaces
+owned by the Profile, but Kubernetes has no multi-object transaction tying those
+reads to the Profile DELETE. App database locks do **not** constrain `kubectl`,
+GitOps, other controllers or privileged users. Keep `profileDeletion: false`
+until these controls and the installed controller have been reviewed; UID
+preconditions on the Profile alone cannot guarantee the namespace blast radius.
+
+- It requests deletion of **one** Profile, identified by an exact name, with a **nonempty reason** and a `confirmName` that must equal the target Profile name **exactly** (raw comparison, no trimming or case folding).
+- The delete uses **background propagation**, matching `kubectl delete` semantics: the API server accepts the request and the objects disappear asynchronously.
+- The installed Profile controller and Kubernetes garbage collection perform the normal cleanup of the owned namespace and its namespaced objects. The console has **no** namespace-delete permission and issues **no** Namespace `DELETE`.
+- The console never directly deletes a PV/PVC. Namespace cleanup deletes PVCs and applies each bound PV's reclaim policy: **Delete can irreversibly destroy the backing volume and data**, while Retain-policy PVs and external data may remain. Retain does not protect against backend lifecycle or later operator deletion. Namespaced VolumeSnapshots also disappear; underlying snapshot content follows its own deletion policy. This is not a verified data wipe.
+- The action succeeds only when the Profile **and** its owned namespace are both observed **gone**. A replacement object with the same name, or a read error, is **not** gone.
+- If the namespace stays `Terminating` (a finalizer that never clears), the operation becomes `needs-review`. There is no force, no finalizer removal and no retry loop; reconcile it as an operator.
+- While deletion is unresolved, an exclusive namespace fence blocks other app mutations there. After successful deletion the fence is released, but missing Profile/namespace scope still refuses child mutations. A later recreated workspace requires fresh observations and plans.
+
+Because the operation is irreversible and the app has no undo, test it only on a disposable pilot and keep a verified backup beforehand.

@@ -25,11 +25,32 @@ assert.deepEqual(links, [["overview", "Overview"], ["profiles", "Profiles"], ["n
 assert.ok(html.includes('href="/history" data-page="history"'));
 assert.ok(html.includes('class="source-link"') && html.includes('href="https://github.com/mshagirov/kubeflow-admin.git"') && html.includes('class="gh-icon"') && html.includes('rel="noopener noreferrer"'), "sidebar links to the public source repository");
 assert.ok(style.includes(".source-link") && style.includes(".gh-icon"));
+assert.ok(html.includes('</a><small>© 2026 Murat Shagirov</small></div></aside>'), "sidebar copyright follows the repository link");
 assert.equal(html.includes("Administrative control plane"), false, "sidebar omits the administrative control plane label");
 assert.equal(html.includes('<span class="dot"></span>'), false, "sidebar omits the status dot");
 assert.equal(/data-page="(operations|audit)"/.test(html), false, "History replaces separate sidebar entries");
 assert.equal(html.includes('<section id="operations"'), false);
 assert.equal(html.includes('<section id="audit"'), false);
+
+// The Overview no longer carries the static explanation panels: the console
+// explains nothing the operator did not ask for.
+assert.equal(html.includes("Review before you apply"), false, "the Overview no longer renders the review panel");
+assert.equal(html.includes("Observed, not assumed"), false, "the Overview no longer renders the observed-state panel");
+assert.equal(html.includes("info-grid"), false, "the Overview info grid is removed");
+assert.equal(style.includes(".info-grid"), false, "the removed info grid leaves no styling behind");
+assert.ok(style.includes(".info{"), "the shared info panel styling stays for the other pages");
+
+// The footer is deployment configuration, not a shipped sentence. An empty
+// configuration renders no footer element at all.
+assert.equal(html.includes("Administrative changes are audited"), false, "the built-in footer sentence is removed");
+assert.equal(html.includes("Inventory reflects its observation timestamp"), false, "the built-in footer sentence is removed");
+assert.equal(html.includes("History is a bounded recent window, not a full export"), false, "the built-in footer sentence is removed");
+assert.ok(html.includes("{{if .Config.UI.FooterText}}") && html.includes("<footer>{{.Config.UI.FooterText}}</footer>"), "the footer text is projected from the deployment configuration");
+assert.ok(/<footer>\{\{\.Config\.UI\.FooterText\}\}<\/footer>/.test(html), "the footer carries no hardcoded text");
+
+// The plan confirmation workflow is unchanged: the browser still confirms a
+// server-owned plan before anything is submitted.
+assert.ok(html.includes('id="plan-dialog"') && html.includes('id="plan-preview"') && html.includes('id="confirm-plan"') && html.includes('id="cancel-plan"') && html.includes('id="submit-plan"'), "the plan confirmation workflow is unchanged");
 assert.deepEqual(logic.routeFor("/operations", ""), { page: "history", tab: "operations" });
 assert.deepEqual(logic.routeFor("/audit", ""), { page: "history", tab: "audit" });
 assert.deepEqual(logic.routeFor("/history", "?tab=audit"), { page: "history", tab: "audit" });
@@ -51,6 +72,7 @@ assert.ok(html.includes('<meta name="pod-restarts" content="{{.Config.Features.P
 assert.ok(html.includes('<meta name="node-cordon" content="{{.Config.Features.NodeCordon}}">'));
 assert.ok(app.includes("nodeCordonFeature") && app.includes('meta("node-cordon")'));
 assert.ok(html.includes('<meta name="csrf-token" content="{{.Identity.CSRF}}">'));
+assert.ok(html.includes('<meta name="profile-deletion" content="{{.Config.Features.ProfileDeletion}}">'), "the profile deletion capability is projected to the browser as a feature meta");
 assert.ok(html.includes("{{if .Identity.DisplayName}}"));
 assert.ok(html.includes('action="/auth/logout" method="post"'));
 assert.ok(html.includes('name="csrf"'));
@@ -88,10 +110,36 @@ assert.ok(app.includes("historyCache[tab].rows") && app.includes("logic.parseTar
 
 // Accessible management drawers for Profile, Storage, Notebook and Pod restart,
 // including the scoped Profile summary modal.
-for (const drawer of ["profile-drawer", "storage-drawer", "notebook-drawer", "profile-summary-drawer", "pod-restart-drawer", "namespace-summary-drawer", "node-cordon-drawer"]) {
+for (const drawer of ["profile-drawer", "storage-drawer", "notebook-drawer", "profile-summary-drawer", "pod-restart-drawer", "namespace-summary-drawer", "node-cordon-drawer", "resource-details-drawer"]) {
   assert.ok(html.includes(`id="${drawer}"`), `missing ${drawer}`);
 }
-assert.equal((html.match(/aria-modal="true"/g) || []).length >= 7, true);
+assert.equal((html.match(/aria-modal="true"/g) || []).length >= 8, true);
+assert.ok(html.includes('id="resource-details-body"') && html.includes('aria-labelledby="resource-details-title"'), "the observed resource details drawer is a labelled modal dialog");
+assert.ok(app.includes("openResourceDetails") && app.includes("detailEntries"), "observed resource details open the right-side drawer");
+assert.equal(app.includes("detailsNode"), false, "resource details never use an inline disclosure");
+assert.ok(app.includes('el("details", undefined, "stage-details")'), "audit stage details keep their lazy disclosure");
+assert.ok(app.includes("data-clear-filters") && app.includes("clearFilters"), "every table offers a clear-filters control");
+assert.ok(app.includes("syncClearFilters") && app.includes("aria-disabled"), "the clear-filters control reports whether a filter is applied");
+assert.ok(app.includes("applyResourceScope") && app.includes("resourceScope") && app.includes("dropResourceScope"), "a deep-linked resource focus is applied and dropped coherently");
+assert.ok(app.includes("resourceScopeCell") && app.includes("resourceScopeTargets"), "namespace summary resources link to their scoped page");
+// The Profile management contract: an owned new name, an editable create
+// owner, a read-only update owner and a dedicated deletion drawer.
+assert.ok(html.includes('id="profile-create-name"') && html.includes('maxlength="63"') && html.includes('pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"'), "the new Profile name is a DNS-1123 label input");
+assert.equal(html.includes('list="profile-names"'), false, "the new Profile name never offers the existing profiles");
+assert.equal(html.includes('<datalist id="profile-names">'), false, "the Profile name datalist is removed");
+assert.ok(html.includes("Email (registered with identity provider, e.g. user email from LDAP)"), "the create owner asks for the registered email address");
+assert.ok(html.includes('name="profileCreateOwner" type="email"'), "the create owner is an email field");
+assert.ok(html.includes('name="profileOwner" type="text" readonly'), "the update owner is read-only and still submitted");
+assert.equal(html.includes('name="profileOwner" type="text" disabled'), false, "a disabled owner would not be submitted");
+assert.ok(html.includes('name="profileBaseConfigDigest"') && html.includes('type="hidden"'), "the configuration precondition is a hidden field");
+assert.ok(html.includes("Owner transfer is unsupported by the installed Profile controller"), "the read-only owner explains the unsupported transfer");
+assert.ok(html.includes("every existing quota key must be supplied with its current value"), "the quota hint states the no-removal contract");
+assert.ok(html.includes('id="profile-delete-drawer"') && html.includes('id="profile-delete-form"'), "the deletion has its own drawer and form");
+assert.ok(html.includes('name="kind" value="profile.delete"'), "the deletion form posts the typed deletion action");
+assert.ok(html.includes('name="confirmName"') && html.includes('name="reason" required maxlength="500"'), "the deletion form requires a reason and an exact confirmation");
+assert.ok(app.includes("profileDeleteValidation") && app.includes("preSubmitError"), "the deletion uses the shared validation helper before the request");
+assert.ok(app.includes("profileNameValidation") && app.includes("profileFormValues") && app.includes("profileQuotaValues"), "the Profile form uses the shared pure helpers");
+assert.ok(app.includes("profile-use-suggestion") && app.includes("aria-describedby"), "the name suggestion is explicit and accessible");
 for (const kind of ["profile", "storage", "notebook"]) assert.ok(html.includes(`data-open-drawer="${kind}"`));
 assert.ok(html.includes('id="profile-form"') && html.includes('id="storage-form"') && html.includes('id="notebook-form"') && html.includes('id="pod-restart-form"') && html.includes('id="node-cordon-form"'));
 assert.ok(html.includes('name="kind" value="pod.restart"'));
@@ -189,7 +237,7 @@ async function bootHarness(options = {}) {
       this.classList = { set: new Set(), add: (...names) => names.forEach(name => this.classList.set.add(name)), remove: (...names) => names.forEach(name => this.classList.set.delete(name)), toggle: (name, on) => { const value = on === undefined ? !this.classList.set.has(name) : on; value ? this.classList.set.add(name) : this.classList.set.delete(name); }, contains: name => this.classList.set.has(name) };
     }
     append(...nodes) { nodes.forEach(node => { if (node) node.parent = this; this.children.push(node); }); }
-    replaceChildren(...nodes) { this.children.forEach(node => { if (node) node.parent = null; }); nodes.forEach(node => { if (node) node.parent = this; }); this.children = nodes; }
+    replaceChildren(...nodes) { this.children.forEach(node => { if (node) { node.parent = null; disconnect(node); } }); nodes.forEach(node => { if (node) node.parent = this; }); this.children = nodes; }
     prepend(...nodes) { nodes.forEach(node => { if (node) node.parent = this; }); this.children.unshift(...nodes); }
     addEventListener(name, handler) { (this.listeners[name] || (this.listeners[name] = [])).push(handler); }
     querySelector(selector) {
@@ -197,32 +245,51 @@ async function bootHarness(options = {}) {
       return descendants(this, selector)[0] || null;
     }
     querySelectorAll(selector) { return descendants(this, selector); }
-    closest(selector) { return selector === "[hidden]" ? (this.hidden ? this : null) : this; }
+    // A hidden ancestor hides its control as well, exactly as in a browser.
+    closest(selector) {
+      if (selector !== "[hidden]") return this;
+      let node = this;
+      while (node) { if (node.hidden) return node; node = node.parent; }
+      return null;
+    }
     get parentElement() { return new Element(); }
     before() {}
     remove() {
       if (this.parent) { this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }
+      disconnect(this);
     }
     focus() { document.activeElement = this; }
-    click() { for (const handler of this.listeners.click || []) handler({ button: 0, defaultPrevented: false, preventDefault() {}, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false }); }
+    click() { for (const handler of this.listeners.click || []) handler({ button: 0, defaultPrevented: false, preventDefault() {}, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, currentTarget: this, target: this }); }
     select() {}
     showModal() { this.open = true; }
     close() { this.open = false; }
     getClientRects() { return this.hidden ? [] : [{}]; }
     contains(node) { return node === this || this.children.some(child => child && typeof child.contains === "function" && child.contains(node)); }
     setAttribute(name, value) { this.attributes[name] = value; }
+    hasAttribute(name) { return Object.hasOwn(this.attributes, name); }
     removeAttribute(name) { delete this.attributes[name]; }
     get textContent() { return this._text || ""; }
     set textContent(value) { this._text = String(value); }
   }
   class Option extends Element { constructor(text, value) { super("option"); this.textContent = text; this.value = value; } }
+  // A removed element is no longer connected to the document. The application
+  // relies on that to find the control that may take the focus back.
+  function disconnect(node) {
+    if (!node) return;
+    node.isConnected = false;
+    for (const child of node.children || []) disconnect(child);
+  }
   class FakeFormData {
     constructor(form) { this.form = form; }
     *[Symbol.iterator]() {
-      yield ["kind", "notebook.stop"];
-      yield ["namespace", "team-a"];
-      yield ["name", "work-000"];
-      yield ["reason", "Synthetic retry reason"];
+      // A real FormData carries every enabled, named control of the form.
+      for (const control of this.form?.controls || []) {
+        if (!control || control.disabled) continue;
+        const name = String(control.name || "");
+        if (!name) continue;
+        if (control.type === "checkbox") { if (control.checked) yield [name, control.value || "on"]; continue; }
+        yield [name, control.value === undefined ? "" : control.value];
+      }
     }
   }
   function matchesSelector(node, selector) {
@@ -268,23 +335,74 @@ async function bootHarness(options = {}) {
     if (!nodes.has(selector)) nodes.set(selector, new Element("div", selector));
     return nodes.get(selector);
   }
+  // Controls created at runtime are found by walking the registered stubs.
+  function registryMatches(selector) {
+    const found = [];
+    for (const node of nodes.values()) {
+      if (matchesSelector(node, selector)) found.push(node);
+      descendants(node, selector, found);
+    }
+    return found;
+  }
   const sidebar = [["overview", "/"], ["profiles", "/profiles"], ["namespaces", "/namespaces"], ["storage", "/storage"], ["notebooks", "/notebooks"], ["pods", "/pods"], ["nodes", "/nodes"], ["history", "/history"]].map(([page, href]) => {
     const link = new Element("a"); link.dataset.page = page; link.href = "https://admin.example.invalid" + href; return link;
   });
   const sections = ["overview", "profiles", "namespaces", "storage", "notebooks", "pods", "nodes", "history"].map(id => { const section = new Element("section"); section.id = id; return section; });
   const tabs = ["operations", "audit"].map(tab => { const button = new Element("button"); button.dataset.historyTab = tab; return button; });
-  const drawers = ["profile", "storage", "notebook", "profile-summary", "pod-restart", "namespace-summary", "node-cordon"].map(kind => { const drawer = get("#" + kind + "-drawer"); drawer.hidden = true; return drawer; });
+  const drawers = ["profile", "storage", "notebook", "profile-summary", "pod-restart", "namespace-summary", "node-cordon", "resource-details", "profile-delete"].map(kind => { const drawer = get("#" + kind + "-drawer"); drawer.id = kind + "-drawer"; drawer.hidden = true; return drawer; });
+  // The body of a summary drawer lives inside its drawer, exactly as in the
+  // document. A closed drawer therefore hides its controls with it.
+  for (const kind of ["profile-summary", "namespace-summary", "resource-details"]) get("#" + kind + "-drawer").append(get("#" + kind + "-body"));
   const sharedError = new Element("p"); sharedError.className = "form-error"; sharedError.hidden = true;
   const sharedSubmit = new Element("button"); sharedSubmit.type = "submit"; sharedSubmit.textContent = "Prepare plan";
-  const forms = ["profile-form", "storage-form", "notebook-form", "pod-restart-form"].map(id => {
+  const forms = ["profile-form", "storage-form", "notebook-form", "pod-restart-form", "profile-delete-form"].map(id => {
     const form = new Element("form"); form.id = id; form.append(sharedError, sharedSubmit); return form;
   });
+  // The forms carry the controls a real browser would submit, so a payload can
+  // be asserted end to end.
+  const control = (name, value = "", type = "text") => { const input = new Element(type === "select" ? "select" : "input"); input.name = name; input.value = value; input.type = type; return input; };
+  const profileQuotaKeys = ["requests.cpu", "requests.memory", "limits.cpu", "limits.memory", "requests.storage", "persistentvolumeclaims", "pods"];
+  const profileQuotaInputs = profileQuotaKeys.map(key => { const input = control("quota." + key); input.dataset.profileQuota = key; return input; });
+  const profileQuotaFieldset = get("#profile-quota-fields");
+  profileQuotaInputs.forEach(input => profileQuotaFieldset.append(input));
+  const profileControls = {
+    kind: control("kind", "profile.create", "select"),
+    profileCreateName: control("profileCreateName"),
+    profileTarget: control("profileTarget", "", "select"),
+    profileCreateOwner: control("profileCreateOwner", "", "email"),
+    profileOwner: control("profileOwner", "", "text"),
+    profileBaseConfigDigest: control("profileBaseConfigDigest"),
+    reason: control("reason")
+  };
+  // The stubs are the same nodes the application resolves by id.
+  for (const [id, name] of [["#profile-kind", "kind"], ["#profile-create-name", "profileCreateName"], ["#profile-update-name", "profileTarget"],
+    ["#profile-create-owner", "profileCreateOwner"], ["#profile-update-owner", "profileOwner"], ["#profile-update-digest", "profileBaseConfigDigest"], ["#profile-reason", "reason"]]) {
+    const stub = get(id);
+    stub.name = profileControls[name].name;
+    stub.value = profileControls[name].value;
+    profileControls[name] = stub;
+  }
+  const staticProfileControls = [profileControls.kind, profileControls.profileCreateName, profileControls.profileTarget, profileControls.profileCreateOwner,
+    profileControls.profileOwner, profileControls.profileBaseConfigDigest, profileControls.reason, ...profileQuotaInputs];
+  // The unmanaged quota keys are round-tripped through hidden controls the
+  // application creates at runtime, exactly as a browser would submit them.
+  Object.defineProperty(forms[0], "controls", { get() { return [...staticProfileControls, ...registryMatches("[data-profile-quota-extra]")]; } });
+  const deleteControls = { kind: control("kind", "profile.delete"), name: control("name"), reason: control("reason"), confirmName: control("confirmName") };
+  for (const [id, name] of [["#profile-delete-name", "name"], ["#profile-delete-reason", "reason"], ["#profile-delete-confirm", "confirmName"]]) {
+    const stub = get(id);
+    stub.name = deleteControls[name].name;
+    deleteControls[name] = stub;
+  }
+  forms[4].controls = [deleteControls.kind, deleteControls.name, deleteControls.reason, deleteControls.confirmName];
+  forms[2].controls = [control("kind", "notebook.stop"), control("namespace", "team-a"), control("name", "work-000"), control("reason", "Synthetic retry reason")];
+  forms[1].controls = [control("kind", "pvc.create"), control("namespace", "team-a"), control("name", "data")];
+  forms[3].controls = [control("kind", "pod.restart"), control("namespace", "team-a"), control("name", "work-0"), control("reason", "Synthetic retry reason")];
   const nodeCordonForm = get("#node-cordon-form");
   nodeCordonForm.elements = { kind: new Element("input"), name: new Element("input"), reason: new Element("input"), force: new Element("input") };
   const openers = ["profile", "storage", "notebook"].map(kind => { const button = new Element("button"); button.dataset.openDrawer = kind; return button; });
   const closers = [new Element("button")];
   const labels = ["pvc.create pvc.expand pv.nfs.create pv.reserve", "pvc.create pv.nfs.create pv.reserve", "pv.reserve", "pv.nfs.create", "pv.nfs.create"].map(value => { const label = new Element("label"); label.dataset.storage = value; return label; });
-  const handlers = {}, intervals = [], writes = [], calls = [];
+  const handlers = {}, intervals = [], writes = [], calls = [], bodies = [];
   const document = {
     hidden: !!options.hidden, activeElement: new Element("body"),
     body: { dataset: { writes: options.writes === false ? "false" : "true" }, classList: new Element().classList },
@@ -301,6 +419,8 @@ async function bootHarness(options = {}) {
       if (selector === ".drawer") return drawers;
       if (selector === ".drawer form" || selector === "[data-action-form]") return forms;
       if (selector === "[data-open-drawer]") return openers;
+      const opener = /^\[data-open-drawer="([^"]+)"\]$/.exec(selector);
+      if (opener) return openers.filter(item => item.dataset.openDrawer === opener[1]);
       if (selector === "[data-close-drawer]") return closers;
       if (selector === "[data-namespaces]") return [new Element("select"), new Element("select")];
       if (selector === "[data-gpu-quota]") return [];
@@ -313,6 +433,8 @@ async function bootHarness(options = {}) {
         return openDots;
       }
       if (selector === "[data-action-form] button[type=\"submit\"]") return [sharedSubmit];
+      if (selector === "[data-profile-quota]" || selector === "[data-profile-quota-extra]") return registryMatches(selector);
+      if (selector === "[data-resource-key]") return registryMatches(selector);
       return [];
     },
     createElement(tag) { return new Element(tag); },
@@ -320,41 +442,61 @@ async function bootHarness(options = {}) {
     addEventListener(name, handler) { (handlers[name] || (handlers[name] = [])).push(handler); }
   };
   const notebookWrites = options.notebookWrites !== false, podRestarts = options.podRestarts !== false, nodeCordon = options.nodeCordon !== false;
-  for (const name of ["csrf-token", "notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "node-cordon", "notification-scope"]) {
+  const profileDeletion = options.profileDeletion !== false;
+  for (const name of ["csrf-token", "notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "node-cordon", "profile-deletion", "notification-scope"]) {
     get(`meta[name="${name}"]`).content = name === "csrf-token" ? "test-csrf"
       : name === "notebook-writes" ? String(notebookWrites)
       : name === "pod-restarts" ? String(podRestarts)
       : name === "node-cordon" ? String(nodeCordon)
+      : name === "profile-deletion" ? String(profileDeletion)
       : name === "notification-scope" ? "random-test-scope" : "false";
   }
   get("#storage-kind").value = "pvc.create"; get("#notebook-kind").value = "notebook.start"; get("#profile-kind").value = "profile.create";
   get("#overview-table").hidden = true;
+  // The detailed Overview table is a hidden section of the page: its rows
+  // exist in the document but can never take the focus.
+  get('[data-table="overview"]').hidden = true;
   get("#storage-template").selectedOptions = []; get("#pv-selector").selectedOptions = []; get("#replace-mounts").checked = false;
   const mountHint = new Element("p"); mountHint.className = "hint"; get("#replace-mounts").append(mountHint);
-  const location = new URL("https://admin.example.invalid/");
+  const location = new URL("https://admin.example.invalid/" + (options.path || ""));
+  const windowHandlers = {};
   const window = {
     history: {
       pushState(_state, _title, url) { const next = new URL(url, "https://admin.example.invalid"); location.pathname = next.pathname; location.search = next.search; },
       replaceState(_state, _title, url) { const next = new URL(url, "https://admin.example.invalid"); location.pathname = next.pathname; location.search = next.search; }
     },
-    addEventListener() {}
+    addEventListener(name, handler) { (windowHandlers[name] || (windowHandlers[name] = [])).push(handler); }
   };
   const inventory = {
     // Deliberately skewed server time proves the browser uses local receipt age.
     observedAt: options.observedAt || "2000-01-01T00:00:00Z",
-    resources: [
-      { kind: "Profile", name: "team" },
-      { kind: "Namespace", name: "team", state: "Active", details: { createdAt: "2026-01-01T00:00:00Z" } },
-      { kind: "Namespace", name: "other", state: "Active", details: { createdAt: "2026-01-02T00:00:00Z" } },
-      { kind: "Notebook", name: "work", namespace: "team", state: "Running / Ready", details: { "image.main": "image" } },
-      { kind: "Pod", name: "work-0", namespace: "team", state: "Running", owner: "StatefulSet/work", details: { node: "node-1", ready: "true", containers: "1/1 ready", restarts: "2", "requested.cpu": "500m", "requested.memory": "1Gi", "limit.cpu": "2", "limit.memory": "4Gi" } },
-      { kind: "Pod", name: "legacy-0", namespace: "team", state: "Running", owner: "Deployment/legacy", details: { node: "node-1", ready: "true", containers: "1/1 ready", restarts: "0" } },
-      { kind: "PersistentVolumeClaim", name: "data", namespace: "team", state: "Bound", details: { requested: "10Gi", capacity: "10Gi", storageClass: "team-class" } },
-      { kind: "StorageClass", name: "team-class" },
-      { kind: "Event", name: "scheduled", namespace: "team", state: "Warning" },
-      { kind: "Node", name: "node-1", state: "Ready,SchedulingDisabled", details: { roles: "control-plane", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.1", externalIP: "", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd://2.0", unschedulable: "true", controlPlane: "true" } },
-      { kind: "Node", name: "node-2", state: "Ready", details: { roles: "control-plane", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.2", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd://2.0", unschedulable: "false", controlPlane: "true" } },
-      { kind: "Node", name: "node-3", state: "NotReady", details: { roles: "worker", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.3", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd://2.0", unschedulable: "false", controlPlane: "false" } }
+    resources: options.resources || [
+      { kind: "Profile", name: "team", uid: "uid-profile-team", state: "Active", owner: "alice@example.test",
+        details: { apiVersion: "kubeflow.org/v1", ownerKind: "User", configDigest: "sha256:teamdigest", "quota.requests.cpu": "4", "quota.requests.memory": "8Gi", "quota.example.com/gpu": "1" } },
+      { kind: "Profile", name: "guarded", uid: "uid-profile-guarded", state: "Protected", owner: "bob@example.test",
+        details: { apiVersion: "kubeflow.org/v1", ownerKind: "User", configDigest: "sha256:guardeddigest" } },
+      { kind: "Namespace", name: "team", uid: "uid-namespace-team", state: "Active", details: { createdAt: "2026-01-01T00:00:00Z" } },
+      { kind: "Namespace", name: "other", uid: "uid-namespace-other", state: "Active", details: { createdAt: "2026-01-02T00:00:00Z" } },
+      { kind: "Namespace", name: "reserved-ns", uid: "uid-namespace-reserved", state: "Active", details: { createdAt: "2026-01-03T00:00:00Z" } },
+      { kind: "Notebook", name: "work", namespace: "team", uid: "uid-notebook-work", state: "Running / Ready", details: { "image.main": "image" } },
+      // A StatefulSet with the same name as the Notebook: only the kind tells
+      // the two observed resources apart.
+      { kind: "StatefulSet", name: "work", namespace: "team", uid: "uid-statefulset-work", state: "1 ready", details: { "image.main": "image" } },
+      { kind: "Pod", name: "work-0", namespace: "team", uid: "uid-pod-team-work-0", state: "Running", owner: "StatefulSet/work", details: { node: "node-1", ready: "true", containers: "1/1 ready", restarts: "2", "requested.cpu": "500m", "requested.memory": "1Gi", "limit.cpu": "2", "limit.memory": "4Gi" } },
+      { kind: "Pod", name: "legacy-0", namespace: "team", uid: "uid-pod-team-legacy-0", state: "Running", owner: "Deployment/legacy", details: { node: "node-1", ready: "true", containers: "1/1 ready", restarts: "0" } },
+      // The same Pod name in another namespace is a different Pod.
+      { kind: "Pod", name: "work-0", namespace: "other", uid: "uid-pod-other-work-0", state: "Running", owner: "StatefulSet/work", details: { node: "node-2", ready: "true", containers: "1/1 ready", restarts: "0" } },
+      { kind: "PersistentVolumeClaim", name: "data", namespace: "team", uid: "uid-pvc-team-data", state: "Bound", details: { requested: "10Gi", capacity: "10Gi", storageClass: "team-class" } },
+      // A volume and a storage class that share the name of the claim.
+      { kind: "PersistentVolume", name: "data", uid: "uid-pv-data", state: "Bound", details: { requested: "10Gi", capacity: "10Gi", storageClass: "team-class", claim: "team/data" } },
+      { kind: "StorageClass", name: "data", uid: "uid-sc-data", details: { provisioner: "example.test/nfs" } },
+      { kind: "StorageClass", name: "team-class", uid: "uid-sc-team-class" },
+      { kind: "Event", name: "scheduled", namespace: "team", uid: "uid-event-scheduled", state: "Warning" },
+      // A resource quota that shares the name of the event.
+      { kind: "ResourceQuota", name: "scheduled", namespace: "team", uid: "uid-quota-scheduled", details: { "requests.cpu": "8" } },
+      { kind: "Node", name: "node-1", uid: "uid-node-1", state: "Ready,SchedulingDisabled", details: { roles: "control-plane", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.1", externalIP: "", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd://2.0", unschedulable: "true", controlPlane: "true" } },
+      { kind: "Node", name: "node-2", uid: "uid-node-2", state: "Ready", details: { roles: "control-plane", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.2", externalIP: "", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd://2.0", unschedulable: "false", controlPlane: "true" } },
+      { kind: "Node", name: "node-3", uid: "uid-node-3", state: "NotReady", details: { roles: "worker", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.3", externalIP: "", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd://2.0", unschedulable: "false", controlPlane: "false" } }
     ],
     warnings: ["Filesystem usage is not available."]
   };
@@ -376,6 +518,7 @@ async function bootHarness(options = {}) {
   });
   const fetch = async (url, init = {}) => {
     calls.push(url);
+    if (init.body) { try { bodies.push(JSON.parse(init.body)); } catch { bodies.push(init.body); } }
     if (url.endsWith("/inventory")) {
       if (options.deferInventory) await new Promise(resolve => { resolveInventory = resolve; });
       return response(inventory);
@@ -385,7 +528,7 @@ async function bootHarness(options = {}) {
         plansFailures--;
         return response({ error: { code: "validation_failed", message: "Synthetic plan rejected for test.", retryable: false } }, false, 422);
       }
-      return response({ id: "synthetic-plan", actor: "https://issuer.example|subject", actorDisplay: "Test Admin", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString(), prepared: { action: { kind: "notebook.stop" }, summary: "Synthetic preview", warnings: ["Synthetic interruption warning"], targetUID: "uid", resourceVersion: "1" } }, true, 201);
+      return response({ id: "synthetic-plan", actor: "https://issuer.example|subject", actorDisplay: "Test Admin", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString(), prepared: { action: { kind: "notebook.stop" }, summary: "Synthetic preview", warnings: ["Synthetic interruption warning"], targetUID: "uid", resourceVersion: "1", changes: [{ field: "requests.cpu", before: "4", after: "8" }] } }, true, 201);
     }
     if (url.endsWith("/operations") && init.method === "POST") return response({ id: "operation-test", state: "queued" });
     if (url.endsWith("/operations")) return response(operationsRows, true, 200, headers.operations);
@@ -412,8 +555,20 @@ async function bootHarness(options = {}) {
     return [node._text || "", ...(node.children || []).map(textOf)].join(" ");
   }
   return {
-    get, calls, writes, drawers, openers, closers, tabs, forms, error: sharedError, location, handlers, textOf, walk,
+    get, calls, writes, bodies, drawers, openers, closers, tabs, forms, error: sharedError, location, handlers, textOf, walk,
+    profileQuotaInputs, profileControls, windowHandlers,
     get activeElement() { return document.activeElement; },
+    // The observation is replaced the way a refreshed inventory replaces it.
+    setResources(resources) { inventory.resources = resources; return inventory; },
+    resources() { return inventory.resources; },
+    async popstate(path) {
+      if (path !== undefined) {
+        const next = new URL(path, "https://admin.example.invalid");
+        location.pathname = next.pathname; location.search = next.search;
+      }
+      for (const handler of windowHandlers.popstate || []) handler();
+      await settle();
+    },
     async click(page) {
       const link = sidebar.find(item => item.dataset.page === page);
       for (const handler of link.listeners.click || []) handler({ button: 0, defaultPrevented: false, preventDefault() {}, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false });
@@ -686,6 +841,683 @@ async function bootHarness(options = {}) {
   await noController.click("pods");
   const disabledRestarts = noController.walk(noController.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.textContent === "Restart");
   assert.ok(disabledRestarts.length > 0 && disabledRestarts.every(button => button.disabled), "pod restart stays disabled without the controller contract");
+
+  // ---- Clear filters --------------------------------------------------------
+  // Every table offers a clear control that is only actionable once a search
+  // text or a namespace scope is applied, and it resets search, scope and page.
+  const filterTest = await bootHarness({});
+  await filterTest.click("pods");
+  const filterPods = filterTest.get('[data-table="pods"]');
+  const filterSearch = filterPods.querySelector("[data-search]");
+  const filterClear = filterPods.querySelector("[data-clear-filters]");
+  assert.ok(filterSearch && filterClear, "every table exposes a search box and a clear control");
+  assert.equal(filterClear.disabled, true, "the clear control is inert while no filter is applied");
+  assert.equal(filterClear.attributes["aria-disabled"], "true", "the inert clear control is announced as disabled");
+  filterSearch.value = "work-0";
+  for (const handler of filterSearch.listeners.input || []) handler();
+  assert.equal(filterClear.disabled, false, "an applied search makes the clear control actionable");
+  assert.equal(filterClear.attributes["aria-disabled"], "false", "the actionable clear control is announced as enabled");
+  assert.ok(filterTest.textOf(filterPods).includes("work-0") && !filterTest.textOf(filterPods).includes("legacy-0"), "the search narrows the table");
+  filterClear.listeners.click[0]();
+  assert.equal(filterSearch.value, "", "clearing empties the search box");
+  assert.equal(filterClear.disabled, true, "the clear control is inert again once the filters are gone");
+  assert.ok(filterTest.textOf(filterPods).includes("legacy-0"), "clearing restores every loaded row");
+  assert.equal(filterTest.activeElement, filterSearch, "clearing returns keyboard focus to the search box");
+
+  // A namespace scope is a shared filter and clearing it updates the URL.
+  const scopeTest = await bootHarness({});
+  await scopeTest.click("storage");
+  const scopeStorage = scopeTest.get('[data-table="storage"]');
+  const scopeSelect = scopeStorage.querySelector("[data-namespace]");
+  scopeSelect.value = "team";
+  for (const handler of scopeSelect.listeners.change || []) handler();
+  await scopeTest.settle();
+  assert.equal(scopeTest.location.search, "?namespace=team", "the namespace scope is reflected in the URL");
+  const scopeClear = scopeStorage.querySelector("[data-clear-filters]");
+  assert.equal(scopeClear.disabled, false, "an applied namespace scope makes the clear control actionable");
+  scopeClear.listeners.click[0]();
+  assert.equal(scopeTest.location.search, "", "clearing removes the namespace scope from the URL");
+  assert.equal(scopeStorage.querySelector("[data-namespace]").value, "", "the namespace control returns to its default");
+  // Cluster-wide tables share the same namespace scope, so they offer the same
+  // reset even though they never showed a namespace control.
+  await scopeTest.click("nodes");
+  scopeTest.get("#overview-namespace").value = "team";
+  for (const handler of scopeTest.get("#overview-namespace").listeners.change || []) handler();
+  await scopeTest.settle();
+  assert.equal(scopeTest.location.search, "?namespace=team", "the shared namespace scope is applied to the console");
+  const scopeNodes = scopeTest.get('[data-table="nodes"]');
+  const scopeNodeClear = scopeNodes.querySelector("[data-clear-filters]");
+  assert.equal(scopeNodeClear.disabled, false, "a cluster-wide table offers the same clear control");
+  scopeNodeClear.listeners.click[0]();
+  assert.equal(scopeTest.location.search, "", "the cluster-wide clear control removes the shared namespace scope");
+
+  // ---- Observed resource details drawer -------------------------------------
+  // Inline disclosures are replaced by a control that opens the right-side
+  // modal drawer with the same inert, focus and Escape behaviour.
+  const detailsTest = await bootHarness({});
+  for (const table of ["pods", "nodes", "notebooks", "storage"]) {
+    await detailsTest.click(table);
+    const container = detailsTest.get(`[data-table="${table}"]`);
+    assert.equal(detailsTest.walk(container, node => node.tagName === "DETAILS").length, 0, `${table} no longer uses an inline details disclosure`);
+    assert.ok(detailsTest.walk(container, node => node.tagName === "BUTTON" && node.textContent === "Details").length > 0, `${table} exposes a details control`);
+  }
+  await detailsTest.click("pods");
+  const detailsPods = detailsTest.get('[data-table="pods"]');
+  const detailsButton = detailsTest.walk(detailsPods, node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Pod work-0")[0];
+  assert.ok(detailsButton, "each resource row exposes its own details control");
+  assert.equal(detailsButton.attributes["aria-label"], "Details for Pod work-0", "the details control names the observed resource");
+  // A pointer click does not always move the focus. The clicked control is the
+  // opener, not whatever happened to be focused before.
+  detailsButton.click();
+  const detailsDrawer = detailsTest.get("#resource-details-drawer");
+  assert.equal(detailsDrawer.hidden, false, "the resource details drawer opens on the right");
+  assert.equal(detailsTest.get("#drawer-scrim").hidden, false, "the drawer covers the background with a scrim");
+  assert.equal(detailsTest.get("main").inert, true, "the background is inert while the drawer is open");
+  assert.equal(detailsTest.get(".sidebar").inert, true, "the sidebar is inert while the drawer is open");
+  assert.equal(detailsTest.textOf(detailsTest.get("#resource-details-title")).trim(), "work-0", "the drawer title is the resource name");
+  const detailsText = detailsTest.textOf(detailsTest.get("#resource-details-body"));
+  assert.ok(detailsText.includes("node: node-1"), "the projected details keep their labels");
+  assert.ok(detailsText.includes("Pod") && detailsText.includes("team"), "the drawer names the observed kind and namespace");
+  assert.ok(detailsText.includes("StatefulSet/work"), "the observed owner is shown");
+  detailsTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  assert.equal(detailsDrawer.hidden, true, "Escape closes the resource details drawer");
+  assert.equal(detailsTest.get("main").inert, false, "the background is interactive again");
+  assert.equal(detailsTest.activeElement, detailsButton, "focus returns to the clicked control even when it never had the focus");
+
+  // A refresh replaces the row. The opener is gone, so the focus may only go
+  // back to the control of the very same observed resource.
+  detailsButton.click();
+  detailsTest.get("#refresh").listeners.click[0]();
+  await detailsTest.settle();
+  assert.equal(detailsDrawer.hidden, false, "a refresh never closes the details drawer");
+  const refreshedButton = detailsTest.walk(detailsTest.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Pod work-0")[0];
+  assert.ok(refreshedButton && refreshedButton !== detailsButton, "the refreshed row replaces the control");
+  detailsTest.get("#drawer-scrim").listeners.click[0]();
+  assert.equal(detailsDrawer.hidden, true, "the scrim closes the details drawer");
+  assert.equal(detailsTest.activeElement, refreshedButton, "a stale opener never focuses the first details control of the document");
+  assert.notEqual(detailsTest.activeElement, detailsTest.get("#page-title"), "the exact resource control takes the focus back");
+
+  // A replaced resource is reported: the drawer never shows an old body as if
+  // it were the latest observation.
+  const replacedTest = await bootHarness({});
+  await replacedTest.click("pods");
+  const replacedButton = replacedTest.walk(replacedTest.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Pod work-0")[0];
+  replacedButton.click();
+  replacedTest.setResources(replacedTest.resources().map(resource =>
+    resource.kind === "Pod" && resource.name === "work-0" && resource.namespace === "team" ? { ...resource, uid: "uid-pod-team-work-0-replaced" } : resource));
+  replacedTest.get("#refresh").listeners.click[0]();
+  await replacedTest.settle();
+  assert.equal(replacedTest.get("#resource-details-drawer").hidden, false, "a replaced resource keeps the drawer open");
+  assert.ok(replacedTest.textOf(replacedTest.get("#resource-details-body")).includes("replaced"), "a replaced resource is reported in the drawer");
+
+  // A resource that is gone is reported in the drawer instead of being shown
+  // as if it were the latest observation.
+  const goneTest = await bootHarness({});
+  await goneTest.click("pods");
+  goneTest.walk(goneTest.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Pod work-0")[0].click();
+  goneTest.setResources(goneTest.resources().filter(resource => !(resource.kind === "Pod" && resource.name === "work-0" && resource.namespace === "team")));
+  goneTest.get("#refresh").listeners.click[0]();
+  await goneTest.settle();
+  assert.equal(goneTest.get("#resource-details-drawer").hidden, false, "a refresh never closes the details drawer");
+  const goneText = goneTest.textOf(goneTest.get("#resource-details-body"));
+  assert.ok(goneText.includes("no longer present"), "a resource that is gone is reported in the drawer");
+  assert.equal(goneText.includes("latest inventory observation"), false, "a stale body never claims to be the latest observation");
+  assert.ok(goneTest.textOf(goneTest.get("#notifications")).includes("no longer present"), "the missing resource is also reported as a notice");
+
+  // Storage claim and volume names open the same observed-details drawer.
+  const storageTest = await bootHarness({});
+  await storageTest.click("storage");
+  const storageContainer = storageTest.get('[data-table="storage"]');
+  const claimName = storageTest.walk(storageContainer, node => node.tagName === "BUTTON" && node.textContent === "data" && node.attributes["aria-label"] === "Details for PersistentVolumeClaim data")[0];
+  assert.ok(claimName, "a storage claim name is a control");
+  claimName.click();
+  assert.equal(storageTest.get("#resource-details-drawer").hidden, false, "the storage name opens the resource details drawer");
+  assert.ok(storageTest.textOf(storageTest.get("#resource-details-body")).includes("storageClass: team-class"), "the storage details keep their labels");
+  storageTest.closers[0].listeners.click[0]();
+  const volumeName = storageTest.walk(storageContainer, node => node.tagName === "BUTTON" && node.textContent === "data" && node.attributes["aria-label"] === "Details for PersistentVolume data")[0];
+  assert.ok(volumeName, "a storage volume name is a control");
+  volumeName.click();
+  assert.equal(storageTest.get("#resource-details-drawer").hidden, false, "the volume name opens the resource details drawer");
+  assert.ok(storageTest.textOf(storageTest.get("#resource-details-body")).includes("claim: team/data"), "the volume details keep their labels");
+
+  // ---- Namespace summary resource drilldown ---------------------------------
+  // Individual resources lead to the scoped page filtered to that resource,
+  // while the group counts and scoped views keep working. The identity is the
+  // canonical triple kind, namespace and name.
+  const scopedTest = await bootHarness({});
+  await scopedTest.click("namespaces");
+  const scopedNamespace = scopedTest.walk(scopedTest.get('[data-table="namespaces"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0];
+  scopedNamespace.click();
+  const scopedBody = scopedTest.get("#namespace-summary-body");
+  assert.ok(scopedTest.textOf(scopedBody).includes("Scoped views"), "the scoped group links continue to work");
+  const linkTo = href => scopedTest.walk(scopedBody, node => node.tagName === "A" && node.href === href)[0];
+  const scopedNotebook = linkTo("/notebooks?namespace=team&kind=Notebook&resource=work");
+  assert.ok(scopedNotebook, "the namespace summary links an individual notebook");
+  assert.ok(linkTo("/notebooks?namespace=team&kind=StatefulSet&resource=work"), "the namespace summary links an individual StatefulSet");
+  assert.ok(linkTo("/pods?namespace=team&kind=Pod&resource=work-0"), "the namespace summary links an individual pod");
+  assert.ok(linkTo("/storage?namespace=team&kind=PersistentVolumeClaim&resource=data"), "the namespace summary links an individual claim");
+  assert.ok(linkTo("/?namespace=team&kind=Event&resource=scheduled"), "the namespace summary links an individual event");
+  assert.ok(linkTo("/?namespace=team&kind=ResourceQuota&resource=scheduled"), "the namespace summary links an individual quota");
+  for (const handler of scopedTest.handlers.click || []) handler({ target: scopedNotebook, defaultPrevented: false, button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, preventDefault() {} });
+  await scopedTest.settle();
+  assert.equal(scopedTest.location.pathname, "/notebooks", "the resource link opens the scoped page");
+  assert.ok(scopedTest.location.search.includes("namespace=team") && scopedTest.location.search.includes("kind=Notebook") && scopedTest.location.search.includes("resource=work"), "the URL keeps the namespace scope and the resource identity");
+  const scopedNotebooks = scopedTest.get('[data-table="notebooks"]');
+  assert.equal(scopedNotebooks.querySelector("[data-search]").value, "work", "the scoped page shows the resource focus in the visible filter");
+  assert.equal(scopedTest.walk(scopedNotebooks, node => node.tagName === "TR").length, 2, "only the selected Notebook remains, not the StatefulSet with the same name");
+  const scopedClear = scopedNotebooks.querySelector("[data-clear-filters]");
+  assert.equal(scopedClear.disabled, false, "the scoped page offers an actionable clear control");
+  scopedClear.listeners.click[0]();
+  assert.equal(scopedNotebooks.querySelector("[data-search]").value, "", "clearing removes the resource focus from the visible filter");
+  assert.equal(scopedTest.location.search, "", "clearing removes the namespace scope and the resource identity from the URL");
+
+  // A claim is never confused with the volume or the storage class that share
+  // its name.
+  const claimScopeTest = await bootHarness({});
+  await claimScopeTest.click("namespaces");
+  claimScopeTest.walk(claimScopeTest.get('[data-table="namespaces"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0].click();
+  const claimLink = claimScopeTest.walk(claimScopeTest.get("#namespace-summary-body"), node => node.tagName === "A" && node.href === "/storage?namespace=team&kind=PersistentVolumeClaim&resource=data")[0];
+  for (const handler of claimScopeTest.handlers.click || []) handler({ target: claimLink, defaultPrevented: false, button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, preventDefault() {} });
+  await claimScopeTest.settle();
+  const claimTable = claimScopeTest.get('[data-table="storage"]');
+  assert.equal(claimScopeTest.walk(claimTable, node => node.tagName === "TR").length, 2, "only the claim of the selected kind remains");
+  assert.ok(claimScopeTest.textOf(claimTable).includes("PersistentVolumeClaim"), "the selected kind is the claim");
+  assert.equal(claimScopeTest.textOf(claimTable).includes("PersistentVolume ·"), false, "the volume with the same name never leaks into the claim");
+
+  // The same Pod name in another namespace is a different Pod.
+  const podScopeTest = await bootHarness({ path: "pods?namespace=team&kind=Pod&resource=work-0" });
+  await podScopeTest.settle();
+  const podTable = podScopeTest.get('[data-table="pods"]');
+  assert.equal(podScopeTest.walk(podTable, node => node.tagName === "TR").length, 2, "only the Pod of the selected namespace remains");
+  const otherPodScope = await bootHarness({ path: "pods?namespace=other&kind=Pod&resource=work-0" });
+  await otherPodScope.settle();
+  const otherPodTable = otherPodScope.get('[data-table="pods"]');
+  assert.equal(otherPodScope.walk(otherPodTable, node => node.tagName === "TR").length, 2, "the Pod of the other namespace is a different resource");
+  assert.ok(otherPodScope.textOf(otherPodTable).includes("node-2"), "the other namespace keeps its own observation");
+
+  // A deep link focuses the requested resource when the page boots.
+  const deepLinkTest = await bootHarness({ path: "pods?namespace=team&kind=Pod&resource=work-0" });
+  await deepLinkTest.settle();
+  const deepPods = deepLinkTest.get('[data-table="pods"]');
+  assert.equal(deepPods.querySelector("[data-search]").value, "work-0", "a deep link focuses the requested resource in the visible filter");
+  assert.equal(deepLinkTest.walk(deepPods, node => node.tagName === "TR").length, 2, "a deep link shows only the requested resource");
+
+  // A cluster-wide page identifies its resource by its own kind.
+  const nodeDeepLinkTest = await bootHarness({ path: "nodes?resource=node-1" });
+  await nodeDeepLinkTest.settle();
+  const deepNodes = nodeDeepLinkTest.get('[data-table="nodes"]');
+  assert.equal(deepNodes.querySelector("[data-search]").value, "node-1", "a node deep link mirrors the name in the visible filter");
+  assert.equal(nodeDeepLinkTest.walk(deepNodes, node => node.tagName === "TR").length, 2, "a node deep link shows exactly the requested node");
+  assert.ok(nodeDeepLinkTest.textOf(deepNodes).includes("node-1") && !nodeDeepLinkTest.textOf(deepNodes).includes("node-2"), "only the requested node is shown");
+
+  // A resource URL on the Overview page expands the detailed table, however
+  // the page was reached.
+  const overviewDeepTest = await bootHarness({ path: "/?namespace=team&kind=Event&resource=scheduled" });
+  await overviewDeepTest.settle();
+  assert.equal(overviewDeepTest.get("#overview-table").hidden, false, "a resource URL expands the detailed overview table");
+  assert.equal(overviewDeepTest.walk(overviewDeepTest.get('[data-table="overview"]'), node => node.tagName === "TR").length, 2, "the overview table is filtered to the selected resource");
+  const overviewQuotaTest = await bootHarness({ path: "/?namespace=team&kind=ResourceQuota&resource=scheduled" });
+  await overviewQuotaTest.settle();
+  assert.equal(overviewQuotaTest.walk(overviewQuotaTest.get('[data-table="overview"]'), node => node.tagName === "TR").length, 2, "the quota with the same name is a different resource");
+  assert.ok(overviewQuotaTest.textOf(overviewQuotaTest.get('[data-table="overview"]')).includes("ResourceQuota"), "the selected kind is the quota");
+
+  // A quota or event link from the namespace summary opens the scoped Overview
+  // table filtered to that resource.
+  const overviewScopeTest = await bootHarness({});
+  await overviewScopeTest.click("namespaces");
+  overviewScopeTest.walk(overviewScopeTest.get('[data-table="namespaces"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0].click();
+  const eventLink = overviewScopeTest.walk(overviewScopeTest.get("#namespace-summary-body"), node => node.tagName === "A" && node.href === "/?namespace=team&kind=Event&resource=scheduled")[0];
+  assert.ok(eventLink, "the namespace summary links an individual event");
+  for (const handler of overviewScopeTest.handlers.click || []) handler({ target: eventLink, defaultPrevented: false, button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, preventDefault() {} });
+  await overviewScopeTest.settle();
+  assert.equal(overviewScopeTest.location.pathname, "/", "the event link opens the Overview page");
+  assert.equal(overviewScopeTest.get("#overview-table").hidden, false, "the detailed overview table is expanded for a scoped event link");
+  assert.equal(overviewScopeTest.walk(overviewScopeTest.get('[data-table="overview"]'), node => node.tagName === "TR").length, 2, "the overview table is filtered to the selected resource");
+
+  // ---- Focus and URL coherence ---------------------------------------------
+  // A focus never outlives the URL that named it, and a typed search is never
+  // overwritten by a focus.
+  const focusTest = await bootHarness({ path: "pods?namespace=team&kind=Pod&resource=work-0" });
+  await focusTest.settle();
+  const focusSearch = focusTest.get('[data-table="pods"]').querySelector("[data-search]");
+  assert.equal(focusSearch.value, "work-0", "the deep link is mirrored in the visible filter");
+  await focusTest.popstate("/pods?namespace=team");
+  assert.equal(focusSearch.value, "", "the mirrored focus search is cleared with the focus");
+  assert.ok(focusTest.textOf(focusTest.get('[data-table="pods"]')).includes("legacy-0"), "the deep link no longer narrows the table");
+  assert.equal(focusTest.get('[data-table="pods"]').querySelector("[data-clear-filters]").disabled, false, "the namespace scope keeps the clear control actionable");
+
+  // A typed search is not a focus mirror and survives a navigation.
+  const typedTest = await bootHarness({ path: "pods?namespace=team&kind=Pod&resource=work-0" });
+  await typedTest.settle();
+  const typedSearch = typedTest.get('[data-table="pods"]').querySelector("[data-search]");
+  typedSearch.value = "legacy";
+  for (const handler of typedSearch.listeners.input || []) handler();
+  assert.equal(typedSearch.value, "legacy");
+  await typedTest.popstate("/pods?namespace=team");
+  assert.equal(typedSearch.value, "legacy", "an unrelated typed search survives a navigation");
+  assert.ok(typedTest.textOf(typedTest.get('[data-table="pods"]')).includes("legacy-0"), "the typed search still filters the rows");
+
+  // The sidebar drops the resource identity, and the focus goes with it.
+  const sidebarTest = await bootHarness({ path: "pods?namespace=team&kind=Pod&resource=work-0" });
+  await sidebarTest.settle();
+  await sidebarTest.click("pods");
+  assert.equal(sidebarTest.location.search, "?namespace=team", "the sidebar link carries no resource identity");
+  assert.equal(sidebarTest.get('[data-table="pods"]').querySelector("[data-search]").value, "", "the focus does not survive a sidebar navigation");
+  assert.ok(sidebarTest.textOf(sidebarTest.get('[data-table="pods"]')).includes("legacy-0"), "every row of the scope is shown again");
+
+  // A navigation to another page and back restores the deep link.
+  const backTest = await bootHarness({ path: "pods?namespace=team&kind=Pod&resource=work-0" });
+  await backTest.settle();
+  await backTest.click("storage");
+  await backTest.popstate("/pods?namespace=team&kind=Pod&resource=work-0");
+  assert.equal(backTest.get('[data-table="pods"]').querySelector("[data-search]").value, "work-0", "the deep link is applied again after a navigation back");
+  assert.equal(backTest.walk(backTest.get('[data-table="pods"]'), node => node.tagName === "TR").length, 2, "only the requested resource is shown again");
+  assert.equal(backTest.activeElement, backTest.get("#page-title"), "a popstate navigation moves the focus to the page heading");
+
+  // A namespace change drops the resource focus: the new scope shows its own
+  // rows instead of the resource of the old scope.
+  const rescopeTest = await bootHarness({ path: "pods?namespace=team&kind=Pod&resource=work-0" });
+  await rescopeTest.settle();
+  const rescopeSelect = rescopeTest.get('[data-table="pods"]').querySelector("[data-namespace]");
+  rescopeSelect.value = "other";
+  for (const handler of rescopeSelect.listeners.change || []) handler();
+  await rescopeTest.settle();
+  assert.equal(rescopeTest.location.search, "?namespace=other", "the namespace scope is reflected in the URL");
+  assert.equal(rescopeTest.get('[data-table="pods"]').querySelector("[data-search]").value, "", "the focus of the old scope is dropped");
+  assert.ok(rescopeTest.textOf(rescopeTest.get('[data-table="pods"]')).includes("node-2"), "the new scope shows its own rows");
+
+  // A cached focus of another table never outlives the scope it belongs to.
+  const cachedTest = await bootHarness({ path: "pods?namespace=team&kind=Pod&resource=work-0" });
+  await cachedTest.settle();
+  await cachedTest.click("storage");
+  assert.equal(cachedTest.get('[data-table="pods"]').querySelector("[data-search]").value, "work-0", "the cached focus of the other table is still there");
+  const cachedSelect = cachedTest.get('[data-table="storage"]').querySelector("[data-namespace]");
+  cachedSelect.value = "other";
+  for (const handler of cachedSelect.listeners.change || []) handler();
+  await cachedTest.settle();
+  await cachedTest.click("pods");
+  assert.equal(cachedTest.get('[data-table="pods"]').querySelector("[data-search]").value, "", "a namespace change drops the cached focus of every table");
+  assert.equal(cachedTest.walk(cachedTest.get('[data-table="pods"]'), node => node.tagName === "TR").length, 2, "every row of the new scope is shown again");
+  assert.ok(cachedTest.textOf(cachedTest.get('[data-table="pods"]')).includes("node-2"), "the new scope shows its own observation");
+
+  // Clearing removes the identity from the URL and keeps every other
+  // parameter.
+  const preserveTest = await bootHarness({ path: "pods?namespace=team&kind=Pod&resource=work-0&view=compact" });
+  await preserveTest.settle();
+  preserveTest.get('[data-table="pods"]').querySelector("[data-clear-filters]").listeners.click[0]();
+  assert.ok(preserveTest.location.search.includes("view=compact"), "an unrelated query parameter is preserved");
+  assert.equal(preserveTest.location.search.includes("resource="), false, "the resource identity is removed from the URL");
+  assert.equal(preserveTest.location.search.includes("kind="), false, "the kind is removed from the URL");
+  assert.equal(preserveTest.get('[data-table="pods"]').querySelector("[data-search]").value, "", "the mirrored search is cleared with the identity");
+  // The same reset without a namespace scope drops the identity as well.
+  const unscopedTest = await bootHarness({ path: "pods?kind=Pod&resource=work-0&view=compact" });
+  await unscopedTest.settle();
+  unscopedTest.get('[data-table="pods"]').querySelector("[data-clear-filters]").listeners.click[0]();
+  assert.ok(unscopedTest.location.search.includes("view=compact"), "an unrelated query parameter is preserved without a namespace scope");
+  assert.equal(unscopedTest.location.search.includes("resource="), false, "the resource identity is removed from the URL without a namespace scope");
+  assert.equal(unscopedTest.location.search.includes("kind="), false, "the kind is removed from the URL without a namespace scope");
+
+  // A legacy link without a kind keeps working as a name filter.
+  const legacyTest = await bootHarness({ path: "pods?namespace=team&resource=work-0" });
+  await legacyTest.settle();
+  assert.equal(legacyTest.get('[data-table="pods"]').querySelector("[data-search]").value, "work-0", "a legacy link still mirrors the name");
+  assert.equal(legacyTest.walk(legacyTest.get('[data-table="pods"]'), node => node.tagName === "TR").length, 2, "a legacy link filters by the inferred kind of the page");
+
+  // ---- Focus eligibility ----------------------------------------------------
+  // A closed drawer keeps its DOM. A control that is connected but hidden may
+  // never take the focus back.
+  const hiddenOpenerTest = await bootHarness({});
+  await hiddenOpenerTest.click("pods");
+  const hiddenOpener = hiddenOpenerTest.walk(hiddenOpenerTest.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Pod work-0")[0];
+  hiddenOpener.click();
+  hiddenOpener.hidden = true;
+  hiddenOpenerTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  assert.equal(hiddenOpenerTest.get("#resource-details-drawer").hidden, true, "Escape closes the details drawer");
+  assert.notEqual(hiddenOpenerTest.activeElement, hiddenOpener, "a hidden opener never takes the focus back");
+  assert.equal(hiddenOpenerTest.activeElement, hiddenOpenerTest.get("#page-title"), "a hidden opener falls back to the page heading");
+
+  // A control hidden by its ancestor is not focusable either.
+  const hiddenAncestorTest = await bootHarness({});
+  await hiddenAncestorTest.click("pods");
+  const ancestorOpener = hiddenAncestorTest.walk(hiddenAncestorTest.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Pod work-0")[0];
+  ancestorOpener.click();
+  hiddenAncestorTest.get('[data-table="pods"]').hidden = true;
+  hiddenAncestorTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  assert.notEqual(hiddenAncestorTest.activeElement, ancestorOpener, "a control of a hidden table never takes the focus back");
+  assert.equal(hiddenAncestorTest.activeElement, hiddenAncestorTest.get("#page-title"), "a control of a hidden table falls back to the page heading");
+
+  // A control that is not rendered and a disabled control may never take the
+  // focus back either.
+  const ineligibleTest = await bootHarness({});
+  await ineligibleTest.click("pods");
+  const ineligible = ineligibleTest.walk(ineligibleTest.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Pod work-0")[0];
+  ineligible.click();
+  ineligible.getClientRects = () => [];
+  ineligibleTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  assert.notEqual(ineligibleTest.activeElement, ineligible, "a control that is not rendered never takes the focus back");
+  assert.equal(ineligibleTest.activeElement, ineligibleTest.get("#page-title"), "a control that is not rendered falls back to the page heading");
+  const disabledTest = await bootHarness({});
+  await disabledTest.click("pods");
+  const disabled = disabledTest.walk(disabledTest.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Pod work-0")[0];
+  disabled.click();
+  disabled.disabled = true;
+  disabledTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  assert.notEqual(disabledTest.activeElement, disabled, "a disabled control never takes the focus back");
+  assert.equal(disabledTest.activeElement, disabledTest.get("#page-title"), "a disabled control falls back to the page heading");
+
+  // The hidden Overview table keeps a copy of every resource. The visible
+  // control of the same resource takes the focus back, never the hidden one.
+  const duplicateKeyTest = await bootHarness({});
+  await duplicateKeyTest.click("overview");
+  duplicateKeyTest.get("#toggle-overview-table").listeners.click[0]();
+  await duplicateKeyTest.click("storage");
+  const storageKey = "PersistentVolumeClaim|team|data";
+  const storageControl = duplicateKeyTest.walk(duplicateKeyTest.get('[data-table="storage"]'), node => node.tagName === "BUTTON" && node.dataset.resourceKey === storageKey && node.textContent === "Details")[0];
+  const overviewControl = duplicateKeyTest.walk(duplicateKeyTest.get('[data-table="overview"]'), node => node.tagName === "BUTTON" && node.dataset.resourceKey === storageKey)[0];
+  assert.ok(storageControl && overviewControl, "the same resource is rendered in the Overview table and in the Storage table");
+  storageControl.click();
+  storageControl.hidden = true;
+  duplicateKeyTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  assert.notEqual(duplicateKeyTest.activeElement, storageControl, "the hidden control never takes the focus back");
+  assert.notEqual(duplicateKeyTest.activeElement, overviewControl, "the hidden Overview control never takes the focus back");
+  const visibleKeyControl = duplicateKeyTest.walk(duplicateKeyTest.get('[data-table="storage"]'), node => node.tagName === "BUTTON" && node.dataset.resourceKey === storageKey && node.textContent === "data")[0];
+  assert.equal(duplicateKeyTest.activeElement, visibleKeyControl, "the visible control of the same resource takes the focus back");
+
+  // The Profile summary hands over to the editor. The editor is closed again
+  // and the focus never stays on a control of the closed summary.
+  const profileFocusTest = await bootHarness({});
+  await profileFocusTest.click("profiles");
+  profileFocusTest.walk(profileFocusTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0].click();
+  const summaryEditButton = profileFocusTest.walk(profileFocusTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit profile")[0];
+  summaryEditButton.focus();
+  summaryEditButton.click();
+  assert.equal(profileFocusTest.get("#profile-drawer").hidden, false, "the editor drawer opens");
+  assert.equal(profileFocusTest.get("#profile-summary-drawer").hidden, true, "the summary drawer is closed");
+  profileFocusTest.closers[0].listeners.click[0]();
+  assert.equal(profileFocusTest.get("#profile-drawer").hidden, true, "the editor drawer closes");
+  assert.notEqual(profileFocusTest.activeElement, summaryEditButton, "the focus never stays on a control of the closed summary");
+  assert.notEqual(profileFocusTest.activeElement, profileFocusTest.get("#page-title"), "the visible management control takes the focus back");
+  assert.equal(profileFocusTest.activeElement, profileFocusTest.openers[0], "the visible management control of the page takes the focus back");
+
+  // ---- Profile management ---------------------------------------------------
+  // The create form owns its name input. A dotted name is refused with a
+  // suggestion that is only applied when the administrator asks for it.
+  const profileTest = await bootHarness({});
+  profileTest.openers[0].listeners.click[0]();
+  assert.equal(profileTest.get("#profile-drawer").hidden, false, "the profile drawer opens");
+  const createName = profileTest.get("#profile-create-name");
+  createName.value = "my.team";
+  for (const handler of createName.listeners.input || []) handler();
+  assert.equal(profileTest.get("#profile-name-suggestion").hidden, false, "a dotted name offers a suggestion");
+  assert.ok(profileTest.get("#profile-name-suggestion-text").textContent.includes("my-team"), "the exact replacement is named");
+  assert.equal(createName.value, "my.team", "the typed name is never rewritten");
+  assert.ok(profileTest.get("#profile-name-message").textContent.includes("dots or underscores"), "the reason is concise and accessible");
+  assert.ok(String(createName.attributes["aria-describedby"]).includes("profile-name-suggestion-text"), "the suggestion is linked to the input");
+  profileTest.get("#profile-use-suggestion").listeners.click[0]();
+  assert.equal(createName.value, "my-team", "the suggestion is applied only on an explicit request");
+
+  // An existing namespace reserves the name: the request never reaches the API.
+  createName.value = "reserved-ns";
+  for (const handler of createName.listeners.input || []) handler();
+  profileTest.get("#profile-create-owner").value = "alice@example.test";
+  const reservedBefore = profileTest.bodies.length;
+  await profileTest.submitForm(0);
+  assert.equal(profileTest.bodies.length, reservedBefore, "a reserved name never reaches the API");
+  assert.equal(profileTest.error.hidden, false, "the reserved name is refused in the drawer");
+  assert.ok(profileTest.error.textContent.includes("already exists"), "the refusal names the conflict");
+
+  // A valid create carries the typed name, the typed owner and no precondition.
+  createName.value = "new-team";
+  await profileTest.submitForm(0);
+  const createBody = profileTest.bodies[profileTest.bodies.length - 1];
+  assert.equal(createBody.kind, "profile.create");
+  assert.equal(createBody.name, "new-team");
+  assert.equal(createBody.owner, "alice@example.test");
+  assert.equal(createBody.baseConfigDigest, undefined, "a create carries no configuration precondition");
+
+  // The Profile summary shows the observed configuration and the management
+  // actions after the scoped views.
+  const summaryTest = await bootHarness({});
+  await summaryTest.click("profiles");
+  const profileRow = summaryTest.walk(summaryTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0];
+  assert.ok(profileRow, "a Profile name opens its summary");
+  profileRow.listeners.click[0]();
+  const summaryText = summaryTest.textOf(summaryTest.get("#profile-summary-body"));
+  assert.ok(summaryText.includes("Scoped views"), "the scoped views stay above the configuration");
+  assert.ok(summaryText.includes("kubeflow.org/v1"), "the summary shows the observed API version");
+  assert.ok(summaryText.includes("alice@example.test"), "the summary shows the observed owner");
+  assert.ok(summaryText.includes("requests.cpu") && summaryText.includes("4"), "the summary shows the observed quota values");
+  assert.ok(summaryText.includes("example.com/gpu"), "the summary shows every projected quota key");
+  const copyButton = summaryTest.walk(summaryTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Copy")[0];
+  assert.ok(copyButton, "the owner email can be copied");
+
+  // Edit opens the management drawer in update mode, preselected and prefilled.
+  const editButton = summaryTest.walk(summaryTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit profile")[0];
+  assert.ok(editButton, "the summary offers the edit action");
+  editButton.listeners.click[0]();
+  assert.equal(summaryTest.get("#profile-drawer").hidden, false, "the edit action opens the management drawer");
+  assert.equal(summaryTest.get("#profile-kind").value, "profile.update", "the drawer opens in update mode");
+  assert.equal(summaryTest.get("#profile-update-name").value, "team", "the selected Profile is preselected");
+  assert.equal(summaryTest.get("#profile-update-owner").value, "alice@example.test", "the exact observed owner is prefilled");
+  assert.equal(summaryTest.get("#profile-update-owner").readOnly, true, "the owner is read-only");
+  assert.equal(summaryTest.get("#profile-update-owner").disabled, false, "a read-only owner is still submitted");
+  assert.equal(summaryTest.get("#profile-update-digest").value, "sha256:teamdigest", "the configuration precondition is carried");
+  assert.equal(summaryTest.get("#profile-create-name").disabled, true, "the create name is disabled in update mode");
+  assert.equal(summaryTest.get("#profile-create-owner").disabled, true, "the create owner is disabled in update mode");
+  const cpuInput = summaryTest.profileQuotaInputs.find(input => input.dataset.profileQuota === "requests.cpu");
+  assert.equal(cpuInput.value, "4", "the observed quota is prefilled");
+  assert.equal(cpuInput.required, true, "an existing managed key may not be omitted");
+  assert.ok(summaryTest.textOf(summaryTest.get("#profile-extra-quota-fields")).includes("example.com/gpu"), "an unmanaged observed key is shown read-only");
+
+  // The update payload carries the unchanged owner, the precondition and every
+  // managed quota key.
+  cpuInput.value = "8";
+  await summaryTest.submitForm(0);
+  const updateBody = summaryTest.bodies[summaryTest.bodies.length - 1];
+  assert.equal(updateBody.kind, "profile.update");
+  assert.equal(updateBody.name, "team");
+  assert.equal(updateBody.owner, "alice@example.test", "the exact observed owner is submitted unchanged");
+  assert.equal(updateBody.baseConfigDigest, "sha256:teamdigest", "the precondition travels with the request");
+  assert.equal(updateBody.quota["requests.cpu"], "8", "the changed quota is submitted");
+  assert.equal(updateBody.quota["requests.memory"], "8Gi", "an unchanged managed key is still submitted");
+  assert.equal(updateBody.quota["example.com/gpu"], "1", "an unmanaged observed key round-trips unchanged");
+  assert.equal(updateBody.confirmName, undefined, "an update never carries a confirmation");
+  assert.equal(updateBody.storageClass, undefined, "an update never carries an unrelated field");
+
+  // A tampered read-only field is refused before the request: the server
+  // revalidates the same values.
+  summaryTest.get("#profile-update-owner").value = "someone-else@example.test";
+  const tamperedBefore = summaryTest.bodies.length;
+  await summaryTest.submitForm(0);
+  assert.equal(summaryTest.bodies.length, tamperedBefore, "a tampered form never reaches the API");
+  assert.ok(summaryTest.error.textContent.includes("no longer matches"), "the tampered binding is refused in the drawer");
+
+  // An update that would change nothing is refused as well.
+  summaryTest.get("#profile-update-owner").value = "alice@example.test";
+  cpuInput.value = "4";
+  const noopBefore = summaryTest.bodies.length;
+  await summaryTest.submitForm(0);
+  assert.equal(summaryTest.bodies.length, noopBefore, "a no-op update never reaches the API");
+  assert.ok(summaryTest.error.textContent.includes("Nothing would change"), "a no-op update is refused in the drawer");
+
+  // A managed key that is already set may not be omitted.
+  cpuInput.value = "";
+  const removalBefore = summaryTest.bodies.length;
+  await summaryTest.submitForm(0);
+  assert.equal(summaryTest.bodies.length, removalBefore, "a removed quota key never reaches the API");
+  assert.ok(summaryTest.error.textContent.includes("removing a quota key is unsupported"), "the removal of an existing key is refused in the drawer");
+  cpuInput.value = "4";
+
+  // The deletion drawer is gated by the server opt-in and the protection of
+  // the observed Profile.
+  const deleteTest = await bootHarness({});
+  await deleteTest.click("profiles");
+  const deleteRow = deleteTest.walk(deleteTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0];
+  deleteRow.listeners.click[0]();
+  const deleteButton = deleteTest.walk(deleteTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete profile")[0];
+  assert.ok(deleteButton, "the deletion action is offered for an unprotected profile");
+  deleteButton.listeners.click[0]();
+  assert.equal(deleteTest.get("#profile-delete-drawer").hidden, false, "the deletion drawer opens");
+  assert.equal(deleteTest.get("#profile-delete-name").value, "team", "the target is bound to the selected Profile");
+  assert.ok(deleteTest.get("#profile-delete-target").textContent.includes("also deletes the namespace team"), "the drawer names the namespace that goes with the Profile");
+  assert.ok(html.includes("which can be irreversible") && html.includes("Retain reclaim policy is not protection"), "the deletion drawer warns about the data");
+  deleteTest.get("#profile-delete-reason").value = "decommission the pilot workspace";
+  deleteTest.get("#profile-delete-confirm").value = " team ";
+  const confirmBefore = deleteTest.bodies.length;
+  await deleteTest.submitForm(4);
+  assert.equal(deleteTest.bodies.length, confirmBefore, "a mismatched confirmation never reaches the API");
+  assert.ok(deleteTest.error.textContent.includes("does not match"), "the exact confirmation is refused in the drawer");
+  deleteTest.get("#profile-delete-confirm").value = "team";
+  await deleteTest.submitForm(4);
+  const deleteBody = deleteTest.bodies[deleteTest.bodies.length - 1];
+  assert.equal(deleteBody.kind, "profile.delete");
+  assert.equal(deleteBody.name, "team");
+  assert.equal(deleteBody.reason, "decommission the pilot workspace");
+  assert.equal(deleteBody.confirmName, "team");
+  assert.equal(deleteBody.owner, undefined, "a deletion never carries an owner");
+  assert.equal(deleteBody.baseConfigDigest, undefined, "a deletion never carries a precondition");
+
+  const guardedTest = await bootHarness({});
+  await guardedTest.click("profiles");
+  const guardedRow = guardedTest.walk(guardedTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "guarded")[0];
+  guardedRow.listeners.click[0]();
+  assert.equal(guardedTest.walk(guardedTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete profile").length, 0, "a protected Profile is never deletable");
+  const noDeletionTest = await bootHarness({ profileDeletion: false });
+  await noDeletionTest.click("profiles");
+  const noDeletionRow = noDeletionTest.walk(noDeletionTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0];
+  noDeletionRow.listeners.click[0]();
+  assert.equal(noDeletionTest.walk(noDeletionTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete profile").length, 0, "deletion is not offered without the server opt-in");
+
+  // An inventory refresh never edits the administrator's form values, and a
+  // new selection never inherits the previous one.
+  const refreshTest = await bootHarness({});
+  refreshTest.openers[0].listeners.click[0]();
+  refreshTest.get("#profile-create-name").value = "typed-name";
+  refreshTest.get("#profile-create-owner").value = "typed@example.test";
+  refreshTest.get("#refresh").listeners.click[0]();
+  await refreshTest.settle();
+  assert.equal(refreshTest.get("#profile-create-name").value, "typed-name", "an inventory refresh never edits the typed name");
+  assert.equal(refreshTest.get("#profile-create-owner").value, "typed@example.test", "an inventory refresh never edits the typed owner");
+  refreshTest.get("#profile-kind").value = "profile.update";
+  for (const handler of refreshTest.get("#profile-kind").listeners.change || []) handler();
+  const updateSelect = refreshTest.get("#profile-update-name");
+  updateSelect.value = "team";
+  for (const handler of updateSelect.listeners.change || []) handler();
+  assert.equal(refreshTest.get("#profile-update-owner").value, "alice@example.test", "the typed create owner never bleeds into the update");
+  const refreshCpu = refreshTest.profileQuotaInputs.find(input => input.dataset.profileQuota === "requests.cpu");
+  assert.equal(refreshCpu.value, "4", "the observed quota is loaded");
+  updateSelect.value = "guarded";
+  for (const handler of updateSelect.listeners.change || []) handler();
+  assert.equal(refreshTest.get("#profile-update-owner").value, "bob@example.test", "a new selection replaces the previous owner");
+  assert.equal(refreshTest.get("#profile-update-digest").value, "sha256:guardeddigest", "a new selection replaces the previous precondition");
+  assert.equal(refreshCpu.value, "", "a new selection clears the previous quota");
+
+  // A Profile that changed under the open form is refused before the request:
+  // the typed values and the precondition are kept, and the administrator is
+  // asked to reselect instead of retrying a request that can only be refused.
+  const staleProfileTest = await bootHarness({});
+  await staleProfileTest.click("profiles");
+  staleProfileTest.walk(staleProfileTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0].click();
+  staleProfileTest.walk(staleProfileTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit profile")[0].click();
+  const staleCpu = staleProfileTest.profileQuotaInputs.find(input => input.dataset.profileQuota === "requests.cpu");
+  staleCpu.value = "9";
+  const staleDigest = staleProfileTest.get("#profile-update-digest").value;
+  assert.equal(staleDigest, "sha256:teamdigest", "the precondition is loaded with the selection");
+  // The observation changes under the open form.
+  staleProfileTest.setResources(staleProfileTest.resources().map(resource =>
+    resource.kind === "Profile" && resource.name === "team"
+      ? { ...resource, details: { ...resource.details, configDigest: "sha256:teamdigest-new" } } : resource));
+  staleProfileTest.get("#refresh").listeners.click[0]();
+  await staleProfileTest.settle();
+  assert.equal(staleProfileTest.get("#profile-update-digest").value, staleDigest, "a refresh never rewrites the precondition of the open form");
+  assert.equal(staleCpu.value, "9", "a refresh never rewrites the typed quota");
+  const staleBefore = staleProfileTest.bodies.length;
+  await staleProfileTest.submitForm(0);
+  assert.equal(staleProfileTest.bodies.length, staleBefore, "a form that no longer matches the observation never reaches the API");
+  assert.ok(staleProfileTest.error.textContent.includes("Reselect or reopen the Profile"), "the administrator is asked to reselect");
+  assert.ok(staleProfileTest.error.textContent.includes("your edits were not applied"), "the refusal states that the edits were not applied");
+  // A reselection loads the current observation and the request is prepared.
+  const staleSelect = staleProfileTest.get("#profile-update-name");
+  staleSelect.value = "team";
+  for (const handler of staleSelect.listeners.change || []) handler();
+  assert.equal(staleProfileTest.get("#profile-update-digest").value, "sha256:teamdigest-new", "the reselection loads the current precondition");
+  staleCpu.value = "9";
+  await staleProfileTest.submitForm(0);
+  const staleBody = staleProfileTest.bodies[staleProfileTest.bodies.length - 1];
+  assert.equal(staleBody.kind, "profile.update", "a reselected form prepares the request");
+  assert.equal(staleBody.baseConfigDigest, "sha256:teamdigest-new", "the current precondition travels with the request");
+
+  // A Profile that was replaced under the open form is refused as well, even
+  // when its configuration precondition is unchanged.
+  const replacedProfileTest = await bootHarness({});
+  await replacedProfileTest.click("profiles");
+  replacedProfileTest.walk(replacedProfileTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0].click();
+  replacedProfileTest.walk(replacedProfileTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit profile")[0].click();
+  replacedProfileTest.profileQuotaInputs.find(input => input.dataset.profileQuota === "requests.cpu").value = "9";
+  replacedProfileTest.setResources(replacedProfileTest.resources().map(resource =>
+    resource.kind === "Profile" && resource.name === "team" ? { ...resource, uid: "uid-profile-team-replaced" } : resource));
+  replacedProfileTest.get("#refresh").listeners.click[0]();
+  await replacedProfileTest.settle();
+  const replacedBefore = replacedProfileTest.bodies.length;
+  await replacedProfileTest.submitForm(0);
+  assert.equal(replacedProfileTest.bodies.length, replacedBefore, "a replaced Profile never reaches the API");
+  assert.ok(replacedProfileTest.error.textContent.includes("Reselect or reopen the Profile"), "a replaced Profile asks for a reselection");
+
+  // An ordinary refresh of an unchanged Profile never refuses the request.
+  const sameProfileTest = await bootHarness({});
+  await sameProfileTest.click("profiles");
+  sameProfileTest.walk(sameProfileTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0].click();
+  sameProfileTest.walk(sameProfileTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit profile")[0].click();
+  sameProfileTest.profileQuotaInputs.find(input => input.dataset.profileQuota === "requests.cpu").value = "9";
+  sameProfileTest.get("#refresh").listeners.click[0]();
+  await sameProfileTest.settle();
+  await sameProfileTest.submitForm(0);
+  assert.equal(sameProfileTest.bodies.length > 0, true, "a refresh with an unchanged Profile never blocks the request");
+  assert.equal(sameProfileTest.bodies[sameProfileTest.bodies.length - 1].baseConfigDigest, "sha256:teamdigest", "the unchanged precondition travels with the request");
+
+  // The plan preview shows the validated before and after values of the raw
+  // server change.
+  const previewTest = await bootHarness({});
+  await previewTest.submitForm(2);
+  const changesNode = previewTest.walk(previewTest.get("#plan-preview"), node => node.id === "plan-changes")[0];
+  assert.ok(changesNode, "the validated change table is rendered");
+  const changesText = previewTest.textOf(changesNode);
+  assert.ok(changesText.includes("requests.cpu") && changesText.includes("4") && changesText.includes("8"), "the server change is rendered with its actual before and after values");
+  assert.ok(changesText.includes("Before") && changesText.includes("After"), "the change table keeps its before and after columns");
+
+  // The configuration precondition never reaches the console.
+  const digestTest = await bootHarness({});
+  await digestTest.click("profiles");
+  const digestRow = digestTest.walk(digestTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0];
+  digestRow.listeners.click[0]();
+  assert.equal(digestTest.textOf(digestTest.get("#profile-summary-body")).includes("sha256:teamdigest"), false, "the Profile summary never shows the precondition hash");
+  const digestDetails = digestTest.walk(digestTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Profile team")[0];
+  assert.ok(digestDetails, "a Profile row exposes its observed details");
+  digestDetails.listeners.click[0]();
+  const digestText = digestTest.textOf(digestTest.get("#resource-details-body"));
+  assert.equal(digestText.includes("sha256:teamdigest"), false, "the observed details never show the precondition hash");
+  assert.equal(digestText.includes("configDigest"), false, "the precondition key is not rendered at all");
+  assert.ok(digestText.includes("apiVersion: kubeflow.org/v1"), "the observed details keep their labels");
+  digestTest.closers[0].listeners.click[0];
+  // The precondition hash is not searchable either.
+  const hashSearch = digestTest.get('[data-table="profiles"]').querySelector("[data-search]");
+  hashSearch.value = "sha256:teamdigest";
+  for (const handler of hashSearch.listeners.input || []) handler();
+  assert.equal(digestTest.walk(digestTest.get('[data-table="profiles"]'), node => node.tagName === "TR").length, 0, "the precondition hash matches no loaded row");
+  assert.ok(digestTest.textOf(digestTest.get('[data-table="profiles"]')).includes("0 records matching"), "the precondition hash is not part of the searchable observation");
+  hashSearch.value = "";
+  for (const handler of hashSearch.listeners.input || []) handler();
+  // The update request still carries the precondition.
+  const digestUpdate = await bootHarness({});
+  await digestUpdate.click("profiles");
+  const digestUpdateRow = digestUpdate.walk(digestUpdate.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0];
+  digestUpdateRow.listeners.click[0]();
+  const digestEdit = digestUpdate.walk(digestUpdate.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit profile")[0];
+  digestEdit.listeners.click[0]();
+  digestUpdate.profileQuotaInputs.find(input => input.dataset.profileQuota === "requests.cpu").value = "6";
+  await digestUpdate.submitForm(0);
+  const digestBody = digestUpdate.bodies[digestUpdate.bodies.length - 1];
+  assert.equal(digestBody.baseConfigDigest, "sha256:teamdigest", "the update request still carries the precondition");
 
   console.log("Dashboard navigation, bounded viewers, drawer contracts, notification policy and history tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

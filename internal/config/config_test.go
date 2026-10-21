@@ -3,7 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+
+	"kubeflow-admin/internal/footer"
 )
 
 const valid = `server:
@@ -111,5 +115,58 @@ func TestLoginSourceLimit(t *testing.T) {
 				t.Fatalf("ok=%v err=%v", tc.ok, e)
 			}
 		})
+	}
+}
+
+func TestUIFooterText(t *testing.T) {
+	c, err := load(t, valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The footer is empty by default: a deployment never sees a shipped
+	// sentence it did not ask for.
+	if c.UI.FooterText != "" {
+		t.Fatalf("unexpected default footer text: %q", c.UI.FooterText)
+	}
+	// A configured footer is kept exactly as written under the same key: the
+	// console sanitizes the value before it renders it.
+	c, err = load(t, valid+"ui:\n  footerText: \"Support: platform-team@example.org\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UI.FooterText != "Support: platform-team@example.org" {
+		t.Fatalf("footer text was not loaded: %q", c.UI.FooterText)
+	}
+	// Branding markup is accepted under the same key and is kept verbatim in
+	// the configuration: the sanitizer, not the loader, decides what is
+	// rendered.
+	branding := `<p><strong>Acme</strong></p><img src="https://cdn.acme.example/logo.png" alt="Acme logo"><a href="https://support.acme.example">Support</a>`
+	c, err = load(t, valid+"ui:\n  footerText: "+strconv.Quote(branding)+"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UI.FooterText != branding {
+		t.Fatalf("footer branding was not loaded: %q", c.UI.FooterText)
+	}
+	// The section is strict like every other one: an alternative HTML footer
+	// field or any other unknown key is refused instead of silently ignored.
+	for _, body := range []string{
+		"ui:\n  footerHtml: '<b>x</b>'\n",
+		"ui:\n  footerText: 'a'\n  footerMarkup: '<b>x</b>'\n",
+	} {
+		if _, err = load(t, valid+body); err == nil {
+			t.Fatalf("unknown ui field accepted: %q", body)
+		}
+	}
+	// An unbounded footer is refused: the console footer is a bounded
+	// branding block. The bound is counted in runes, not bytes.
+	if _, err = load(t, valid+"ui:\n  footerText: "+strconv.Quote(strings.Repeat("x", footer.MaxRunes+1))+"\n"); err == nil {
+		t.Fatal("oversized footer accepted")
+	}
+	if _, err = load(t, valid+"ui:\n  footerText: "+strconv.Quote(strings.Repeat("x", footer.MaxRunes))+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = load(t, valid+"ui:\n  footerText: "+strconv.Quote(strings.Repeat("é", footer.MaxRunes))+"\n"); err != nil {
+		t.Fatalf("a rune-counted footer at the bound was refused: %v", err)
 	}
 }

@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - rbac.yaml
+# Opt-in only; never included by all-features automatically. The base stays
+# read-only: a site must separately set features.profileDeletion (and keep
+# features.writesEnabled true) after an operator reviews the added
+# cluster-scoped Profile delete permission. Both gates are required: the API
+# refuses a profile.delete action when either one is off, and the console only
+# offers the capability when both are on.
+#
+# The base is included exactly once. Compose this role into a site overlay by
+# copying rbac.yaml into deploy/site/ (for example profile-deletion-rbac.yaml)
+# and listing it under the site's resources; do not stack this overlay on top
+# of another overlay that already includes the base.
+#
+# The ClusterRole is intentionally limited to kubeflow.org/profiles delete: no
+# namespaces, persistentvolumes, persistentvolumeclaims or pods delete, and no
+# finalizer update or patch.

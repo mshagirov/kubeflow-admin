@@ -56,4 +56,4 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
       - name: Scan source dependencies, secrets and manifest misconfiguration
-        run: docker run --rm -v "$PWD:/src:ro" aquasec/trivy:0.67.2@sha256:e2b22eac59c02003d8749f5b8d9bd073b62e30fefaef5b7c8371204e0a4b0c08 fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 /src
+        run: docker run --rm -v "$PWD:/src:ro" aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222 fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 /src

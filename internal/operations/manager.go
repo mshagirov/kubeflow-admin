@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"kubeflow-admin/internal/auth"
 	"kubeflow-admin/internal/config"
@@ -136,7 +137,10 @@ func (m *Manager) Plan(ctx context.Context, actor model.Identity, a model.Action
 	// through operation_claims, not the plan record. Failure never blocks a
 	// preview, and only plans (never operations or audit) are removed.
 	m.cleanupExpiredPlans(ctx)
-	if len(a.Reason) > 500 {
+	// The reason limit counts Unicode code points, like the API's documented
+	// maxLength and the backend's own limit, so a multibyte reason is never
+	// rejected for being shorter in characters than it is in bytes.
+	if utf8.RuneCountInString(a.Reason) > 500 {
 		return model.Plan{}, errors.New("reason exceeds 500 characters")
 	}
 	p, err := m.k.Prepare(ctx, a)
@@ -395,6 +399,14 @@ func (m *Manager) run(t task) bool {
 		op.State = "applying"
 		op.Step = step
 		op.UpdatedAt = time.Now().UTC()
+		// The durable checkpoint that precedes the single Profile delete
+		// request is the last thing that happens before that request is
+		// issued. Once durably true, a request may have started. A versioned,
+		// explicitly false marker proves this checkpoint was never reached.
+		// The marker is monotonic in the store, so no later update can clear it.
+		if op.Action == profileDeleteKind && step == profileDeleteStep {
+			op.ProfileDeleteCheckpointed = true
+		}
 		auditID, err := id()
 		if err != nil {
 			return err
@@ -427,7 +439,7 @@ func (m *Manager) run(t task) bool {
 		op.Error = "The cluster API rejected the request before any change was applied. Nothing was changed; correct the reported precondition, authenticate and preview again."
 	} else {
 		op.State = "needs-review"
-		op.Error = safeError(err) + " Inspect actual cluster state; a notebook may be stopped or storage partially provisioned. No rollback or automatic replay was performed. Targets remain locked pending explicit reconciliation."
+		op.Error = safeError(err) + " " + reviewGuidance(op.Action)
 	}
 	return m.persistOutcome(op)
 }
@@ -455,6 +467,43 @@ func safeError(err error) string {
 		return "Administrator session is no longer authorized."
 	}
 	return "Operation could not be completed safely."
+}
+
+// profileDeleteKind is the typed destructive Profile action. It is the only
+// action whose outcome can remove a whole namespace by cascade, so it needs
+// review guidance that points the operator at the objects it actually
+// touched.
+const profileDeleteKind = "profile.delete"
+
+// profileDeleteStep is the durable checkpoint step of the Profile deletion
+// workflow. The checkpoint that carries this step is written immediately
+// before the single delete request, so it is the boundary between "no write
+// was ever started" and "a write may have been issued".
+const profileDeleteStep = "delete-profile"
+
+// genericReviewGuidance is the uncertain-outcome guidance for every action
+// kind. It is preserved byte for byte: an existing operator who knows this
+// text must keep seeing exactly this text.
+const genericReviewGuidance = "Inspect actual cluster state; a notebook may be stopped or storage partially provisioned. No rollback or automatic replay was performed. Targets remain locked pending explicit reconciliation."
+
+// profileDeleteReviewGuidance is the uncertain-outcome guidance for the
+// destructive Profile deletion.
+//
+// The generic text talks about notebooks and provisioned storage, which are
+// the wrong objects here: the deletion cascades into the namespace the
+// Profile owns. The text stays generic about the cause (safeError already
+// removed any backend detail) and only states what the administrator must
+// check and must not do.
+const profileDeleteReviewGuidance = "The Profile deletion may already have been accepted. Inspect the Profile, the namespace it owns and any finalizers that remain, and check whether its PersistentVolumeClaims and other storage were deleted or retained. Do not retry the deletion and do not force namespace or resource cleanup. The Profile and its namespace remain locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
+
+// reviewGuidance returns the uncertain-outcome guidance for an action kind.
+// Every action except the destructive Profile deletion keeps the generic
+// wording unchanged.
+func reviewGuidance(action string) string {
+	if action == profileDeleteKind {
+		return profileDeleteReviewGuidance
+	}
+	return genericReviewGuidance
 }
 func storageError(err error) error {
 	var integrity *store.IntegrityError

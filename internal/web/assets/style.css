@@ -61,7 +61,6 @@ h3{font-size:14px}
 .health-count.warn{background:#fff6df;color:#866728}
 .health-count.bad{background:#fff0eb;color:#ac532f}
 .tag{font-size:9px;letter-spacing:.9px;color:#526f9e;background:#edf3fc;border-radius:5px;padding:7px;white-space:nowrap}
-.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}
 .info{padding:8px 24px 14px}
 .info p{font-size:13px}
 .info-panel{padding:6px 24px 16px}
@@ -82,6 +81,9 @@ legend{font-size:11px;color:var(--muted);padding:0 5px}
 #notice.success{border-color:#bce6d2;background:#effaf4;color:#286a4a}
 .plan-warning{margin:10px 0}
 footer{color:#98a4b5;font-size:10px;margin-top:20px;line-height:1.7}
+/* A configured footer may carry a company logo: it stays inside the footer
+   and never overflows a narrow screen. */
+footer img{vertical-align:middle;max-width:100%}
 
 /* Notifications: non-modal, accessible, never a substitute for plan warnings. */
 .notifications{position:fixed;bottom:18px;right:18px;width:min(430px,calc(100vw - 36px));z-index:30;display:grid;gap:10px;max-height:50vh;overflow:auto;pointer-events:none}
@@ -136,6 +138,7 @@ td small{display:block;font-weight:400;color:var(--muted);margin-top:5px;line-he
 .resource-name>span{font-weight:600}
 .resource-name small{max-width:420px}
 .detail-button{padding:3px 6px;background:transparent;color:var(--accent);font-size:11px;margin-top:4px}
+.detail-button:hover{text-decoration:underline;filter:none}
 .details{white-space:pre-wrap;overflow-wrap:anywhere;max-width:420px;font-size:11px;font-weight:400;color:var(--muted)}
 .actor-cell span,.actor-label{overflow-wrap:anywhere}
 .actor-cell small,.id-cell small{font-size:10px;color:#8593a6;overflow-wrap:anywhere}
@@ -177,6 +180,33 @@ td small{display:block;font-weight:400;color:var(--muted);margin-top:5px;line-he
 .summary-link.static:hover{background:#f7f9fd}
 .summary-link strong{font-size:22px;line-height:1;color:var(--accent)}
 .summary-link span{font-size:12px;color:var(--muted)}
+.summary-resource{color:var(--accent);font-weight:600;text-decoration:none}
+.summary-resource:hover{text-decoration:underline}
+
+/* Observed resource details (right-side drawer) */
+.detail-list{display:grid;grid-template-columns:130px 1fr;border:1px solid var(--line);border-radius:7px;overflow:hidden;margin:14px 0}
+.detail-list dt,.detail-list dd{padding:9px 11px;margin:0;font-size:12px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.detail-list dt{background:#f7f9fd;color:#6d7b90}
+.detail-rows{display:grid;gap:6px;margin:10px 0 0}
+.detail-row{font-size:12px;color:#2c3f5c;background:#f7f9fd;border:1px solid var(--line);border-radius:6px;padding:8px 11px;overflow-wrap:anywhere;white-space:pre-wrap}
+
+/* Profile management: read-only owner, unmanaged quota keys, destructive delete. */
+.profile-configuration{margin-top:18px}
+.quota-list{list-style:none;margin:0;padding:0;display:grid;gap:4px}
+.quota-list li{display:flex;justify-content:space-between;gap:12px;font-size:12px}
+.quota-list code,.quota-readonly-row code{font-size:11px;color:#2c3f5c;background:#eef3fb;border-radius:4px;padding:1px 5px;overflow-wrap:anywhere}
+.quota-readonly{margin:12px 0 0;padding:10px 12px;border:1px dashed #c8d4e6;border-radius:7px;background:#fbfcff}
+.quota-readonly p{margin:0 0 8px}
+.quota-readonly-row{display:flex;justify-content:space-between;gap:12px;font-size:12px;padding:3px 0}
+.name-suggestion{margin:10px 0 0;padding:10px 12px;border:1px solid #d7e0ee;border-radius:7px;background:#f7f9fd;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.name-suggestion p{margin:0;font-size:11px}
+.danger-note{border:1px solid #efc3c3;background:#fff4f4;border-radius:8px;padding:13px 15px;margin:14px 0}
+.danger-note p{font-size:12px;line-height:1.65;margin:0 0 9px;color:#7d3b3b}
+.danger-note p:last-child{margin-bottom:0}
+.danger-note strong{color:#9c3c3c}
+button.danger{background:#a3312f;border-color:#a3312f;color:#fff}
+button.danger:hover{filter:brightness(1.05)}
+.detail-list dd .secondary{margin-left:8px;vertical-align:middle}
 
 /* Plan dialog */
 dialog{width:min(760px,94vw);max-height:90vh;border:1px solid #d7e0ee;border-radius:13px;padding:30px;color:#263a54;box-shadow:0 30px 90px #101e3444}
@@ -208,7 +238,7 @@ body.signed-out main{margin-left:0;margin-right:auto;max-width:760px;padding:37p
   .control-field.inline-control,.control-field.inline-control select{width:100%;min-width:0}
   .toolbar{align-items:stretch;flex-direction:column}
   .freshness{justify-content:space-between}
-  .info-grid,.field-grid{grid-template-columns:1fr}
+  .field-grid{grid-template-columns:1fr}
   .preview-fields{grid-template-columns:110px 1fr}
   .account span{max-width:150px;display:block;overflow-wrap:anywhere}
   .panel-heading{padding:18px}

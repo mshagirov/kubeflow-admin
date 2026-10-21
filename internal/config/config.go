@@ -11,6 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"kubeflow-admin/internal/footer"
 )
 
 type Config struct {
@@ -22,6 +25,7 @@ type Config struct {
 	Notebooks  Notebooks  `yaml:"notebooks"`
 	Database   Database   `yaml:"database"`
 	Features   Features   `yaml:"features"`
+	UI         UI         `yaml:"ui"`
 	History    History    `yaml:"history"`
 	Logging    Logging    `yaml:"logging"`
 }
@@ -103,6 +107,28 @@ type Features struct {
 	PVCExpansion  bool `yaml:"pvcExpansion"`
 	PodRestarts   bool `yaml:"podRestarts"`
 	NodeCordon    bool `yaml:"nodeCordon"`
+	// ProfileDeletion is a separate opt-in for the destructive Profile
+	// deletion workflow. It is never implied by WritesEnabled: both must be
+	// true before the API accepts a delete request, and the console only
+	// projects the capability to the browser when writes are enabled too.
+	// Enabling the flag grants no Kubernetes permission by itself; the
+	// reviewed RBAC grant is a separate, operator-installed step.
+	ProfileDeletion bool `yaml:"profileDeletion"`
+}
+
+// UI holds the console presentation settings a site may set. It carries no
+// capability and no permission: the footer is branding only and is reduced
+// to inert markup before it is rendered.
+type UI struct {
+	// FooterText is the optional footer of the console. It may be plain
+	// text or a small amount of HTML for branding: a company logo, a link
+	// to the support portal, a short line of text. The value is sanitized
+	// against a strict allowlist before it is rendered (see
+	// internal/footer): script, style, embedded frames, forms, event
+	// handlers, inline CSS and unsafe URL schemes are removed. The empty
+	// default renders no footer at all, so a deployment never shows a
+	// shipped sentence it did not ask for.
+	FooterText string `yaml:"footerText"`
 }
 
 type History struct {
@@ -233,6 +259,13 @@ func (c Config) Validate() error {
 	}
 	if c.Kubernetes.RequestTimeoutSeconds < 1 || c.Kubernetes.RequestTimeoutSeconds > 60 {
 		return fmt.Errorf("request timeout must be 1..60 seconds")
+	}
+	// The footer is a bounded branding block: plain text or a small amount
+	// of sanitized HTML. The bound is counted in runes (Unicode code
+	// points), not bytes, and it is the same bound the renderer enforces,
+	// so a value that passes validation always fits the sanitized output.
+	if utf8.RuneCountInString(c.UI.FooterText) > footer.MaxRunes {
+		return fmt.Errorf("ui.footerText must be at most %d characters", footer.MaxRunes)
 	}
 	names := map[string]bool{}
 	for _, t := range c.Storage.NFSTemplates {

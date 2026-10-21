@@ -393,14 +393,19 @@ func TestExactOwnerIdentityAndSafeServerChanges(t *testing.T) {
 		return model.Identity{Subject: "Exact-Kubeflow-Username", CSRF: "csrf-test"}, true
 	}
 	w := request(handler(s), "GET", "/profiles", "")
-	for _, text := range []string{"Exact-Kubeflow-Username", "Exact Kubeflow owner identity", `name="owner" type="text"`, "supply every existing quota key"} {
+	// The create form asks for the registered email address; the update form
+	// shows the observed owner read-only. Neither field is a free-text owner
+	// identity any more.
+	for _, text := range []string{"Exact-Kubeflow-Username", "Email (registered with identity provider, e.g. user email from LDAP)", `name="profileCreateOwner" type="email"`, `name="profileOwner" type="text" readonly`, "Owner transfer is unsupported by the installed Profile controller", "every existing quota key must be supplied with its current value"} {
 		if !strings.Contains(w.Body.String(), text) {
 			t.Errorf("missing %q", text)
 		}
 	}
-	if strings.Contains(w.Body.String(), `name="owner" type="email"`) {
-		t.Fatal("owner field rejects usernames")
+	if strings.Contains(w.Body.String(), `name="owner" type="text"`) {
+		t.Fatal("the owner field is no longer a free-text identity field")
 	}
+	// The legacy API passthrough is unchanged: the typed owner is still sent
+	// exactly as entered, including case.
 	o.changes = []model.Change{{Field: "container.main.cpu.request", Before: "500m", After: "2"}, {Field: "effective run state", Before: "Running", After: "Stopped"}}
 	w = request(handler(s), "POST", "/api/v1/plans", `{"kind":"profile.create","name":"team","owner":"CaseSensitive-Username"}`)
 	if w.Code != 201 || o.action.Owner != "CaseSensitive-Username" {

@@ -9,6 +9,9 @@
   const notebookWrites = meta("notebook-writes") === "true";
   const podRestartFeature = meta("pod-restarts") === "true" && writes && notebookWrites;
   const nodeCordonFeature = meta("node-cordon") === "true" && writes;
+  // Profile deletion is a separate, reviewed opt-in. It is only offered when
+  // the server projects the capability and writes are enabled.
+  const profileDeletionFeature = meta("profile-deletion") === "true" && writes;
   const notificationScope = meta("notification-scope");
   const logic = globalThis.DashboardLogic;
 
@@ -30,6 +33,10 @@
   let inventory = null, inventoryAt = 0, inventoryError = false, loading = false;
   let currentPlan = null, submitKey = null, submitInflight = false;
   let drawerOpener = null;
+  // The observed resource the open details drawer belongs to. It follows the
+  // resource across an inventory refresh and identifies the control that may
+  // take the focus back.
+  let drawerResource = null;
   let overviewTableExpanded = false;
   let errorTipSeq = 0;
   let rowCache = {};
@@ -53,6 +60,24 @@
     historyOperations: logic.defaultTableState("time", "desc"),
     historyAudit: logic.defaultTableState("time", "desc")
   };
+  // The table that owns each page. A deep-linked resource focus is applied to
+  // the table of the page it was requested for.
+  const pageTableKeys = {
+    overview: "overview", profiles: "profiles", namespaces: "namespaces", storage: "storage",
+    notebooks: "notebooks", pods: "pods", nodes: "nodes"
+  };
+  // A resource focus is the identity of one observed resource: its Kubernetes
+  // kind, its namespace and its name. A name alone is never an identity: a
+  // volume and its claim, a Notebook and its StatefulSet, or two Pods with the
+  // same name in different namespaces can share a name.
+  // The focus is mirrored in the visible search box, and the mirror is
+  // remembered so an unrelated typed search is never overwritten.
+  for (const key of Object.keys(tableStates)) { tableStates[key].focus = null; tableStates[key].focusMirror = false; }
+  // A cluster-scoped kind is never identified by a namespace.
+  const clusterScopedKinds = new Set(["Profile", "Namespace", "Node", "PersistentVolume", "StorageClass"]);
+  // The kind a legacy deep link implies on a page that lists exactly one.
+  // A page that lists several kinds treats a kind-less link as a name filter.
+  const pageResourceKinds = { pods: "Pod", nodes: "Node", profiles: "Profile", namespaces: "Namespace" };
   const perPage = 50;
   // Local receipt time is the freshness clock. Server observedAt is display-only
   // so clock skew never disables Refresh or forces a scan on every navigation.
@@ -211,29 +236,61 @@
       cpuLimit: podResourceDetail(resource, "cpuLimit", "limit.cpu"), memoryLimit: podResourceDetail(resource, "memoryLimit", "limit.memory"), time: ""
     };
   }
+  // The configuration precondition is an internal request guard that travels
+  // with a Profile update. Its raw hash is never rendered and never
+  // searchable: it is read from the observation only to be sent back.
+  function visibleDetails(resource) {
+    return logic.visibleResourceDetails(resource);
+  }
   function resourceSearch(resource) {
-    const details = Object.entries(resource.details || {}).map(([key, value]) => `${key} ${value}`).join(" ");
+    const details = Object.entries(visibleDetails(resource)).map(([key, value]) => `${key} ${value}`).join(" ");
     return [resource.name, resource.kind, resource.namespace, resource.owner, resource.state, desired(resource), capacity(resource), details].filter(Boolean).join(" ");
   }
-  function detailsNode(resource) {
-    const details = resource.details || {}, keys = Object.keys(details);
-    if (!keys.length) return null;
-    const disclosure = el("details"), summary = el("summary", "Details", "detail-button"), content = el("div", undefined, "details");
-    content.textContent = keys.sort().map(key => `${key}: ${details[key]}`).join("\n");
-    disclosure.append(summary, content);
-    return disclosure;
+  // Projected resource details are read-only observations. They open the right
+  // resource details drawer instead of an inline disclosure, so a long
+  // key/value list never inflates a table row.
+  function detailEntries(resource) {
+    return Object.entries(visibleDetails(resource)).map(([key, value]) => `${key}: ${value}`);
   }
-  function resourceNameNode(resource) {
+  // The identity of one observed resource: kind, namespace and name. Two
+  // resources that share a name in different kinds or namespaces are
+  // different resources and are never the same focus.
+  function resourceKey(resource) {
+    return [resource?.kind || "", resource?.namespace || "", resource?.name || ""].join("|");
+  }
+  function detailsButton(resource) {
+    if (!detailEntries(resource).length) return null;
+    const button = el("button", "Details", "detail-button");
+    button.type = "button";
+    button.dataset.openDrawer = "resource-details";
+    button.dataset.resourceKey = resourceKey(resource);
+    button.setAttribute("aria-label", `Details for ${resource.kind || "resource"} ${resource.name || ""}`.trim());
+    // The clicked control is the opener: a pointer click does not always move
+    // the focus, so document.activeElement is not a reliable substitute.
+    button.addEventListener("click", event => openResourceDetails(resource, event?.currentTarget));
+    return button;
+  }
+  function resourceNameNode(resource, options = {}) {
     const node = el("div", undefined, "resource-name");
     if (resource.kind === "Profile") {
       const open = el("button", resource.name || "Unnamed", "link-button");
       open.type = "button";
-      open.addEventListener("click", () => openProfileSummary(resource.name));
+      open.addEventListener("click", event => openProfileSummary(resource.name, event?.currentTarget));
+      node.append(open);
+    } else if (options.openDetails) {
+      // Storage names are the visible handle for a volume or claim, so they
+      // open the same observed-details drawer as the inline details control.
+      const open = el("button", resource.name || "Unnamed", "link-button");
+      open.type = "button";
+      open.dataset.openDrawer = "resource-details";
+      open.dataset.resourceKey = resourceKey(resource);
+      open.setAttribute("aria-label", `Details for ${resource.kind || "resource"} ${resource.name || ""}`.trim());
+      open.addEventListener("click", event => openResourceDetails(resource, event?.currentTarget));
       node.append(open);
     } else node.append(el("span", resource.name || "Unnamed"));
     node.append(el("small", [resource.kind, resource.namespace, resource.owner].filter(Boolean).join(" · ")));
-    const disclosure = detailsNode(resource);
-    if (disclosure) node.append(disclosure);
+    const details = detailsButton(resource);
+    if (details) node.append(details);
     return node;
   }
   function actorCell(record) {
@@ -420,13 +477,13 @@
       return resources.filter(resource => resource.kind === "Namespace").map(resource => ({
         namespace: resource.name || "",
         search: [resource.name, resource.kind, resource.state, resource.details?.createdAt].filter(Boolean).join(" "),
-        sort: { name: resource.name || "", state: resource.state || "Not reported", age: resource.details?.createdAt || "" },
+        sort: { name: resource.name || "", type: "Namespace", namespace: "", state: resource.state || "Not reported", age: resource.details?.createdAt || "" },
         cellFactory: () => [namespaceNameNode(resource), badge(resource.state), logic.formatAge(resource.details?.createdAt)]
       }));
     }
     if (stateKey === "storage") {
       return scoped.filter(resource => ["PersistentVolume", "PersistentVolumeClaim", "StorageClass"].includes(resource.kind)).map(resource =>
-        resourceRow(resource, () => [resourceNameNode(resource), resource.kind || "—", resource.details?.requested || "—", badge(resource.state), capacity(resource), resource.details?.storageClass || "—"]));
+        resourceRow(resource, () => [resourceNameNode(resource, { openDetails: ["PersistentVolume", "PersistentVolumeClaim"].includes(resource.kind) }), resource.kind || "—", resource.details?.requested || "—", badge(resource.state), capacity(resource), resource.details?.storageClass || "—"]));
     }
     if (stateKey === "notebooks") {
       return scoped.filter(resource => ["Notebook", "Pod", "StatefulSet"].includes(resource.kind)).map(resource =>
@@ -443,7 +500,7 @@
           namespace: "",
           search: [resource.name, resource.state, details.roles, details.version, details.internalIP, details.externalIP, details.osImage, details.kernelVersion, details.containerRuntime, details.controlPlane === "true" ? "control-plane" : ""].filter(Boolean).join(" "),
           sort: {
-            name: resource.name || "", state: resource.state || "Not reported", roles: details.roles || "",
+            name: resource.name || "", type: "Node", namespace: "", state: resource.state || "Not reported", roles: details.roles || "",
             age: details.createdAt || "", version: details.version || "", internalIP: details.internalIP || "",
             externalIP: details.externalIP || "", osImage: details.osImage || "", kernelVersion: details.kernelVersion || "",
             containerRuntime: details.containerRuntime || ""
@@ -533,6 +590,16 @@
   function clusterWideTable(stateKey) {
     return stateKey === "profiles" || stateKey === "namespaces" || stateKey === "nodes";
   }
+  // A focused row is the observed resource with the very same kind, namespace
+  // and name. A cluster-scoped kind never matches a namespaced row, and a
+  // namespaced kind never matches a row of another namespace.
+  function focusMatches(row, focus) {
+    if (!focus) return true;
+    if (String(row.sort?.name || "") !== focus.name) return false;
+    if (focus.kind && String(row.sort?.type || "") !== focus.kind) return false;
+    if (focus.namespace !== null && focus.namespace !== undefined && String(row.sort?.namespace ?? "") !== focus.namespace) return false;
+    return true;
+  }
   function buildControls(stateKey) {
     const def = tableDefs[stateKey], state = tableStates[stateKey];
     const controls = el("div", undefined, "table-controls");
@@ -542,14 +609,22 @@
     search.type = "search"; search.value = state.search; search.placeholder = "Filter loaded rows";
     search.dataset.search = "1";
     search.setAttribute("aria-label", "Search " + def.label);
-    search.addEventListener("input", () => { const live = tableStates[stateKey]; live.search = search.value; live.page = 1; renderTable(stateKey); });
+    // Editing the visible search invalidates a deep-linked resource focus, so
+    // the URL never claims a filter the table no longer applies. A typed
+    // search is not a focus mirror and is never cleared by a later focus.
+    search.addEventListener("input", () => { const live = tableStates[stateKey]; live.search = search.value; live.focus = null; live.focusMirror = false; live.page = 1; dropResourceScope(); renderTable(stateKey); });
     searchLabel.append(search);
+    const clear = el("button", "Clear filters", "secondary small");
+    clear.type = "button";
+    clear.dataset.clearFilters = "1";
+    clear.setAttribute("aria-label", "Clear the search and namespace filters for " + def.label);
+    clear.addEventListener("click", () => clearFilters(stateKey));
     const count = el("span", undefined, "result-count");
     count.dataset.count = "1";
     count.setAttribute("role", "status");
     count.setAttribute("aria-live", "polite");
     if (clusterWideTable(stateKey)) {
-      controls.append(searchLabel, count);
+      controls.append(searchLabel, clear, count);
       return controls;
     }
     const scopeLabel = el("label", undefined, "control-field");
@@ -559,8 +634,46 @@
     select.setAttribute("aria-label", "Namespace for " + def.label);
     select.addEventListener("change", () => setNamespace(select.value));
     scopeLabel.append(select);
-    controls.append(searchLabel, scopeLabel, count);
+    controls.append(searchLabel, scopeLabel, clear, count);
     return controls;
+  }
+  // The clear control is always reachable, but it is only actionable when a
+  // search text, the shared namespace scope or a resource focus is applied.
+  function syncClearFilters(controls, stateKey) {
+    const clear = controls.querySelector("[data-clear-filters]");
+    if (!clear) return;
+    const state = tableStates[stateKey];
+    const active = !!String(state.search || "").trim() || !!namespaceContext || !!state.focus;
+    clear.disabled = !active;
+    clear.setAttribute("aria-disabled", active ? "false" : "true");
+    clear.title = active
+      ? "Clear the search text, the namespace scope and the resource focus, and return to the first page."
+      : "No search text, namespace scope or resource focus is applied.";
+  }
+  // A focus is dropped on its own. The mirrored search is cleared with it, but
+  // a search the administrator typed is kept.
+  function clearResourceFocus(state) {
+    if (!state || !state.focus) return false;
+    state.focus = null;
+    if (state.focusMirror) { state.search = ""; state.focusMirror = false; }
+    return true;
+  }
+  // Reset search, namespace scope and pagination to their defaults. The
+  // namespace scope is shared by the whole console, so it is cleared from the
+  // URL as well and a deep-linked resource focus is dropped with it.
+  function clearFilters(stateKey) {
+    const state = tableStates[stateKey];
+    const container = $(`[data-table="${stateKey}"]`);
+    state.search = "";
+    state.focus = null;
+    state.focusMirror = false;
+    state.page = 1;
+    const search = container?.querySelector("[data-search]");
+    if (search) search.value = "";
+    if (namespaceContext) setNamespace("");
+    else { dropResourceScope(); renderTable(stateKey); }
+    const focus = container?.querySelector("[data-search]") || container?.querySelector("[data-clear-filters]");
+    if (focus) focus.focus();
   }
   function renderTable(stateKey) {
     const container = $(`[data-table="${stateKey}"]`);
@@ -578,6 +691,7 @@
     }
     const search = controls.querySelector("[data-search]");
     if (search && document.activeElement !== search) search.value = state.search;
+    syncClearFilters(controls, stateKey);
     container.querySelectorAll(".table-scroll, .pager, .table-note, .empty-state").forEach(node => node.remove());
     const count = controls.querySelector("[data-count]");
     if (!inventory && stateKey !== "historyAudit" && stateKey !== "historyOperations") {
@@ -593,7 +707,8 @@
     }
     const rows = tableRows(stateKey);
     const scoped = clusterWideTable(stateKey) ? rows : rows.filter(row => !namespaceContext || !row.namespace || row.namespace === namespaceContext);
-    const filtered = scoped.filter(row => logic.searchMatch(row.search, state.search));
+    const focused = state.focus ? scoped.filter(row => focusMatches(row, state.focus)) : scoped;
+    const filtered = focused.filter(row => logic.searchMatch(row.search, state.search));
     const sorted = logic.sortRows(filtered, state.sortKey, state.sortDir, (def.columns.find(column => column.key === state.sortKey) || {}).type || "text");
     const view = logic.paginate(sorted, state.page, perPage);
     state.page = view.page;
@@ -606,7 +721,15 @@
       }
     }
     if (!view.items.length) {
-      container.append(el("div", def.empty, "empty-state"));
+      // A focused resource that is not observed must not look like an empty
+      // scope; the message names the filter that produced the empty view.
+      const focus = state.focus;
+      const empty = focus
+        ? (focus.kind
+          ? `No observed ${focus.kind} named “${focus.name}” matches this scope. Clear the filters to see every loaded row.`
+          : `No observed resource named “${focus.name}” matches this scope. This deep link filters by name only; clear the filters to see every loaded row.`)
+        : def.empty;
+      container.append(el("div", empty, "empty-state"));
     } else {
       const scroll = el("div", undefined, "table-scroll");
       scroll.tabIndex = 0;
@@ -756,6 +879,16 @@
     const data = await api("inventory");
     inventory = data; inventoryAt = monotonicNow(); rowCache = {};
     updateTimestamp(); selectors(); renderPage();
+    // The open details drawer follows the observed resource. A refresh never
+    // rewrites a form the administrator is working in.
+    syncResourceDetailsDrawer();
+    // A refreshed observation can make a client-side validation message
+    // stale. A server answer is never cleared by an unrelated refresh.
+    for (const form of [$("#profile-form"), $("#profile-delete-form")]) {
+      if (!form) continue;
+      const region = form.querySelector(".form-error");
+      if (region && region.dataset.source === "validation") clearFormError(form);
+    }
     (data.warnings || []).forEach(warning => notify("warning", warning, "inventory"));
   }
   function ensureHistory(tab, force = false) {
@@ -825,10 +958,65 @@
   }
 
   // ---- Navigation ----------------------------------------------------------
+  // A deep link may focus one observed resource inside a scoped page. The
+  // resource identity is the canonical triple kind, namespace and name; the
+  // name alone is ambiguous and is never treated as an identity.
+  function resourceScope(search) {
+    try {
+      const url = new URL(String(search || ""), location.href);
+      return {
+        name: (url.searchParams.get("resource") || "").trim(),
+        kind: (url.searchParams.get("kind") || "").trim(),
+        namespace: (url.searchParams.get("namespace") || "").trim()
+      };
+    } catch { return { name: "", kind: "", namespace: "" }; }
+  }
+  function applyResourceScope(search) {
+    const key = pageTableKeys[page];
+    if (!key || !tableStates[key]) return null;
+    const state = tableStates[key];
+    const scope = resourceScope(search);
+    if (!scope.name) {
+      // A deep link that no longer names a resource must not leave a cached
+      // focus behind. A search the administrator typed is kept.
+      clearResourceFocus(state);
+      return null;
+    }
+    // A link without a kind is a legacy link. It keeps the kind of a page that
+    // lists exactly one kind, and it is otherwise a name filter.
+    const kind = scope.kind || pageResourceKinds[page] || "";
+    const focus = {
+      name: scope.name,
+      kind,
+      // A namespaced kind is identified by its namespace. A cluster-scoped
+      // kind is never identified by one, and a legacy link without a
+      // namespace does not constrain the namespace at all.
+      namespace: kind ? (clusterScopedKinds.has(kind) ? "" : (scope.namespace || null)) : null
+    };
+    state.focus = focus;
+    state.focusMirror = true;
+    state.search = scope.name;
+    state.page = 1;
+    // A resource URL on the Overview page must land on the detailed table, not
+    // on a collapsed dashboard, however the page was reached.
+    if (page === "overview") overviewTableExpanded = true;
+    return focus;
+  }
+  // The resource identity is dropped from the URL. Every other query
+  // parameter is preserved.
+  function dropResourceScope() {
+    const url = new URL(location.href);
+    if (!url.searchParams.has("resource") && !url.searchParams.has("kind")) return false;
+    url.searchParams.delete("resource");
+    url.searchParams.delete("kind");
+    window.history.replaceState(null, "", url.pathname + url.search);
+    return true;
+  }
   function activatePage() {
     const current = logic.routeFor(location.pathname, location.search);
     page = current.page;
     if (current.tab) historyTab = current.tab;
+    applyResourceScope(location.search);
     $("#page-title").textContent = pageTitles[page]?.[0] || "Overview";
     $("#page-subtitle").textContent = pageTitles[page]?.[1] || "";
     document.title = `${pageTitles[page]?.[0] || "Overview"} · Kubeflow Administration`;
@@ -854,7 +1042,17 @@
     rowCache = {};
     const url = new URL(location.href);
     if (value) url.searchParams.set("namespace", value); else url.searchParams.delete("namespace");
+    // A namespace change invalidates a deep-linked resource focus: the URL and
+    // the visible filter are dropped together so they never disagree.
+    url.searchParams.delete("resource");
+    url.searchParams.delete("kind");
     window.history.replaceState(null, "", url.pathname + url.search);
+    const key = pageTableKeys[page];
+    if (key && tableStates[key]) tableStates[key].page = 1;
+    // The namespace scope is shared: a resource focus of any table belongs to
+    // the scope it was taken in. It is dropped even when the URL no longer
+    // names the resource. A search the administrator typed is kept.
+    for (const stateKey of Object.keys(tableStates)) clearResourceFocus(tableStates[stateKey]);
     selectors(true);
     renderPage();
   }
@@ -874,6 +1072,11 @@
     closeDrawers(false);
     selectors(true);
     navigate();
+    // The drawer that was open is closed by the navigation. The focus moves
+    // to the destination heading so no keyboard user is left on a hidden
+    // element.
+    const heading = $("#page-title");
+    if (heading) heading.focus();
   });
   $$("[data-history-tab]").forEach(button => {
     button.addEventListener("click", () => {
@@ -906,6 +1109,11 @@
     window.history.pushState(null, "", target.pathname + target.search);
     selectors(true);
     navigate();
+    // The link lived inside a drawer that is now closed. Move focus to the
+    // destination page heading so keyboard and screen reader users are not
+    // left on a hidden element.
+    const heading = $("#page-title");
+    if (heading) heading.focus();
   });
 
   // ---- Drawers -------------------------------------------------------------
@@ -914,22 +1122,37 @@
     if (main) main.inert = value;
     if (sidebar) sidebar.inert = value;
   }
-  function showFormError(form, message) {
+  function showFormError(form, message, source = "server") {
     let region = form.querySelector(".form-error");
     if (!region) { region = el("p", undefined, "form-error"); region.setAttribute("role", "alert"); form.append(region); }
     region.textContent = String(message || "The request could not be completed.");
+    region.dataset.source = source;
     region.hidden = false;
   }
   function clearFormError(form) {
     const region = form.querySelector(".form-error");
-    if (region) { region.textContent = ""; region.hidden = true; }
+    if (region) { region.textContent = ""; region.hidden = true; delete region.dataset.source; }
   }
-  function clearFormErrors() { $$(".form-error").forEach(region => { region.textContent = ""; region.hidden = true; }); }
+  function clearFormErrors() { $$(".form-error").forEach(region => { region.textContent = ""; region.hidden = true; delete region.dataset.source; }); }
+  // A form may refuse its own submission before any request is made. The
+  // message stays in the drawer and is never sent to the server.
+  function preSubmitError(form) {
+    if (form.id === "profile-form") return profileSubmitError();
+    if (form.id === "profile-delete-form") {
+      const name = String($("#profile-delete-name")?.value || "");
+      const reason = String($("#profile-delete-reason")?.value || "");
+      const confirmName = String($("#profile-delete-confirm")?.value || "");
+      return logic.profileDeleteValidation(name, { reason, confirmName }).message;
+    }
+    return "";
+  }
   function openDrawers() { return $$(".drawer").filter(drawer => !drawer.hidden); }
-  function openDrawer(drawer) {
+  function openDrawer(drawer, opener) {
     if (!drawer) return;
     closeDrawers(false);
-    drawerOpener = document.activeElement;
+    // The control that opened the drawer is remembered. A pointer click does
+    // not always move the focus, so the active element is only a fallback.
+    drawerOpener = opener && opener !== document.body ? opener : document.activeElement;
     $("#drawer-scrim").hidden = false;
     drawer.hidden = false;
     document.body.classList.add("drawer-open");
@@ -937,15 +1160,39 @@
     const first = drawer.querySelector("input:not([type='hidden']):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), a[href]");
     if (first) first.focus();
   }
+  // A control may only take the focus back when it is really there: it must be
+  // connected, visible, enabled and not buried inside a hidden ancestor. A
+  // drawer that was closed keeps its DOM, so its controls stay connected while
+  // they can no longer be focused.
+  function focusEligible(node) {
+    if (!node || node === document.body) return false;
+    if (node.isConnected === false) return false;
+    if (node.hidden) return false;
+    if (node.disabled) return false;
+    if (typeof node.closest === "function" && node.closest("[hidden]")) return false;
+    if (typeof node.getClientRects === "function" && node.getClientRects().length === 0) return false;
+    if (typeof node.focus !== "function") return false;
+    return true;
+  }
+  // The control that may take the focus back is the visible one of the very
+  // same observed resource. The first matching control in the document may
+  // belong to a hidden table or to another resource.
+  function resourceDetailsOpener(key) {
+    if (!key) return null;
+    return $$(`[data-resource-key]`).find(node => node.dataset.resourceKey === key && focusEligible(node)) || null;
+  }
   function restoreDrawerFocus(drawer) {
-    let target = drawerOpener;
-    if (!target || target === document.body || target.isConnected === false) {
+    let target = focusEligible(drawerOpener) ? drawerOpener : null;
+    if (!target && drawer?.id === "resource-details-drawer" && drawerResource) target = resourceDetailsOpener(drawerResource.key);
+    if (!target) {
       const kind = String(drawer?.id || "").replace(/-drawer$/, "");
-      target = kind ? $(`[data-open-drawer="${kind}"]`) : null;
-      if (!target) {
-        target = $("#page-title");
-        if (target && !target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
-      }
+      // The management control of the drawer, when it is visible. Another
+      // drawer never borrows the details control.
+      if (kind && kind !== "resource-details") target = $$(`[data-open-drawer="${kind}"]`).find(node => focusEligible(node)) || null;
+    }
+    if (!target) {
+      target = $("#page-title");
+      if (target && !target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
     }
     if (target && typeof target.focus === "function") target.focus();
     drawerOpener = null;
@@ -961,12 +1208,96 @@
     clearFormErrors();
     if (restore) restoreDrawerFocus(last);
     else drawerOpener = null;
+    // The closed details drawer no longer follows a resource.
+    if (last?.id === "resource-details-drawer") drawerResource = null;
   }
   function focusable(drawer) {
     return $$("a[href], button:not([disabled]), input:not([type='hidden']):not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])", drawer)
       .filter(node => !node.hidden && !node.closest("[hidden]") && (typeof node.getClientRects !== "function" || node.getClientRects().length > 0));
   }
-  function openProfileSummary(name) {
+  function openResourceDetails(resource, opener) {
+    const drawer = $("#resource-details-drawer");
+    drawerResource = {
+      key: resourceKey(resource),
+      kind: resource.kind || "",
+      namespace: resource.namespace || "",
+      name: resource.name || "",
+      uid: resource.uid || "",
+      last: resource
+    };
+    renderResourceDetails(resource, {});
+    openDrawer(drawer, opener);
+  }
+  // The body of the drawer is rebuilt from one observation. It never claims to
+  // be the latest observation while it shows an older one.
+  function renderResourceDetails(resource, options = {}) {
+    const name = resource.name || "Unnamed";
+    $("#resource-details-title").textContent = name;
+    const body = $("#resource-details-body"); body.replaceChildren();
+    if (options.replaced) {
+      body.append(el("p", "This resource was replaced by a new observation while the drawer was open. The values below are the new observation, not the one that was open.", "warning"));
+    }
+    if (options.gone) {
+      body.append(el("p", "This resource is no longer present in the latest observation. The values below are the last observation of it.", "warning"));
+    }
+    body.append(el("p", options.gone
+      ? `Observed ${resource.kind || "resource"} ${name}${resource.namespace ? ` in namespace ${resource.namespace}` : ""}.`
+      : `Observed ${resource.kind || "resource"} ${name}${resource.namespace ? ` in namespace ${resource.namespace}` : ""}. Every value below comes from this console's latest inventory observation.`));
+    const facts = el("dl", undefined, "detail-list");
+    [
+      ["Kind", resource.kind || "Not reported"],
+      ["Namespace", resource.namespace || "Cluster scoped"],
+      ["Owner", resource.owner || resource.details?.owner || "Not reported"],
+      ["Observed state", resource.state || "Not reported"]
+    ].forEach(([label, value]) => facts.append(el("dt", label), el("dd", value)));
+    body.append(facts);
+    // The projected details keep their original labels and values. They are
+    // written as text, never as markup.
+    const entries = detailEntries(resource);
+    if (entries.length) {
+      body.append(el("h3", "Observed details"));
+      const rows = el("div", undefined, "detail-rows");
+      entries.forEach(entry => rows.append(el("div", entry, "detail-row")));
+      body.append(rows);
+    } else {
+      body.append(el("p", "No additional projected details were observed for this resource.", "hint"));
+    }
+  }
+  // The observed resource behind the open drawer, if any.
+  function observedResource(identity) {
+    if (!identity) return null;
+    const resources = inventory?.resources || [];
+    return resources.find(resource =>
+      (resource.kind || "") === identity.kind &&
+      (resource.namespace || "") === identity.namespace &&
+      (resource.name || "") === identity.name) || null;
+  }
+  // A refreshed observation is never shown as the latest one while the drawer
+  // still holds an older body. The drawer follows the resource: it is updated
+  // in place, and a resource that is gone is reported instead of being hidden.
+  function syncResourceDetailsDrawer() {
+    const drawer = $("#resource-details-drawer");
+    if (!drawer || drawer.hidden || !drawerResource) return;
+    const found = observedResource(drawerResource);
+    if (!found) {
+      notify("warning", `The observed ${drawerResource.kind} ${drawerResource.name} is no longer present in the latest observation. The details drawer shows its last observation.`, "inventory");
+      renderResourceDetails(drawerResource.last || {}, { gone: true });
+      return;
+    }
+    const uid = found.uid || "";
+    const replaced = !!drawerResource.uid && !!uid && drawerResource.uid !== uid;
+    const active = document.activeElement;
+    const hadFocus = !!(active && drawer.contains(active));
+    renderResourceDetails(found, { replaced });
+    drawerResource.uid = uid;
+    drawerResource.last = found;
+    // The refresh never steals the focus from the open drawer.
+    if (hadFocus && (!active || active.isConnected === false)) {
+      const close = drawer.querySelector("button[data-close-drawer]") || drawer.querySelector("button");
+      if (close) close.focus();
+    }
+  }
+  function openProfileSummary(name, opener) {
     const drawer = $("#profile-summary-drawer");
     $("#profile-summary-title").textContent = name;
     const body = $("#profile-summary-body"); body.replaceChildren();
@@ -987,7 +1318,47 @@
       body.append(el("p", "No Notebook, Pod or persistent volume claim resources are currently observed in this profile namespace. Zero counts are omitted rather than inferred.", "hint"));
     }
     body.append(el("p", "Kubeflow pipeline runs are not integrated with this console. No pipeline count is shown and none is inferred from Pods.", "hint"));
-    openDrawer(drawer);
+    body.append(profileConfiguration(name));
+    // The management actions follow the observed configuration.
+    const actions = el("div", undefined, "drawer-actions");
+    const edit = el("button", "Edit profile", "secondary");
+    edit.type = "button";
+    edit.setAttribute("aria-label", "Edit the quota of profile " + name);
+    edit.addEventListener("click", () => openProfileUpdate(name));
+    actions.append(edit);
+    const profile = observedProfile(name);
+    if (profileDeletionAllowed(profile)) {
+      const remove = el("button", "Delete profile", "danger");
+      remove.type = "button";
+      remove.setAttribute("aria-label", "Delete profile " + name);
+      remove.addEventListener("click", () => openProfileDelete(profile));
+      actions.append(remove);
+    }
+    body.append(actions);
+    openDrawer(drawer, opener);
+  }
+  // Individual resources inside a namespace summary link to the scoped page
+  // that lists them, focused on the selected resource through the shared
+  // resource identity parameters. The identity is the canonical triple kind,
+  // namespace and name, so a claim never selects its volume. Kinds without a
+  // listing page stay plain text.
+  const resourceScopeTargets = {
+    Notebook: "/notebooks", StatefulSet: "/notebooks", Pod: "/pods",
+    PersistentVolumeClaim: "/storage", ResourceQuota: "/", Event: "/"
+  };
+  function resourceScopeCell(resource) {
+    const name = resource.name || "Unnamed";
+    const target = resourceScopeTargets[resource.kind];
+    if (!target || !resource.name) return el("span", name);
+    const url = new URL(target, location.origin);
+    if (resource.namespace) url.searchParams.set("namespace", resource.namespace);
+    url.searchParams.set("kind", resource.kind);
+    url.searchParams.set("resource", resource.name);
+    const link = el("a", name, "summary-resource");
+    link.href = url.pathname + url.search;
+    link.dataset.scopedLink = "1";
+    link.setAttribute("aria-label", `Open ${resource.kind} ${name}${resource.namespace ? " in namespace " + resource.namespace : ""}`);
+    return link;
   }
   function openNamespaceSummary(name) {
     const drawer = $("#namespace-summary-drawer");
@@ -1017,7 +1388,7 @@
       body.append(el("h3", "Scoped views"), list);
       groups.forEach(group => {
         body.append(el("h3", `${group.label} (${group.count})`));
-        simpleTable(body, ["Name", "State"], group.items.slice(0, 50).map(resource => [resource.name || "Unnamed", badge(resource.state)]));
+        simpleTable(body, ["Name", "State"], group.items.slice(0, 50).map(resource => [resourceScopeCell(resource), badge(resource.state)]));
         if (group.items.length > 50) body.append(el("p", `Showing first 50 of ${group.items.length} resources.`, "hint"));
       });
     }
@@ -1063,7 +1434,11 @@
     $("#pod-restart-target").textContent = `Target pod:${resource.namespace || "?"}/${resource.name || "?"}${owner ? ` · observed owner ${owner}` : ""}`;
     openDrawer($("#pod-restart-drawer"));
   }
-  $$("[data-open-drawer]").forEach(button => button.addEventListener("click", () => openDrawer($(`#${button.dataset.openDrawer}-drawer`))));
+  $$("[data-open-drawer]").forEach(button => button.addEventListener("click", () => {
+    // The Profile management drawer always starts from a clean create form.
+    if (button.dataset.openDrawer === "profile") openProfileCreate();
+    openDrawer($(`#${button.dataset.openDrawer}-drawer`));
+  }));
   $$("[data-close-drawer]").forEach(button => button.addEventListener("click", () => closeDrawers(true)));
   $("#drawer-scrim").addEventListener("click", () => closeDrawers(true));
   document.addEventListener("keydown", event => {
@@ -1115,7 +1490,17 @@
       if (namespaceContext && (applyFilter || !select.value)) select.value = namespaceContext;
     });
     if (applyFilter) { $("#mount-rows").replaceChildren(); $("#replace-mounts").checked = false; }
-    $("#profile-names").replaceChildren(...resources.filter(resource => resource.kind === "Profile").map(resource => new Option(resource.name, resource.name)));
+    // The Profile selector is refreshed from the observation, but the current
+    // selection and every prefilled value are left untouched: an inventory
+    // refresh never edits what the administrator typed or selected.
+    const updateSelect = $("#profile-update-name");
+    if (updateSelect) {
+      const names = observedProfiles().map(resource => resource.name).sort(logic.naturalCompare);
+      const current = String(updateSelect.value || "");
+      updateSelect.replaceChildren(new Option("Select a profile", ""));
+      for (const name of names) updateSelect.append(new Option(name, name));
+      if (names.includes(current)) updateSelect.value = current;
+    }
     $("#claim-names").replaceChildren(...resources.filter(resource => resource.kind === "PersistentVolumeClaim" && (!namespaceContext || resource.namespace === namespaceContext)).map(resource => new Option(resource.name, resource.name)));
     fillSelect($("#pv-selector"), resources.filter(resource => resource.kind === "PersistentVolume" && resource.state === "Available" && !resource.details?.claim && resource.details?.reclaimPolicy === "Retain").map(resource => resource.name), "Select an available Retain PV");
     notebookOptions();
@@ -1149,7 +1534,258 @@
     $("#container-selector").required = edit;
     mountFields();
   }
-  function profileFields() { const owner = $('#profile-form [name="owner"]'); owner.disabled = $("#profile-kind").value !== "profile.create"; owner.required = !owner.disabled; }
+  // ---- Profile management ---------------------------------------------------
+  // The owner of an existing Profile is read-only: the installed Profile
+  // controller cannot transfer it. An update therefore submits the exact
+  // observed owner and the observed configuration precondition unchanged, and
+  // changes only the quota values.
+  let profileSnapshot = null;
+  function observedProfiles() {
+    return (inventory?.resources || []).filter(resource => resource.kind === "Profile" && resource.name);
+  }
+  function observedProfile(name) {
+    return observedProfiles().find(resource => resource.name === name) || null;
+  }
+  function profileQuotaInputs() { return $$('[data-profile-quota]'); }
+  function profileExtraQuotaInputs() { return $$('[data-profile-quota-extra]'); }
+  // Every mode change starts from an empty Profile state: an owner, a quota
+  // or a digest of a previous selection never bleeds into the next one.
+  function clearProfileState() {
+    const owner = $("#profile-update-owner"); if (owner) owner.value = "";
+    const digest = $("#profile-update-digest"); if (digest) digest.value = "";
+    const extra = $("#profile-extra-quota-fields"); if (extra) extra.replaceChildren();
+    const summary = $("#profile-update-extra"); if (summary) summary.replaceChildren();
+    for (const input of profileQuotaInputs()) { input.value = ""; input.required = false; }
+    profileSnapshot = null;
+  }
+  function profileFields() {
+    const kind = $("#profile-kind")?.value || "profile.create";
+    const update = kind === "profile.update";
+    const createFields = $("#profile-create-fields"), updateFields = $("#profile-update-fields");
+    if (createFields) createFields.hidden = update;
+    if (updateFields) updateFields.hidden = !update;
+    const createName = $("#profile-create-name"), updateName = $("#profile-update-name");
+    const createOwner = $("#profile-create-owner"), updateOwner = $("#profile-update-owner"), digest = $("#profile-update-digest");
+    if (createName) { createName.disabled = update; createName.required = !update; }
+    if (updateName) { updateName.disabled = !update; updateName.required = update; }
+    if (createOwner) { createOwner.disabled = update; createOwner.required = !update; }
+    if (updateOwner) { updateOwner.disabled = !update; updateOwner.readOnly = true; }
+    if (digest) digest.disabled = !update;
+    clearProfileState();
+    if (update) applyProfileSelection();
+    else validateProfileName();
+  }
+  // Load the selected Profile: the observed owner, the observed quota and the
+  // observed configuration precondition. The values are read once, at
+  // selection time, and the request is checked against them before it is sent.
+  function applyProfileSelection() {
+    const select = $("#profile-update-name");
+    const name = select ? String(select.value || "") : "";
+    clearProfileState();
+    if (!name) return;
+    const profile = observedProfile(name);
+    if (!profile) return;
+    const values = logic.profileFormValues(profile);
+    const quota = logic.profileQuotaValues(profile);
+    const owner = $("#profile-update-owner");
+    if (owner) owner.value = values.owner || "";
+    const digest = $("#profile-update-digest");
+    if (digest) digest.value = values.baseConfigDigest || "";
+    const managed = new Set();
+    for (const input of profileQuotaInputs()) {
+      const key = input.dataset.profileQuota;
+      managed.add(key);
+      const value = quota[key];
+      input.value = value === undefined ? "" : value;
+      // An existing managed key may not be omitted: the server rejects a removal.
+      input.required = value !== undefined && value !== "";
+    }
+    // Observed quota keys this console does not manage are returned unchanged.
+    const extra = Object.entries(quota).filter(([key]) => !managed.has(key));
+    const host = $("#profile-extra-quota-fields");
+    if (host) {
+      host.replaceChildren();
+      if (extra.length) {
+        const list = el("div", undefined, "quota-readonly");
+        list.append(el("p", "Observed quota keys this console does not manage are returned unchanged and are not editable:", "hint"));
+        for (const [key, value] of extra) {
+          const row = el("div", undefined, "quota-readonly-row");
+          row.append(el("code", key), el("span", value));
+          const hidden = el("input");
+          hidden.type = "hidden"; hidden.name = "quota." + key; hidden.value = value;
+          hidden.dataset.profileQuotaExtra = key;
+          row.append(hidden);
+          list.append(row);
+        }
+        host.append(list);
+      }
+    }
+    profileSnapshot = { name, owner: values.owner || "", digest: values.baseConfigDigest || "", quota, uid: profile.uid || "" };
+  }
+  // The typed name is validated against every observed Profile and namespace.
+  // A replacement is only offered as a suggestion and is never applied
+  // automatically.
+  function validateProfileName() {
+    const input = $("#profile-create-name");
+    const message = $("#profile-name-message");
+    const suggestion = $("#profile-name-suggestion");
+    const suggestionText = $("#profile-name-suggestion-text");
+    if (!input) return null;
+    const value = String(input.value || "");
+    const result = logic.profileNameValidation(value, inventory?.resources || []);
+    input.title = result.valid ? "" : result.message;
+    input.setCustomValidity?.(result.valid ? "" : result.message);
+    if (message) message.textContent = value && !result.valid ? result.message : "";
+    if (suggestion && suggestionText) {
+      if (result.suggestion) {
+        suggestion.hidden = false;
+        suggestionText.textContent = `Suggested name: ${result.suggestion}`;
+        input.setAttribute("aria-describedby", "profile-name-hint profile-name-message profile-name-suggestion-text");
+      } else {
+        suggestion.hidden = true;
+        suggestionText.textContent = "";
+        input.setAttribute("aria-describedby", "profile-name-hint profile-name-message");
+      }
+    }
+    return result;
+  }
+  // A quota update is refused when nothing would change: the server refuses a
+  // no-op as well, and the console never sends a pointless request.
+  function profileQuotaChanged(observed) {
+    const current = {};
+    for (const input of profileQuotaInputs()) {
+      const value = String(input.value || "").trim();
+      if (value) current[input.dataset.profileQuota] = value;
+    }
+    for (const input of profileExtraQuotaInputs()) current[input.dataset.profileQuotaExtra] = String(input.value || "");
+    const keys = new Set([...Object.keys(observed || {}), ...Object.keys(current)]);
+    for (const key of keys) if (String((observed || {})[key] ?? "") !== String(current[key] ?? "")) return true;
+    return false;
+  }
+  // Everything that must hold before a Profile request is sent. A read-only
+  // field is a convenience, not a guarantee: the server revalidates the same
+  // values.
+  function profileSubmitError() {
+    const kind = $("#profile-kind")?.value || "profile.create";
+    if (kind === "profile.update") {
+      const snapshot = profileSnapshot;
+      if (!snapshot) return "Select the Profile to update.";
+      const name = String($("#profile-update-name")?.value || "");
+      const owner = String($("#profile-update-owner")?.value || "");
+      const digest = String($("#profile-update-digest")?.value || "");
+      if (!owner) return "The observed owner is missing. Refresh the inventory and select the Profile again.";
+      if (!digest) return "The observed configuration precondition is missing. Refresh the inventory and select the Profile again.";
+      if (name !== snapshot.name || owner !== snapshot.owner || digest !== snapshot.digest) {
+        return "This form no longer matches the observed Profile. Select the Profile again to load its current owner and quota.";
+      }
+      // The form was filled from one observation. If the latest observation of
+      // the same Profile is a different one, the request would only be
+      // refused by the server. The typed values and the precondition are kept
+      // exactly as they are; the administrator is asked to reselect.
+      const current = observedProfile(snapshot.name);
+      const currentDigest = String(current?.details?.configDigest ?? "");
+      const currentOwner = String(current?.owner ?? "") || String(current?.details?.owner ?? "");
+      const replaced = !!(snapshot.uid && current?.uid && snapshot.uid !== current.uid);
+      if (!current || currentDigest !== snapshot.digest || currentOwner !== snapshot.owner || replaced) {
+        return "Reselect or reopen the Profile to review the current configuration; your edits were not applied.";
+      }
+      for (const input of profileQuotaInputs()) {
+        if (input.required && !String(input.value || "").trim()) {
+          return `The quota key ${input.dataset.profileQuota} is already set on this Profile. Keep its current value: removing a quota key is unsupported.`;
+        }
+      }
+      if (!profileQuotaChanged(snapshot.quota)) return "Nothing would change: the quota values are identical to the observed Profile quota.";
+      return "";
+    }
+    const name = String($("#profile-create-name")?.value || "");
+    const result = logic.profileNameValidation(name, inventory?.resources || []);
+    if (!result.valid) return result.message;
+    if (!String($("#profile-create-owner")?.value || "").trim()) return "Enter the email address registered with your identity provider.";
+    return "";
+  }
+  function profileDeletionAllowed(profile) {
+    if (!profileDeletionFeature) return false;
+    if (!profile || !profile.name) return false;
+    // A protected Profile is never deletable from this console.
+    return String(profile.state || "") !== "Protected";
+  }
+  function openProfileCreate() {
+    const kind = $("#profile-kind");
+    if (kind) kind.value = "profile.create";
+    profileFields();
+  }
+  function openProfileUpdate(name) {
+    const profile = observedProfile(name);
+    if (!profile) {
+      notify("error", "That Profile is not observed any more. Refresh the inventory and try again.", "action", { persist: false });
+      return;
+    }
+    const kind = $("#profile-kind");
+    if (kind) kind.value = "profile.update";
+    profileFields();
+    const select = $("#profile-update-name");
+    if (select) select.value = name;
+    applyProfileSelection();
+    openDrawer($("#profile-drawer"));
+  }
+  function openProfileDelete(profile) {
+    if (!profileDeletionAllowed(profile)) return;
+    const name = profile?.name || "";
+    const title = $("#profile-delete-title");
+    if (title) title.textContent = "Delete " + name;
+    const target = $("#profile-delete-target");
+    if (target) target.textContent = `Deleting the Profile ${name} also deletes the namespace ${name} and everything inside it.`;
+    const hidden = $("#profile-delete-name"); if (hidden) hidden.value = name;
+    const reason = $("#profile-delete-reason"); if (reason) reason.value = "";
+    const confirm = $("#profile-delete-confirm"); if (confirm) confirm.value = "";
+    openDrawer($("#profile-delete-drawer"));
+  }
+  async function copyOwnerEmail(value, button) {
+    const text = String(value || "");
+    try {
+      if (typeof navigator === "undefined" || !navigator.clipboard || !navigator.clipboard.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      button.textContent = "Copied";
+    } catch {
+      button.textContent = "Copy failed";
+    }
+    setTimeout(() => { button.textContent = "Copy"; }, 2000);
+  }
+  // The observed Profile configuration, shown under the scoped views of the
+  // Profile summary. Only projected values are rendered.
+  function profileConfiguration(name) {
+    const profile = observedProfile(name);
+    const details = profile?.details || {};
+    const section = el("section", undefined, "profile-configuration");
+    section.append(el("h3", "Profile configuration"));
+    const facts = el("dl", undefined, "detail-list");
+    facts.append(el("dt", "API version"), el("dd", details.apiVersion || "Not reported"));
+    const owner = profile?.owner || details.owner || "";
+    const ownerValue = el("dd");
+    ownerValue.append(el("span", owner || "Not reported"));
+    if (owner) {
+      const copy = el("button", "Copy", "secondary small");
+      copy.type = "button";
+      copy.setAttribute("aria-label", "Copy the owner email " + owner);
+      copy.addEventListener("click", () => copyOwnerEmail(owner, copy));
+      ownerValue.append(copy);
+    }
+    facts.append(el("dt", "Owner"), ownerValue);
+    const quota = logic.profileQuotaValues(profile);
+    const quotaValue = el("dd");
+    if (Object.keys(quota).length) {
+      const list = el("ul", undefined, "quota-list");
+      for (const [key, value] of Object.entries(quota)) {
+        const item = el("li");
+        item.append(el("code", key), el("span", value));
+        list.append(item);
+      }
+      quotaValue.append(list);
+    } else quotaValue.textContent = "No resource quota is observed for this Profile.";
+    facts.append(el("dt", "resourceQuotaSpec"), quotaValue);
+    section.append(facts);
+    return section;
+  }
   function mountFields() { const enabled = $("#notebook-kind").value === "notebook.edit" && $("#replace-mounts").checked; $$("#mount-rows input,#mount-rows select").forEach(input => { input.disabled = !enabled; }); }
   // A new static PV has its own name, separate from the new PVC name. The
   // existing-PV selector is intentionally only enabled for reservations.
@@ -1167,8 +1803,20 @@
     const readOnly = el("input"); readOnly.type = "checkbox"; readOnly.dataset.field = "readOnly"; const label = el("label", undefined, "check"); label.append(readOnly, document.createTextNode("Read only")); row.append(label);
     const remove = el("button", "Remove mount", "secondary"); remove.type = "button"; remove.addEventListener("click", () => row.remove()); row.append(remove); $("#mount-rows").append(row); $("#replace-mounts").checked = true; mountFields();
   }
+  // The Profile form keeps one control for a new name and another for an
+  // existing Profile, and one editable owner and one read-only owner. The
+  // action field names are restored before the payload is built, so a request
+  // only ever carries the typed action fields of the active mode.
+  const formFieldNames = {
+    profileCreateName: "name", profileTarget: "name",
+    profileCreateOwner: "owner", profileOwner: "owner",
+    profileBaseConfigDigest: "baseConfigDigest"
+  };
+  function actionEntries(form) {
+    return [...new FormData(form)].map(([name, value]) => [formFieldNames[name] || name, value]);
+  }
   function actionFrom(form) {
-    return logic.buildAction(new FormData(form), {
+    return logic.buildAction(actionEntries(form), {
       restart: !!$('[name="restart"]', form)?.checked,
       force: !!$('[name="force"]', form)?.checked,
       replaceMounts: form.id === "notebook-form" && $("#replace-mounts").checked,
@@ -1220,6 +1868,14 @@
     if (button.disabled) return;
     button.disabled = true;
     clearFormError(form);
+    // A refused submission never reaches the server and never prepares a plan.
+    const refused = preSubmitError(form);
+    if (refused) {
+      showFormError(form, refused, "validation");
+      button.disabled = false;
+      notify("error", refused, "action", { persist: false });
+      return;
+    }
     try {
       const plan = await api("plans", actionFrom(form));
       clearFormError(form);
@@ -1272,6 +1928,18 @@
   $("#storage-kind").addEventListener("change", storageFields);
   $("#notebook-kind").addEventListener("change", notebookFields);
   $("#profile-kind").addEventListener("change", profileFields);
+  // The typed name is validated as it is typed. The suggestion is only
+  // applied when the administrator asks for it.
+  $("#profile-create-name")?.addEventListener("input", () => validateProfileName());
+  $("#profile-use-suggestion")?.addEventListener("click", () => {
+    const input = $("#profile-create-name");
+    const result = validateProfileName();
+    if (!input || !result || !result.suggestion) return;
+    input.value = result.suggestion;
+    validateProfileName();
+    input.focus();
+  });
+  $("#profile-update-name")?.addEventListener("change", () => applyProfileSelection());
   $("#storage-template").addEventListener("change", () => { const option = $("#storage-template").selectedOptions[0]; if (option?.dataset.class) $("#storage-class").value = option.dataset.class; storageFields(); });
   $("#pv-selector").addEventListener("change", () => { const volume = (inventory?.resources || []).find(resource => resource.kind === "PersistentVolume" && resource.name === $("#pv-selector").value); if (volume) $("#storage-class").value = volume.details?.storageClass || ""; });
   $('#notebook-form [name="namespace"]').addEventListener("change", () => { notebookOptions(); $("#mount-rows").replaceChildren(); $("#replace-mounts").checked = false; });

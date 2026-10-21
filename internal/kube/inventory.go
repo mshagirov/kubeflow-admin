@@ -27,7 +27,7 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 	}
 	for _, p := range ps.Items {
 		o, _, _ := unstructured.NestedString(p.Object, "spec", "owner", "name")
-		r := model.Resource{Kind: "Profile", Name: p.GetName(), UID: string(p.GetUID()), Owner: o}
+		r := model.Resource{Kind: "Profile", Name: p.GetName(), UID: string(p.GetUID()), Owner: o, Details: profileDetails(&p)}
 		if s.namespacePolicy(p.GetName()) != nil {
 			r.State = "Protected"
 		}
@@ -236,6 +236,67 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 	}
 	out.Warnings = []string{"Filesystem usage and storage-backend capacity are not available from Kubernetes inventory.", "Notebook CR dry-run does not validate controller-generated Pod admission or scheduling."}
 	return out, nil
+}
+
+// profileDetails projects the safe, editable facts of a Profile: the API
+// contract it was served with, the owner kind, its identity metadata and its
+// declared hard quota quantities. It never projects the Profile manifest, a
+// credential or an arbitrary text value.
+func profileDetails(p *unstructured.Unstructured) map[string]string {
+	details := map[string]string{}
+	if v := p.GetAPIVersion(); v != "" {
+		details["apiVersion"] = v
+	}
+	if kind, _, _ := unstructured.NestedString(p.Object, "spec", "owner", "kind"); kind != "" {
+		details["ownerKind"] = kind
+	}
+	if created := p.GetCreationTimestamp(); !created.IsZero() {
+		details["createdAt"] = created.UTC().Format(time.RFC3339)
+	}
+	if rv := p.GetResourceVersion(); rv != "" {
+		details["resourceVersion"] = rv
+	}
+	hard, _, _ := unstructured.NestedMap(p.Object, "spec", "resourceQuotaSpec", "hard")
+	for k, v := range hard {
+		key, ok := safeQuotaKey(k)
+		if !ok {
+			continue
+		}
+		quantity, ok := safeQuantity(v)
+		if !ok {
+			continue
+		}
+		details["quota."+key] = quantity
+	}
+	// The canonical configuration digest is the precondition a quota update is
+	// based on. It binds the Profile name/UID, owner and declared quota, so
+	// it is stable across resource version and metadata churn and changes
+	// when the target identity, owner or declared quota changes.
+	details["configDigest"] = profileConfigDigest(p)
+	return details
+}
+
+// safeQuotaKey accepts only the conservative resource key grammar used by
+// Kubernetes quotas. An unexpected key shape is never projected.
+func safeQuotaKey(k string) (string, bool) {
+	if k == "" || len(k) > 253 {
+		return "", false
+	}
+	for _, r := range k {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '.' || r == '-' || r == '/') {
+			return "", false
+		}
+	}
+	return k, true
+}
+
+// safeQuantity projects only a parsed Kubernetes quantity. The official
+// Profile CRD declares the hard map as int-or-string, so an unquoted integer
+// is a valid declared value and is projected as its quantity text. A value
+// that is not a declared quantity is never projected: it could carry
+// arbitrary text.
+func safeQuantity(v any) (string, bool) {
+	return canonicalQuantity(v)
 }
 
 // nodeReady reports the NodeReady condition exactly; a missing condition is not

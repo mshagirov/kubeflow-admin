@@ -45,6 +45,20 @@ features:
   pvcExpansion: false
   podRestarts: false
   nodeCordon: false
+  # Separate opt-in for Profile deletion. It is never implied by
+  # writesEnabled: both must be true before the API accepts a delete
+  # request, and the console only offers the capability when writes are
+  # enabled. This flag grants no Kubernetes permission; the reviewed RBAC
+  # grant is installed separately by the operator.
+  profileDeletion: false
+ui:
+  # Optional footer of the console. Empty by default: the console renders no
+  # footer at all. The value may be plain text or a small amount of HTML for
+  # branding (a company logo, a link to the support portal): it is sanitized
+  # against a strict allowlist before it is rendered, and unsafe markup is
+  # removed. Keep it within 16384 characters. Config is read at startup, so
+  # changing it needs a rollout restart.
+  footerText: ''
 history:
   retentionDays: 90
   maxAuditRecords: 50000

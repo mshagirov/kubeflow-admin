@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -28,6 +29,103 @@ func TestDashboardRoutesAndFeatureProjection(t *testing.T) {
 			if !strings.Contains(response.Body.String(), `name="notification-scope"`) || !strings.Contains(response.Body.String(), `name="pod-restarts"`) {
 				t.Fatal("missing safe UI feature/session projections")
 			}
+		}
+	}
+}
+
+func TestProfileDeletionFeatureProjection(t *testing.T) {
+	s, _, _ := fixture()
+	identity, ok := s.identity(context.Background())
+	if !ok {
+		t.Fatal("fixture identity missing")
+	}
+	for _, enabled := range []bool{false, true} {
+		s.cfg.Features.ProfileDeletion = enabled
+		s.cfg.Features.WritesEnabled = true
+		view := buildPageView(identity, s.cfg)
+		if view.Config.Features.ProfileDeletion != enabled {
+			t.Fatalf("deletion projection=%v for enabled=%v", view.Config.Features.ProfileDeletion, enabled)
+		}
+		// The capability is never projected while writes are disabled, even
+		// when the separate deletion opt-in is set.
+		s.cfg.Features.WritesEnabled = false
+		if view = buildPageView(identity, s.cfg); view.Config.Features.ProfileDeletion {
+			t.Fatal("deletion capability projected while writes are disabled")
+		}
+		s.cfg.Features.WritesEnabled = true
+	}
+	// The projection is a boolean capability only: it must not carry the rest
+	// of the configuration into the browser.
+	view := buildPageView(identity, s.cfg)
+	if view.Config.Storage.AllowedStorageClasses != nil || len(view.Config.Notebooks.AllowedImages) != 0 {
+		t.Fatal("page view carries unexpected configuration")
+	}
+}
+
+func TestProfileDeletionMetaProjection(t *testing.T) {
+	s, _, _ := fixture()
+	// The enabled capability must be projected as true in the template.
+	s.cfg.Features.ProfileDeletion = true
+	s.cfg.Features.WritesEnabled = true
+	body := request(handler(s), "GET", "/", "").Body.String()
+	if !strings.Contains(body, `name="profile-deletion" content="true"`) {
+		t.Fatal("enabled deletion capability was not projected")
+	}
+	// A disabled capability is never projected as true, whether the template
+	// renders the flag unconditionally or omits it.
+	for _, writes := range []bool{true, false} {
+		s.cfg.Features.ProfileDeletion = false
+		s.cfg.Features.WritesEnabled = writes
+		body = request(handler(s), "GET", "/", "").Body.String()
+		if strings.Contains(body, `name="profile-deletion" content="true"`) {
+			t.Fatalf("deletion capability projected while disabled (writes=%v)", writes)
+		}
+	}
+	// With writes disabled the capability must not be projected even when the
+	// deletion opt-in is enabled.
+	s.cfg.Features.ProfileDeletion = true
+	s.cfg.Features.WritesEnabled = false
+	body = request(handler(s), "GET", "/", "").Body.String()
+	if strings.Contains(body, `name="profile-deletion" content="true"`) {
+		t.Fatal("deletion capability projected while writes are disabled")
+	}
+}
+
+func TestProfileDeletionAPIGate(t *testing.T) {
+	s, _, o := fixture()
+	h := handler(s)
+	body := `{"kind":"profile.delete","name":"team","reason":"disposable pilot cleanup","confirmName":"team"}`
+	// Flag off: refused before any plan is created.
+	s.cfg.Features.ProfileDeletion = false
+	if w := request(h, "POST", "/api/v1/plans", body); w.Code != 403 {
+		t.Fatalf("deletion without the opt-in must be refused: %d", w.Code)
+	}
+	if o.plans != 0 {
+		t.Fatalf("refused deletion reached the plan manager: %d", o.plans)
+	}
+	// Flag on, writes off: refused by the generic writes gate.
+	s.cfg.Features.ProfileDeletion = true
+	s.cfg.Features.WritesEnabled = false
+	if w := request(h, "POST", "/api/v1/plans", body); w.Code != 403 {
+		t.Fatalf("deletion with writes disabled must be refused: %d", w.Code)
+	}
+	if o.plans != 0 {
+		t.Fatalf("refused deletion reached the plan manager: %d", o.plans)
+	}
+	// Flag on and writes on: the typed action reaches the plan manager with
+	// the typed confirmation intact.
+	s.cfg.Features.WritesEnabled = true
+	if w := request(h, "POST", "/api/v1/plans", body); w.Code != 201 {
+		t.Fatalf("gated deletion was not accepted: %d %s", w.Code, w.Body.String())
+	}
+	if o.plans != 1 || o.action.Kind != "profile.delete" || o.action.ConfirmName != "team" {
+		t.Fatalf("typed confirmation did not reach the manager: %+v", o.action)
+	}
+	// No arbitrary delete endpoint exists: deletion is only reachable through
+	// the typed plan/operation pipeline with the reviewed opt-in.
+	for _, path := range []string{"/api/v1/delete", "/api/v1/profiles/delete", "/api/v1/namespaces/delete"} {
+		if w := request(h, "POST", path, body); w.Code != 404 {
+			t.Fatalf("unexpected delete route %s: %d", path, w.Code)
 		}
 	}
 }

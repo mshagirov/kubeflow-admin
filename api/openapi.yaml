@@ -12,6 +12,19 @@ info:
     Kubernetes manifests, proxy, unrestricted deletion or operation replay endpoints exist.
     The separately gated pod.restart action performs normal PDB-aware eviction
     of a validated Notebook-managed Pod only; no forced deletion is supported.
+    The separately gated profile.delete action requests deletion of one existing
+    Profile and delegates the normal cleanup to the installed Profile
+    controller and Kubernetes garbage collection: it deletes no namespace
+    directly and never deletes a PersistentVolume itself. PVC cascade inside
+    the owned namespace still applies the StorageClass reclaim policy, so a
+    Delete-policy class can delete the backing volume and its data through the
+    normal Kubernetes path.
+    Profile ownership is immutable in the installed Profile controller, so
+    profile.update changes quotas only and refuses an owner transfer as an
+    unsupported contract; owner migration and custom owner controllers are a
+    separate future workflow.
+    The API exposes no HTTP DELETE method: a destructive action is submitted as
+    a typed plan and a typed operation, never as a direct resource delete.
     This describes the implemented subset, not all routes from design plans.
 servers:
   - url: /
@@ -348,11 +361,79 @@ components:
       properties:
         kind:
           type: string
-          enum: [profile.create, profile.quota.change, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, notebook.start, notebook.stop, notebook.edit, pod.restart, node.cordon, node.uncordon]
+          description: >-
+            Server-typed action kind. profile.update changes the quota of one
+            existing Profile in place. The owner identity is immutable: the
+            requested owner must equal the current owner exactly, and an owner
+            transfer is refused as an unsupported contract instead of being
+            applied as a broken write. profile.update also requires
+            baseConfigDigest, the identity-bound canonical digest of the
+            reviewed Profile name, UID, owner and quota hard map, so a stale prefill cannot overwrite a concurrent
+            quota change; operator-managed quota keys the adapter does not
+            manage are preserved verbatim. The deprecated profile.quota.change
+            alias requires the same unchanged owner and baseConfigDigest;
+            unguarded requests from older clients are refused and must be
+            rebuilt after reloading the console. profile.delete requests deletion of
+            one existing Profile and requires both a nonempty reason and a
+            confirmName that equals the target Profile name exactly: deletion
+            uses background propagation, matching kubectl, the console issues
+            no Namespace DELETE, and the installed Profile controller and
+            Kubernetes garbage collection perform the normal cleanup. The
+            console never deletes a PersistentVolume itself. PVC cascade inside
+            the owned namespace still applies the bound PV reclaim policy,
+            so a Delete-policy PV can delete the backing volume and its
+            data. The action succeeds only when the Profile and its owned
+            namespace are both observed gone; a replacement object or a read
+            error is not gone. profile.delete additionally requires the
+            separately reviewed profile-deletion opt-in on the server.
+          enum: [profile.create, profile.quota.change, profile.update, profile.delete, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, notebook.start, notebook.stop, notebook.edit, pod.restart, node.cordon, node.uncordon]
         namespace: {type: string}
-        name: {type: string}
-        reason: {type: string, maxLength: 500, description: 'Administrator input only; required and nonblank for pod.restart, node.cordon, and node.uncordon'}
-        owner: {type: string, description: 'Exact Kubeflow owner identity, not an LDAP account creation'}
+        name:
+          type: string
+          description: >-
+            Target object name. For profile.create it must be a DNS-1123 label
+            of at most 63 characters and must be unique at creation time: an
+            existing Profile or Namespace with that name is refused and never
+            adopted. For profile.update and profile.delete it is the exact
+            existing Profile name.
+        reason:
+          type: string
+          maxLength: 500
+          description: 'Administrator input only; required and nonblank for pod.restart, node.cordon, node.uncordon, and profile.delete'
+        confirmName:
+          type: string
+          maxLength: 63
+          description: >-
+            Raw exact target name typed back by the administrator as a second
+            confirmation: the value is compared to the target Profile name
+            exactly, without trimming or case folding. Required for
+            profile.delete, which also requires a nonempty reason; ignored by
+            every other kind.
+        baseConfigDigest:
+          type: string
+          description: >-
+            Canonical digest of the reviewed Profile name, UID, owner and quota hard map,
+            taken from the console's own Profile observation
+            (details.configDigest) and echoed back unchanged. Required for
+            profile.update and profile.quota.change: the server recomputes it at prepare time and
+            refuses the request when it no longer matches, so a stale
+            inventory prefill cannot overwrite a concurrent quota change.
+            Unrelated metadata and resourceVersion churn do not change it. Replacing
+            the Profile under the same name does change it. The value is
+            never user-editable and is never displayed as an editable field.
+        owner:
+          type: string
+          description: >-
+            Exact Kubeflow owner identity, not an LDAP account creation.
+            profile.create requires an email-formatted value, and the check is
+            syntax only: the console performs no identity-provider or LDAP
+            registration lookup, so a well-formed address may still be
+            unregistered. profile.update and profile.quota.change never change the owner: the requested
+            value must equal the current owner exactly, and a legacy Profile
+            whose owner is a configured username is accepted while that owner
+            is left unmodified. Any difference is refused as an unsupported
+            contract; owner transfer, owner migration and custom owner
+            controllers are a separate future workflow.
         quota: {type: object, additionalProperties: {type: string}}
         storageClass: {type: string}
         size: {type: string, description: Kubernetes storage quantity}
@@ -427,9 +508,10 @@ components:
         historyExpired: {type: boolean, description: Compact idempotency record retained after history expiration}
         target: {type: string}
         action: {type: string}
-        state: {type: string, description: Durable state; incomplete recovery becomes needs-review}
+        state: {type: string, description: Durable state; incomplete recovery becomes needs-review; an offline reconciliation of an uncertain profile.delete derives a terminal state and records it in the audit}
         step: {type: string}
         error: {type: string}
+        profileDeleteCheckpointed: {type: boolean, description: 'True once the durable checkpoint that precedes the single Profile delete request was persisted, so a delete request may have been issued. Always present, and never cleared.'}
         createdAt: {type: string, format: date-time}
         updatedAt: {type: string, format: date-time}
     Audit:
@@ -457,7 +539,15 @@ components:
         owner: {type: string}
         state: {type: string}
         desired: {type: string}
-        details: {type: object, additionalProperties: {type: string}}
+        details:
+          type: object
+          additionalProperties: {type: string}
+          description: >-
+            Safe projected facts of the observed resource. A Profile carries
+            its owner kind, its quota hard map and a configDigest: the
+            canonical digest of the Profile name, UID, owner and hard map that a
+            profile.update request echoes back unchanged as baseConfigDigest.
+            No manifest, credential or arbitrary text value is projected.
     Inventory:
       type: object
       required: [observedAt, resources]

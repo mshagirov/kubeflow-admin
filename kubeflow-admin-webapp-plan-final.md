@@ -4,6 +4,16 @@
 
 This file consolidates and supersedes the earlier draft plans (v1–v3). It is a delivery contract, not evidence that live acceptance tests have passed. Build/test evidence and remaining site configuration are in [docs/verification.md](docs/verification.md).
 
+**Scope amendment (21 October 2026):** the operator requested a separately
+opt-in, typed Profile deletion workflow with normal controller/garbage-collection
+namespace cleanup. This is the only direct object-deletion exception below;
+it grants no Namespace/PV/PVC delete permission and never removes finalizers.
+Success requires both the Profile and namespace to be absent. PVC cleanup can
+destroy Delete-policy storage; retained/external data may remain. Owner transfer
+is still unsupported by the upstream controller; the operator approved a
+read-only owner with prefilled, stale-configuration-checked quota editing.
+See [workflow acceptance](docs/ui-workflow-acceptance.md) for the current contract.
+
 **Delivery status (15 October 2026):** implemented and built. Agents used OpenCode subagent sessions on `openai/gpt-6.1-sol` at default thinking level, as requested. All seven work packages in section 5 are complete: the application compiles, all tests pass (including `-race`), `govulncheck` is clean, the Linux amd64 binary and container image build, and all manifest variants render. The operator still performs deployment and live acceptance; nothing was applied to the cluster.
 
 ## 1. Review and resolved conflicts
@@ -13,7 +23,7 @@ This file consolidates and supersedes the earlier draft plans (v1–v3). It is a
 | Trust `X-Auth-Request-Email` or `kubeflow-userid` | Direct OIDC verification with a dedicated Dex client. Ignore identity headers. No insecure development login or automatic proxy fallback. |
 | `kubeflow.org/notebook-stopped: true` in v1 | Incorrect controller contract. Use `kubeflow-resource-stopped` with RFC3339 timestamp to stop; remove the key to start. Enable only after controller contract confirmation. |
 | Strategic merge patch for Notebook CRDs; replace container index 0 | UID/resourceVersion conditional JSON patches; select containers by name and retain sidecars, unknown fields, env, probes, other resources and volumes. |
-| CRUD/delete/owner transfer and broad namespace/Pod writes | No deletion, owner transfer, raw YAML, exec, arbitrary mounts, RBAC writes, Secret reads, impersonation, or direct StatefulSet scaling. |
+| CRUD/delete/owner transfer and broad namespace/Pod writes | Only separately gated, reviewed Profile deletion (21 October amendment); no owner transfer, arbitrary deletion, raw YAML, exec, arbitrary mounts, RBAC writes, Secret reads, impersonation, or direct StatefulSet scaling. |
 | Stateless app or optional audit | Kubernetes remains authoritative; SQLite persists login/session state, previews, operations and audit. Database failure blocks writes. |
 | Browser stores ID/refresh tokens | Opaque host-only Secure/HttpOnly session cookie; only hashed session identifiers persisted. No raw access/ID/refresh tokens stored. |
 | CDN frontend | Embedded local HTML/CSS/JavaScript. A small native script replaces HTMX where sufficient; no frontend dependency/build pipeline or remote assets. |
@@ -47,7 +57,7 @@ Still configured by the operator: public Dex issuer, exact admin group or subjec
 6. Server-owned expiring preview → explicit confirmation → bounded asynchronous operation → observed result. Persist action attribution, checkpoints, idempotency and audit. Interrupted operations become `needs-review`, never blindly replayed.
 7. Embedded usable UI, same-origin JSON API and OpenAPI contract. No user Kubernetes credentials reach the browser.
 
-Not included: deletion or finalizer removal; new notebook creation; LDAP account/group edits; ownership/contributor changes; arbitrary YAML/env/ServiceAccount/security-context edits; process state recovery; file browsing; GPU utilization metrics; high availability; automatic spec/data rollback; unreviewed external storage imports.
+Not included: arbitrary deletion or finalizer removal; new notebook creation; LDAP account/group edits; ownership/contributor changes; arbitrary YAML/env/ServiceAccount/security-context edits; process state recovery; file browsing; GPU utilization metrics; high availability; automatic spec/data rollback; unreviewed external storage imports. Profile deletion is the narrow, separately enabled exception described in the 21 October amendment.
 
 ## 4. Architecture and security contract
 
@@ -62,7 +72,7 @@ The app also talks to Dex and its local SQLite database. It uses Go stdlib HTTP/
 * Notebook API acceptance does not prove Pod admission or readiness. Wait for actual controller-owned StatefulSet/Pod observations; child mapping uses owner UIDs. Surface pending/error/stale versus desired state.
 * Mounts use same-namespace filesystem PVCs; removal never deletes claims. GPU counts use approved extended-resource keys with valid integer request/limit relationships. No capacity promise based on free-resource estimates.
 * Static volumes use Retain and intended claim reservation; reject Bound/Released/reserved/terminating or incompatible PVs and duplicate configured backend handles. No generic hostPath UI.
-* Dedicated ServiceAccount gets exact read verbs plus only enabled mutation resources. No `delete`, wildcard, Secret, impersonation, RBAC-write, exec or StatefulSet-write privileges.
+* Dedicated ServiceAccount gets exact read verbs plus only enabled mutation resources. Only the separately opt-in Profile deletion role grants `delete` on `kubeflow.org/profiles`; no Namespace/PV/PVC/Pod delete, wildcard, Secret, impersonation, RBAC-write, exec or StatefulSet-write privileges.
 * Kubernetes RBAC does not constrain patched fields or Profile namespaces. Operator-enforced admission restrictions remain necessary against stolen ServiceAccount credentials. App validation is not an admission boundary.
 * Audit/checkpoints must commit before writes. Never store whole notebook manifests, secret/env values or tokens. No automatic compensating storage deletion or replay on crash/database restore.
 * Secure host-only cookies and <=15-minute sessions bound claim age. Expired admin authorization blocks subsequent write steps. Local logout does not revoke upstream SSO. Protect TLS/private CA trust; never disable verification.

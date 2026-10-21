@@ -62,8 +62,10 @@ func backendFailure(w http.ResponseWriter, err error, validation bool) {
 	switch message {
 	case "Kubernetes resource not found", "matching Profile required: Kubernetes resource not found":
 		failure(w, 404, "resource_not_found", "The Kubernetes resource was not found. Verify the name and namespace; notebook and storage changes require a matching Profile.", false)
-	case "Kubernetes API denied the request", "matching Profile required: Kubernetes API denied the request":
+	case "Kubernetes API denied the request", "matching Profile required: Kubernetes API denied the request", "Kubernetes API denied the Profile deletion":
 		failure(w, 503, "cluster_access_denied", "Kubernetes denied the request. Ask the operator to check the application's RBAC and cluster admission policy.", false)
+	case "Kubernetes API rejected the Profile deletion":
+		failure(w, 422, "cluster_validation_failed", "Kubernetes rejected the Profile deletion. Check admission policy and controller compatibility, then refresh and prepare again.", false)
 	case "Kubernetes API rejected validation or conditional patch":
 		failure(w, 422, "cluster_validation_failed", "Kubernetes rejected validation or the conditional patch. Check quantities, admission policy and installed API compatibility, then refresh and prepare again.", false)
 	case "plan belongs to a different actor":
@@ -104,6 +106,25 @@ protected namespace
 namespace is outside configured scope
 Profile is terminating
 unsupported Profile owner contract
+Profile name must be at most 63 characters
+Profile name must be a lowercase DNS label
+a valid owner email address is required
+Profile owner transfer is unsupported by the installed controller contract
+the reviewed Profile configuration digest is required
+Profile quota already matches the requested values
+Reload the console and review the current Profile configuration before changing quotas
+profile deletion is disabled
+a nonempty reason is required for profile deletion
+typed confirmation must exactly match the Profile name
+profile deletion accepts no other action fields
+the Profile namespace does not exist; this deletion requires the Profile-owned namespace
+the Profile namespace has no stable UID
+Profile has no stable UID
+unsupported Profile API contract
+cluster identity could not be verified
+the namespace list could not be verified
+the Profile namespace has more than one owner reference
+Profile deletion requires UID and resourceVersion preconditions
 namespace is not active
 namespace ownership does not match its Profile
 writes are disabled
@@ -147,11 +168,12 @@ Node is already schedulable
 control-plane Node requires force to cordon
 NotReady Node requires force to cordon
 a positive Kubernetes quantity is required
+a quota value must be a non-negative Kubernetes quantity
+a quota count must be a whole number of objects
 nonempty quota required; removing quotas is unsupported
 unsupported quota resource
 changing an unsupported quota key is unsupported
 exact nonempty owner identity required
-Profile must have a namespace-compatible name
 existing namespaces cannot be adopted
 quota removal is unsupported
 unsupported Profile quota shape

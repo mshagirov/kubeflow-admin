@@ -24,7 +24,7 @@ READ_RESOURCES = {
 # ALLOWED is the union of every verb/resource any shipped role may grant.
 ALLOWED = {
     **{key: {"get", "list"} for key in READ_RESOURCES},
-    ("kubeflow.org", "profiles"): {"get", "list", "create", "patch"},
+    ("kubeflow.org", "profiles"): {"get", "list", "create", "patch", "delete"},
     ("kubeflow.org", "notebooks"): {"get", "list", "patch"},
     ("", "persistentvolumes"): {"get", "list", "create", "patch"},
     ("", "persistentvolumeclaims"): {"get", "list", "create", "patch"},
@@ -47,6 +47,26 @@ EXPECTED_ROLES = {
     "kubeflow-admin-pvc-expansion": {("", "persistentvolumeclaims"): {"patch"}},
     "kubeflow-admin-pod-restarts": {("", "pods/eviction"): {"create"}},
     "kubeflow-admin-node-cordon": {("", "nodes"): {"patch"}},
+    # Explicit optional Profile deletion workflow: the single delete verb on
+    # the cluster-scoped Profile resource, and nothing else.
+    "kubeflow-admin-profile-deletion": {("kubeflow.org", "profiles"): {"delete"}},
+}
+# The only delete grant any shipped overlay may contain is the separately
+# opt-in Profile deletion workflow, and only from its own overlay path. Every
+# other overlay must stay free of the delete verb.
+DELETE_ALLOWED = {("kubeflow.org", "profiles")}
+DELETE_OPT_IN_PATH = "profile-deletion"
+# Every overlay variant that must render, exactly once, for the release.
+EXPECTED_VARIANTS = {
+    "base",
+    "all-features",
+    "local-storage",
+    "node-cordon",
+    "pod-restarts",
+    "pvc-expansion",
+    "profile-deletion",
+    "static-storage",
+    "writes",
 }
 
 def check(path):
@@ -66,11 +86,19 @@ def check(path):
                             assert path.name == "pod-restarts", "eviction grant must stay separately opt-in"
                         if resource == "nodes" and "patch" in rule["verbs"]:
                             assert path.name == "node-cordon", "node cordon grant must stay separately opt-in"
+                        if resource.endswith("/finalizers"):
+                            assert not ({"patch", "update", "delete"} & set(rule["verbs"])), rule
+                        for verb in rule["verbs"]:
+                            if verb == "delete":
+                                assert (group, resource) in DELETE_ALLOWED, rule
+                                assert path.name == DELETE_OPT_IN_PATH, "profile deletion grant must stay separately opt-in"
                         actual.setdefault((group, resource), set()).update(rule["verbs"])
                         assert set(rule["verbs"]) <= ALLOWED.get((group, resource), set()), rule
                         if path.name in ("base", "local-storage"):
                             assert set(rule["verbs"]) <= {"get", "list"}, rule
             assert actual == EXPECTED_ROLES[d["metadata"]["name"]], (path, actual)
+            if d["metadata"]["name"] == "kubeflow-admin-profile-deletion":
+                assert path.name == DELETE_OPT_IN_PATH, "profile deletion grant must stay separately opt-in"
         if d["kind"] == "Deployment":
             assert d["spec"]["replicas"] == 1
             assert d["spec"]["strategy"]["type"] == "Recreate"
@@ -93,6 +121,10 @@ def check(path):
     print(f"OK {path.relative_to(ROOT)} ({len(docs)} resources)")
 
 if __name__ == "__main__":
-    for directory in [ROOT / "deploy/base", *sorted((ROOT / "deploy/overlays").iterdir())]:
-        if directory.is_dir():
-            check(directory)
+    directories = [ROOT / "deploy/base", *sorted((ROOT / "deploy/overlays").iterdir())]
+    directories = [directory for directory in directories if directory.is_dir()]
+    variants = {directory.name for directory in directories}
+    assert variants == EXPECTED_VARIANTS, f"overlay variants changed: {sorted(variants)}"
+    for directory in directories:
+        check(directory)
+    print(f"OK {len(variants)} rendered variants ({', '.join(sorted(variants))})")

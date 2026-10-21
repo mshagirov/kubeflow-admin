@@ -28,19 +28,52 @@ func (w *work) change(field string, before, after any) {
 		w.prepared.Changes = append(w.prepared.Changes, model.Change{Field: field, Before: b, After: a})
 	}
 }
+
+// mergedHardQuota returns the hard quota map the prepared patch will write.
+// It is the authoritative result of the merge: keys the adapter preserves
+// verbatim keep their declared literal, so a preview built from it never
+// claims a change that is not written.
+func mergedHardQuota(w *work) map[string]any {
+	for _, op := range w.ops {
+		switch op.Path {
+		case "/spec/resourceQuotaSpec/hard":
+			if m, ok := op.Value.(map[string]any); ok {
+				return m
+			}
+		case "/spec/resourceQuotaSpec":
+			if m, ok := op.Value.(map[string]any); ok {
+				if hard, ok := m["hard"].(map[string]any); ok {
+					return hard
+				}
+			}
+		}
+	}
+	return map[string]any{}
+}
+
 func (s *Service) previews(w *work) {
 	a := w.prepared.Action
 	switch a.Kind {
 	case "profile.create":
 		w.change("profile", nil, a.Name)
 		w.change("owner", nil, a.Owner)
-		for k, v := range a.Quota {
+		// The previewed quota values are the validated ones the prepared
+		// Profile carries, not the raw requested spelling.
+		for k, v := range preparedHardQuota(w) {
 			w.change("quota."+k, nil, v)
 		}
-	case "profile.quota.change":
+	case "profile.quota.change", "profile.update":
+		// The owner is immutable and never changes, so only the declared quota
+		// is previewed as a difference. The previewed values are the ones the
+		// prepared patch actually writes, not the requested ones: a key this
+		// adapter preserves verbatim is never shown as changed.
 		old, _, _ := unstructured.NestedMap(w.profile.Object, "spec", "resourceQuotaSpec", "hard")
-		for k, v := range a.Quota {
-			w.change("quota."+k, old[k], v)
+		for k, v := range mergedHardQuota(w) {
+			before, existed := old[k]
+			if existed && sameQuotaValue(before, v) {
+				continue
+			}
+			w.change("quota."+k, before, v)
 		}
 	case "pvc.expand":
 		w.change("requested storage", w.pvc.Spec.Resources.Requests.Storage().String(), a.Size)

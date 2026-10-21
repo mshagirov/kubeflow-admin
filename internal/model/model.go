@@ -53,29 +53,39 @@ func (i Identity) DisplayName() string {
 
 // Action is deliberately typed: no arbitrary Kubernetes manifests or field paths.
 type Action struct {
-	Kind          string            `json:"kind"`
-	Namespace     string            `json:"namespace,omitempty"`
-	Name          string            `json:"name"`
-	Reason        string            `json:"reason,omitempty"`
-	Owner         string            `json:"owner,omitempty"`
-	Quota         map[string]string `json:"quota,omitempty"`
-	StorageClass  string            `json:"storageClass,omitempty"`
-	Size          string            `json:"size,omitempty"`
-	AccessMode    string            `json:"accessMode,omitempty"`
-	PVName        string            `json:"pvName,omitempty"`
-	Template      string            `json:"template,omitempty"`
-	Subdirectory  string            `json:"subdirectory,omitempty"`
-	Container     string            `json:"container,omitempty"`
-	Image         string            `json:"image,omitempty"`
-	CPURequest    string            `json:"cpuRequest,omitempty"`
-	CPULimit      string            `json:"cpuLimit,omitempty"`
-	MemoryRequest string            `json:"memoryRequest,omitempty"`
-	MemoryLimit   string            `json:"memoryLimit,omitempty"`
-	GPUPreset     string            `json:"gpuPreset,omitempty"`
-	GPUCount      *int64            `json:"gpuCount,omitempty"`
-	Mounts        *[]Mount          `json:"mounts,omitempty"`
-	Restart       bool              `json:"restart,omitempty"`
-	Force         bool              `json:"force,omitempty"`
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
+	Reason    string `json:"reason,omitempty"`
+	// ConfirmName is the exact target name typed back by the administrator as a
+	// second confirmation. It is required for destructive kinds such as
+	// profile.delete and is ignored by every other kind.
+	ConfirmName string `json:"confirmName,omitempty"`
+	// BaseConfigDigest is the canonical digest of the Profile configuration
+	// the administrator reviewed: the owner identity and the declared quota
+	// hard map. It is echoed back from the console's own observation and is
+	// required by profile.update, so a stale prefill cannot overwrite a
+	// concurrent quota change. It is never an editable field.
+	BaseConfigDigest string            `json:"baseConfigDigest,omitempty"`
+	Owner            string            `json:"owner,omitempty"`
+	Quota            map[string]string `json:"quota,omitempty"`
+	StorageClass     string            `json:"storageClass,omitempty"`
+	Size             string            `json:"size,omitempty"`
+	AccessMode       string            `json:"accessMode,omitempty"`
+	PVName           string            `json:"pvName,omitempty"`
+	Template         string            `json:"template,omitempty"`
+	Subdirectory     string            `json:"subdirectory,omitempty"`
+	Container        string            `json:"container,omitempty"`
+	Image            string            `json:"image,omitempty"`
+	CPURequest       string            `json:"cpuRequest,omitempty"`
+	CPULimit         string            `json:"cpuLimit,omitempty"`
+	MemoryRequest    string            `json:"memoryRequest,omitempty"`
+	MemoryLimit      string            `json:"memoryLimit,omitempty"`
+	GPUPreset        string            `json:"gpuPreset,omitempty"`
+	GPUCount         *int64            `json:"gpuCount,omitempty"`
+	Mounts           *[]Mount          `json:"mounts,omitempty"`
+	Restart          bool              `json:"restart,omitempty"`
+	Force            bool              `json:"force,omitempty"`
 }
 type Mount struct {
 	Name     string `json:"name"`
@@ -111,18 +121,26 @@ type Plan struct {
 	Prepared     Prepared  `json:"prepared"`
 }
 type Operation struct {
-	ID             string    `json:"id"`
-	PlanID         string    `json:"planID"`
-	Actor          string    `json:"actor"`
-	ActorDisplay   string    `json:"actorDisplay,omitempty"`
-	HistoryExpired bool      `json:"historyExpired,omitempty"`
-	Target         string    `json:"target"`
-	Action         string    `json:"action"`
-	State          string    `json:"state"`
-	Step           string    `json:"step"`
-	Error          string    `json:"error,omitempty"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
+	ID             string `json:"id"`
+	PlanID         string `json:"planID"`
+	Actor          string `json:"actor"`
+	ActorDisplay   string `json:"actorDisplay,omitempty"`
+	HistoryExpired bool   `json:"historyExpired,omitempty"`
+	Target         string `json:"target"`
+	Action         string `json:"action"`
+	State          string `json:"state"`
+	Step           string `json:"step"`
+	Error          string `json:"error,omitempty"`
+	// ProfileDeleteCheckpointed records that the durable checkpoint which
+	// precedes the single Profile delete request was persisted before that
+	// request was issued. It is the durable proof that no Profile deletion
+	// write was ever started, and the only evidence that may let an offline
+	// reconciliation cancel an uncertain deletion. It is always serialized,
+	// so a record that lacks the field is distinguishable from a record that
+	// was admitted without one.
+	ProfileDeleteCheckpointed bool      `json:"profileDeleteCheckpointed"`
+	CreatedAt                 time.Time `json:"createdAt"`
+	UpdatedAt                 time.Time `json:"updatedAt"`
 }
 type Audit struct {
 	ID           string    `json:"id"`

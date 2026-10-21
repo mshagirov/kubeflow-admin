@@ -26,6 +26,30 @@ The public Kubeflow `v1.10.0` sources were read during implementation and confir
 
 This verifies published source semantics, not your deployed image digest, culling configuration, or a successful live start/stop test.
 
+### Profile owner and deletion contract
+
+The [v1.10.0 Profile controller source](https://github.com/kubeflow/kubeflow/blob/v1.10.0/components/profile-controller/controllers/profile_controller.go)
+checks the existing namespace's `owner` annotation before reconciling access or
+quotas. Changing `spec.owner.name` in place causes that check to fail. This
+console therefore shows the current owner read-only and rejects owner transfers;
+it never patches namespace ownership to work around the controller. Quota
+editing uses the exact existing owner and a configuration-digest precondition.
+The deprecated `profile.quota.change` alias now requires the same guard; old
+unguarded requests are refused. Reload the browser after upgrading and update
+any direct clients before attempting quota changes.
+New Profile owners must be email addresses; syntax validation does not verify
+registration with LDAP or the identity provider. Existing non-email owners may
+remain unchanged when editing quotas.
+
+The controller sets the Profile as the namespace's controlling owner. On normal
+Profile deletion it revokes plugins and removes its own finalizer; Kubernetes
+garbage collection and namespace cleanup remove the owned namespace and its
+contents. The separately enabled console workflow deletes only the reviewed
+Profile, waits for both objects to disappear, and never bypasses finalizers.
+Profile deletion can delete PVC-backed data under a Delete reclaim policy;
+retained PVs and external data may remain. Verify the installed controller,
+storage behavior and disposable-pilot cleanup before enabling this capability.
+
 ## Read-only discovery (run yourself)
 
 Do not export Secrets or authentication configuration. A representative command set:

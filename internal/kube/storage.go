@@ -12,7 +12,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"kubeflow-admin/internal/model"
 )
@@ -355,78 +354,6 @@ func modesApproved(modes []corev1.PersistentVolumeAccessMode, approved []string)
 func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(string) error) error {
 	a := w.prepared.Action
 	switch a.Kind {
-	case "profile.create":
-		if err := checkpoint(cp, "create-profile"); err != nil {
-			return err
-		}
-		p, err := s.Dynamic.Resource(Profiles).Create(ctx, w.profile, metav1.CreateOptions{})
-		if err != nil {
-			return safe(err)
-		}
-		return s.wait(ctx, func() (bool, error) {
-			cur, err := s.Dynamic.Resource(Profiles).Get(ctx, a.Name, metav1.GetOptions{})
-			if err != nil {
-				return false, safe(err)
-			}
-			ownerName, _, _ := unstructured.NestedString(cur.Object, "spec", "owner", "name")
-			ownerKind, _, _ := unstructured.NestedString(cur.Object, "spec", "owner", "kind")
-			if cur.GetUID() != p.GetUID() || cur.GetDeletionTimestamp() != nil || ownerName != a.Owner || ownerKind != "User" {
-				return false, ErrConflict
-			}
-			ns, err := s.Typed.CoreV1().Namespaces().Get(ctx, a.Name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			if err != nil {
-				return false, safe(err)
-			}
-			if ns.Status.Phase != corev1.NamespaceActive || ns.DeletionTimestamp != nil {
-				return false, nil
-			}
-			if !controlledBy(ns.OwnerReferences, p.GetUID()) || ns.Annotations["owner"] != a.Owner {
-				return false, ErrConflict
-			}
-			rb, err := s.Typed.RbacV1().RoleBindings(a.Name).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return false, safe(err)
-			}
-			access := false
-			for _, r := range rb.Items {
-				for _, sub := range r.Subjects {
-					if sub.Kind == "User" && sub.Name == a.Owner && sub.APIGroup == "rbac.authorization.k8s.io" && r.RoleRef.Kind == "ClusterRole" && r.RoleRef.Name == "kubeflow-admin" && r.RoleRef.APIGroup == "rbac.authorization.k8s.io" && controlledBy(r.OwnerReferences, p.GetUID()) && r.DeletionTimestamp == nil {
-						access = true
-					}
-				}
-			}
-			if !access {
-				return false, nil
-			}
-			return s.quotaObserved(ctx, a.Name, a.Quota, p.GetUID())
-		})
-	case "profile.quota.change":
-		b, _ := json.Marshal(conditional(string(w.profile.GetUID()), w.profile.GetResourceVersion(), w.ops))
-		if err := checkpoint(cp, "patch-profile-quota"); err != nil {
-			return err
-		}
-		if _, err := s.Dynamic.Resource(Profiles).Patch(ctx, a.Name, types.JSONPatchType, b, metav1.PatchOptions{}); err != nil {
-			return safe(err)
-		}
-		oldOwner, _, _ := unstructured.NestedString(w.profile.Object, "spec", "owner", "name")
-		return s.wait(ctx, func() (bool, error) {
-			cur, err := s.Dynamic.Resource(Profiles).Get(ctx, a.Name, metav1.GetOptions{})
-			if err != nil {
-				return false, safe(err)
-			}
-			o, _, _ := unstructured.NestedString(cur.Object, "spec", "owner", "name")
-			if cur.GetUID() != w.profile.GetUID() || cur.GetDeletionTimestamp() != nil || o != oldOwner {
-				return false, ErrConflict
-			}
-			e := s.newEvidence()
-			if err = s.scope(ctx, a.Name, &e); err != nil {
-				return false, err
-			}
-			return s.quotaObserved(ctx, a.Name, a.Quota, w.profile.GetUID())
-		})
 	case "pvc.expand":
 		b, _ := json.Marshal(conditional(string(w.pvc.UID), w.pvc.ResourceVersion, w.ops))
 		if err := checkpoint(cp, "expand-pvc"); err != nil {
@@ -567,7 +494,14 @@ func (s *Service) quotaObserved(ctx context.Context, ns string, desired map[stri
 		}
 		ok := true
 		for k, v := range desired {
-			want, _ := quantity(v)
+			// A declared quota value may be zero, so the comparison uses the
+			// non-negative quantity rule, not the strictly positive storage
+			// size rule.
+			want, err := quotaQuantity(v)
+			if err != nil {
+				ok = false
+				continue
+			}
 			got, exists := q.Spec.Hard[corev1.ResourceName(k)]
 			if !exists || got.Cmp(want) != 0 {
 				ok = false

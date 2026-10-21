@@ -19,6 +19,7 @@ import (
 
 	"kubeflow-admin/internal/auth"
 	"kubeflow-admin/internal/config"
+	"kubeflow-admin/internal/footer"
 	"kubeflow-admin/internal/kube"
 	"kubeflow-admin/internal/model"
 	"kubeflow-admin/internal/operations"
@@ -35,6 +36,11 @@ var assets embed.FS
 type pageView struct {
 	Identity pageIdentity
 	Config   pageConfig
+	// ContentSecurityPolicy is the response policy for this page. It is the
+	// shipped policy plus the exact external image hosts the configured
+	// footer references, so a deployment opens the image source it
+	// configured and nothing else.
+	ContentSecurityPolicy string
 }
 type pageIdentity struct {
 	Email             string
@@ -47,6 +53,7 @@ type pageConfig struct {
 	Features  pageFeatures
 	Notebooks pageNotebooks
 	Storage   pageStorage
+	UI        pageUI
 }
 type pageFeatures struct {
 	WritesEnabled bool
@@ -54,6 +61,10 @@ type pageFeatures struct {
 	PVCExpansion  bool
 	PodRestarts   bool
 	NodeCordon    bool
+	// ProfileDeletion is projected only when the deletion opt-in and writes
+	// are both enabled, so the browser never offers a capability the API
+	// would refuse. It carries no permission and no secret.
+	ProfileDeletion bool
 }
 type pageNotebooks struct {
 	ControllerContractConfirmed bool
@@ -74,10 +85,22 @@ type pageTemplate struct {
 	StorageClass string
 }
 
+// pageUI carries the deployment-configured console footer. The value is the
+// sanitized markup only: the raw configured string never reaches the
+// template, and the typed template.HTML is the single point where the
+// console trusts it.
+type pageUI struct {
+	FooterText template.HTML
+}
+
 // buildPageView copies only the configuration the template consumes: feature
-// switches, GPU preset names and resource keys, allowed images, and approved
-// storage class/template names.
+// switches, GPU preset names and resource keys, allowed images, approved
+// storage class/template names and the optional footer.
+//
+// The footer is sanitized here, once per render: the projection carries the
+// sanitized markup, never the raw configured value.
 func buildPageView(identity model.Identity, cfg config.Config) pageView {
+	f := footer.Sanitize(cfg.UI.FooterText)
 	v := pageView{
 		Identity: pageIdentity{Email: identity.Email, Subject: identity.Subject, CSRF: identity.CSRF, DisplayName: identity.DisplayName(), NotificationScope: identity.NotificationScope},
 		Config: pageConfig{
@@ -87,13 +110,21 @@ func buildPageView(identity model.Identity, cfg config.Config) pageView {
 				PVCExpansion:  cfg.Features.PVCExpansion,
 				PodRestarts:   cfg.Features.PodRestarts,
 				NodeCordon:    cfg.Features.NodeCordon,
+				// The deletion capability is never offered while writes are
+				// disabled, even if the separate opt-in is set.
+				ProfileDeletion: cfg.Features.ProfileDeletion && cfg.Features.WritesEnabled,
 			},
 			Notebooks: pageNotebooks{
 				ControllerContractConfirmed: cfg.Notebooks.ControllerContractConfirmed,
 				AllowedImages:               cfg.Notebooks.AllowedImages,
 			},
 			Storage: pageStorage{AllowedStorageClasses: cfg.Storage.AllowedStorageClasses},
+			// The footer is the only presentation content a site may set. A
+			// value that sanitizes to nothing renders no footer at all, so
+			// the page never keeps an empty placeholder.
+			UI: pageUI{FooterText: f.HTML},
 		},
+		ContentSecurityPolicy: contentSecurityPolicy(f.ExternalImageHosts),
 	}
 	for _, p := range cfg.Notebooks.GPUPresets {
 		v.Config.Notebooks.GPUPresets = append(v.Config.Notebooks.GPUPresets, pageGPUPreset{Name: p.Name, ResourceKey: p.ResourceKey})
@@ -186,11 +217,16 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 				return
 			}
 			var page bytes.Buffer
-			if err := tmpl.Execute(&page, buildPageView(identity, s.cfg)); err != nil {
+			view := buildPageView(identity, s.cfg)
+			if err := tmpl.Execute(&page, view); err != nil {
 				fail(w, 500, "The console could not be rendered.")
 				return
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			// The page policy names the external image hosts the configured
+			// footer references and nothing else. A deployment without a
+			// footer keeps the shipped policy unchanged.
+			w.Header().Set("Content-Security-Policy", view.ContentSecurityPolicy)
 			// Native form POSTs can acquire Origin: null under no-referrer
 			// (notably in Firefox). Preserve origin for same-origin submissions
 			// without disclosing dashboard paths to external sites. OIDC callback
@@ -248,6 +284,23 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 	return security(root)
 }
 
+// contentSecurityPolicy is the shipped response policy. It allows no
+// external subresource at all: the console ships its own script, style and
+// fonts.
+//
+// A configured footer may reference a company logo on an external host. The
+// page then names exactly those hosts, so a deployment opens the image
+// source it configured and nothing else. The console never fetches the
+// image itself: the operator's browser does, and the operator owns those
+// URLs.
+func contentSecurityPolicy(imageHosts []string) string {
+	images := "'self'"
+	if len(imageHosts) > 0 {
+		images += " " + strings.Join(imageHosts, " ")
+	}
+	return "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src " + images + "; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+}
+
 func (s *server) historyHeaders(w http.ResponseWriter, window string) {
 	w.Header().Set("X-History-Limit", "1000")
 	w.Header().Set("X-History-Window", window)
@@ -256,7 +309,7 @@ func (s *server) historyHeaders(w http.ResponseWriter, window string) {
 
 func security(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", contentSecurityPolicy(nil))
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
@@ -375,6 +428,14 @@ func (s *server) plan(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.cfg.Features.WritesEnabled {
 		fail(w, 403, "Changes are disabled by server policy.")
+		return
+	}
+	// Profile deletion needs its own reviewed opt-in in addition to writes.
+	// Only the typed profile.delete kind is gated here: there is no
+	// namespace-delete action and no arbitrary delete endpoint, and a refused
+	// request never reaches the plan manager.
+	if a.Kind == "profile.delete" && !s.cfg.Features.ProfileDeletion {
+		fail(w, 403, "Profile deletion is disabled by server policy.")
 		return
 	}
 	v, e := s.ops.Plan(r.Context(), i, a)
