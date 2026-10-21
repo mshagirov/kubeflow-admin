@@ -25,6 +25,9 @@
 //   PROFILE_FIXTURE_PORT    loopback port of the synthetic fixture
 //   PROFILE_GATED_FIXTURE_PORT  loopback port of the fixture without the
 //                           Profile deletion capability
+//   PROFILE_READONLY_FIXTURE_PORT  loopback port of the fixture without writes
+//   PROFILE_NOCONTRACT_FIXTURE_PORT loopback port of the fixture without the
+//                           confirmed Notebook controller contract
 //
 // Without a Playwright module or without a usable Chrome the runner prints
 // SKIP and exits successfully. Everything else is a failure: a fixture that
@@ -46,6 +49,8 @@ const FIXTURE_SOURCE = process.env.PROFILE_FIXTURE_DIR || path.join(__dirname, "
 const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const FIXTURE_PORT = process.env.PROFILE_FIXTURE_PORT || "18768";
 const GATED_FIXTURE_PORT = process.env.PROFILE_GATED_FIXTURE_PORT || "18769";
+const READONLY_FIXTURE_PORT = process.env.PROFILE_READONLY_FIXTURE_PORT || "18770";
+const NOCONTRACT_FIXTURE_PORT = process.env.PROFILE_NOCONTRACT_FIXTURE_PORT || "18771";
 
 const DESKTOP = { width: 1280, height: 844 };
 const MOBILE = { width: 390, height: 844 };
@@ -77,15 +82,49 @@ const PROFILE_BETA = {
   ],
   unmanaged: { key: "requests.ephemeral-storage", value: "5Gi" }
 };
+// A Profile whose quota declares the Kubernetes aliases and a device key of
+// its own. The observed keys are edited under their own names.
+const PROFILE_LEGACY = {
+  name: "team-legacy",
+  owner: "legacy.owner@example.org",
+  apiVersion: "kubeflow.org/v1",
+  ownerKind: "User",
+  quotas: [
+    { key: "cpu", value: "128" },
+    { key: "memory", value: "256Gi" },
+    { key: "nvidia.com/gpu", value: "4" },
+    { key: "persistentvolumeclaims", value: "20" },
+    { key: "requests.storage", value: "500Gi" }
+  ],
+  unmanaged: { key: "requests.ephemeral-storage", value: "5Gi" },
+  counted: { key: "count/jobs.batch", value: "5" }
+};
 const RESERVED_NAMESPACE = "team-delta";
 const NEW_PROFILE = "team-gamma";
 const EXPIRED_PLAN_PROFILE = "team-epsilon";
 const NEW_PROFILE_OWNER = "Gamma.Owner@Example.org";
 const NAMESPACE = "team-alpha";
 const NOTEBOOK = { kind: "Notebook", name: "team-alpha-notebook-0", namespace: NAMESPACE, detail: "node: node-a" };
+const NOTEBOOK_WORK = { kind: "Notebook", name: "work", namespace: NAMESPACE, detail: "image.notebook: kubeflownotebookswg/jupyter:1.9.0" };
+const STATEFULSET_WORK = { kind: "StatefulSet", name: "work", namespace: NAMESPACE, detail: "replicas: 1" };
+const POD_WORK = { kind: "Pod", name: "work", namespace: NAMESPACE, detail: "node: node-a" };
+const BETA_WORK = { namespace: "team-beta" };
 const CLAIM = { kind: "PersistentVolumeClaim", name: "team-alpha-claim", namespace: NAMESPACE, detail: "storageClass: standard" };
 const POD = { kind: "Pod", name: "team-alpha-notebook-0-0", namespace: NAMESPACE, detail: "node: node-a" };
 const NODE = { kind: "Node", name: "node-a", detail: "version: v1.31.4" };
+// The typed synthetic Notebook detail model. The management drawer has to
+// prefill from this observed model, not from a fresh guess.
+const NOTEBOOK_MODEL = {
+  kind: "Notebook",
+  name: "team-alpha-notebook-0",
+  namespace: NAMESPACE,
+  container: "notebook",
+  image: "kubeflownotebookswg/jupyter:1.9.0",
+  cpu: "4",
+  memory: "8Gi",
+  claim: "team-alpha-claim",
+  storageClass: "standard"
+};
 
 // ---------------------------------------------------------------- utilities
 
@@ -127,7 +166,7 @@ async function buildFixture() {
 // offline by construction: the fixture never opens a kubeconfig and never
 // talks to a cluster. A fixed port keeps the base URL stable; an occupied
 // port falls back to an ephemeral one.
-async function startFixture({ artifact, writes = true, deletion = true, port } = {}) {
+async function startFixture({ artifact, writes = true, deletion = true, contract = true, port } = {}) {
   const launch = async requestedPort => {
     const child = spawn(artifact, [], {
       env: {
@@ -135,6 +174,7 @@ async function startFixture({ artifact, writes = true, deletion = true, port } =
         KF_ADMIN_REPO_ROOT: process.env.KF_ADMIN_REPO_ROOT || REPO_ROOT,
         KF_ADMIN_WRITES: writes ? "1" : "0",
         KF_ADMIN_PROFILE_DELETION: deletion ? "1" : "0",
+        KF_ADMIN_NOTEBOOK_CONTRACT: contract ? "1" : "0",
         KF_ADMIN_PORT: requestedPort || ""
       },
       stdio: ["ignore", "pipe", "pipe"]
@@ -272,7 +312,144 @@ async function openProfileSummary(page, base, name) {
   await control.click();
   const drawer = page.locator("#profile-summary-drawer");
   await drawer.waitFor({ state: "visible", timeout: 10000 });
+  // A Profile name opens exactly one Profile summary. It must not be a
+  // generic RESOURCE DETAILS drawer.
+  assert.equal(await page.locator("#resource-details-drawer").isVisible().catch(() => false), false,
+    "the Profile name opened the generic RESOURCE DETAILS drawer instead of the Profile summary");
+  assert.equal(await drawer.locator("#profile-summary-title").innerText(), name, "the Profile summary does not name the selected Profile");
   return drawer;
+}
+
+// openProfileEdit opens the summary of one Profile and follows its Edit
+// action. The summary is the only Profile entry point; there is no generic
+// per-row details control.
+async function openProfileEdit(page, base, name) {
+  const summary = await openProfileSummary(page, base, name);
+  const edit = await findVisible(summary, [
+    { role: "button", name: /^edit profile$/i },
+    { role: "button", name: /^edit/i },
+    { role: "button", name: /edit/i }
+  ], "the Profile edit action in the summary");
+  await edit.click();
+  const form = page.locator("#profile-drawer");
+  await form.waitFor({ state: "visible", timeout: 10000 });
+  await page.waitForTimeout(200);
+  return form;
+}
+
+// assertNoDetailsControls proves that a table has no separate Details button
+// and no Details column. A resource name is the visible details handle.
+async function assertNoDetailsControls(table, description) {
+  const buttons = await table.locator("button").evaluateAll(nodes =>
+    nodes.filter(node => (node.textContent || "").trim() === "Details").map(node => node.outerHTML));
+  assert.deepEqual(buttons, [], description + " still offers a separate Details button: " + buttons.join(" | "));
+  const headers = await table.locator("thead th").allTextContents();
+  assert.ok(!headers.some(header => header.trim().toLowerCase() === "details"),
+    description + " still offers a separate Details column (" + headers.join(", ") + ")");
+}
+
+// resourceNameText reads the visible name of a row, whether the name is plain
+// text or the button that opens the details drawer.
+async function resourceNameText(row) {
+  return (await row.locator(".resource-name > span, .resource-name > button.link-button").first().innerText()).trim();
+}
+
+// rowKind reads the observed kind a row shows under its name.
+async function rowKind(row) {
+  const meta = (await row.locator(".resource-name small").first().innerText().catch(() => "")).trim();
+  return meta.split("·")[0].trim();
+}
+
+// clickResourceName opens the details drawer through the visible resource
+// name. A separate Details button is never required and is never used.
+async function clickResourceName(page, tableKey, name) {
+  const row = await rowFor(page, tableKey, name);
+  const control = await findVisible(row, [
+    { role: "button", name, exact: true },
+    `.resource-name > button.link-button`,
+    `button[aria-label*="${name}"]`
+  ], "the " + name + " resource name control");
+  await control.click();
+  const drawer = page.locator("#resource-details-drawer");
+  await drawer.waitFor({ state: "visible", timeout: 10000 });
+  return drawer;
+}
+
+// openNotebookDetails opens the Notebook details drawer and returns both the
+// drawer and the typed API model the console fetched.
+async function openNotebookDetails(page, base, notebook = NOTEBOOK) {
+  const route = notebook.namespace ? "/notebooks?namespace=" + encodeURIComponent(notebook.namespace) : "/notebooks";
+  await gotoTable(page, base, route, "notebooks");
+  const drawer = await clickResourceName(page, "notebooks", notebook.name);
+  assert.equal((await drawer.locator("#resource-details-title").innerText()).trim(), notebook.name,
+    "the Notebook details drawer does not name the observed Notebook");
+  return drawer;
+}
+
+// openNotebookManagement opens one exact Notebook's details and follows its
+// Manage Notebook action into the management drawer.
+async function openNotebookManagement(page, base, notebook = NOTEBOOK) {
+  const details = await openNotebookDetails(page, base, notebook);
+  const manage = await notebookManageControl(details);
+  await manage.click();
+  const form = await findVisible(page, [
+    "#notebook-drawer",
+    "#notebook-management-drawer",
+    '[data-drawer="notebook-management"]'
+  ], "the Notebook management drawer");
+  await form.locator("form").first().waitFor({ timeout: 10000 });
+  return { details, manage, form };
+}
+
+// notebookManageControl resolves the Manage Notebook action of the open
+// details drawer. A gated console may not render it at all.
+async function notebookManageControl(drawer, options = {}) {
+  return findVisible(drawer, [
+    "#manage-notebook",
+    "[data-manage-notebook]",
+    { role: "button", name: /^manage notebook$/i },
+    { role: "button", name: /manage.*notebook/i }
+  ], "the Manage Notebook action", options);
+}
+
+// assertNotebookManageFocus proves that closing the management drawer returns
+// the focus to the visible control of the very same Notebook. When the console
+// hands the details drawer over to management, the control inside the closed
+// details drawer may never take the focus back.
+async function assertNotebookManageFocus(page, details, manage, key) {
+  const focus = await page.evaluate(expected => {
+    const active = document.activeElement;
+    const owner = active && active.closest ? active.closest("[data-resource-key]") : null;
+    return {
+      id: active?.id || "",
+      text: String(active?.textContent || "").trim().slice(0, 80),
+      key: (active?.dataset && active.dataset.resourceKey) || (owner && owner.dataset && owner.dataset.resourceKey) || "",
+      hidden: !!(active && active.closest && active.closest("[hidden]")),
+      visible: !!(active && typeof active.getClientRects === "function" && active.getClientRects().length > 0),
+      expected
+    };
+  }, key);
+  assert.equal(focus.hidden, false, "the focus went to a control inside a closed drawer");
+  assert.equal(focus.visible, true, "the focus did not return to a visible control");
+  if (await details.isVisible().catch(() => false)) {
+    assert.equal(await manage.evaluate(node => node === document.activeElement), true,
+      "closing Notebook management did not return the focus to the Manage Notebook control");
+    return;
+  }
+  assert.equal(focus.key, key,
+    "closing Notebook management did not return the focus to the visible control of the exact Notebook (" + JSON.stringify(focus) + ")");
+  assert.notEqual(focus.text, "Manage Notebook",
+    "closing Notebook management focused the Manage control inside the closed details drawer");
+}
+
+// notebookField resolves one control of the Notebook management drawer across
+// the labelled and the legacy selector spellings.
+async function notebookField(form, candidates) {
+  for (const selector of candidates) {
+    const field = form.locator(selector);
+    if (await field.count()) return field.first();
+  }
+  throw new Error("the Notebook management drawer has none of: " + candidates.join(", "));
 }
 
 // profileMessage returns the validation message the console shows for the
@@ -439,6 +616,8 @@ async function checkRenderedProjection(context) {
     assert.equal(writes, String(state.features.writesEnabled), "the write capability does not match the configuration");
     assert.equal(await page.locator('meta[name="profile-deletion"]').getAttribute("content"), String(state.features.profileDeletion),
       "the deletion capability does not match the configuration");
+    assert.equal(await page.locator('meta[name="notebook-writes"]').getAttribute("content"), String(state.features.notebookContract),
+      "the Notebook controller contract capability does not match the configuration");
   }
   if (state) {
     for (const secret of state.forbiddenStrings) {
@@ -627,23 +806,69 @@ async function checkValidProfileCreation(context) {
   // The fixture records the request and mutates nothing.
   const profiles = await fetchJson(context.base + "/api/v1/profiles");
   const names = profiles.resources.filter(resource => resource.kind === "Profile").map(resource => resource.name).sort();
-  assert.deepEqual(names, ["team-alpha", "team-beta"], "the fixture inventory changed after a plan and operation");
+  assert.deepEqual(names, ["team-alpha", "team-beta", "team-legacy"], "the fixture inventory changed after a plan and operation");
 }
 
-// The Profile summary shows the observed Profile contract: its API version,
-// its owner and every quota key.
+// The Profile name opens one Profile summary. The summary carries the whole
+// observed Profile contract: apiVersion, owner, every hard quota key, state,
+// creation time and safe metadata, plus the Edit and Delete actions. The
+// Profiles table has no generic Details button or column.
 async function checkProfileSummaryContents(context) {
   const { page } = context;
+  await gotoTable(page, context.base, "/profiles", "profiles");
+  const table = page.locator('[data-table="profiles"]');
+  await assertNoDetailsControls(table, "the Profiles table");
   const drawer = await openProfileSummary(page, context.base, PROFILE_ALPHA.name);
   const text = await visibleText(drawer);
   assert.ok(text.includes(PROFILE_ALPHA.apiVersion), `the Profile summary does not show the apiVersion ${PROFILE_ALPHA.apiVersion}`);
   assert.ok(text.includes(PROFILE_ALPHA.owner), `the Profile summary does not show the owner ${PROFILE_ALPHA.owner}`);
+  assert.ok(text.includes(PROFILE_ALPHA.ownerKind), "the Profile summary does not show the observed owner kind");
+  assert.ok(text.includes("Active"), "the Profile summary does not show the observed state");
+  assert.match(text, /created/i, "the Profile summary does not show when the Profile was created");
+  assert.match(text, /resource version/i, "the Profile summary does not show the safe observed metadata heading");
+  assert.ok(text.includes("4242"), "the Profile summary does not show the observed safe resource metadata");
   for (const quota of PROFILE_ALPHA.quotas) {
     const pair = await quotaPair(drawer, quota.key, quota.value);
     assert.ok(pair.ok, `the Profile summary does not show ${quota.key} = ${quota.value} (${pair.how})`);
   }
   const unmanaged = await quotaPair(drawer, PROFILE_ALPHA.unmanaged.key, PROFILE_ALPHA.unmanaged.value);
   assert.ok(unmanaged.ok, `the Profile summary does not show ${PROFILE_ALPHA.unmanaged.key} = ${PROFILE_ALPHA.unmanaged.value} (${unmanaged.how})`);
+  // The management actions live in the one summary.
+  await findVisible(drawer, [
+    { role: "button", name: /^edit profile$/i },
+    { role: "button", name: /edit/i }
+  ], "the Profile edit action");
+  await findVisible(drawer, [
+    { role: "button", name: /delete profile/i },
+    { role: "button", name: /^delete/i }
+  ], "the Profile delete action");
+  await page.keyboard.press("Escape");
+  await drawer.waitFor({ state: "hidden", timeout: 5000 });
+
+  // A legacy Profile keeps its declared aliases and its raw device key. The
+  // raw key is visibly explained: standard Kubernetes does not enforce a bare
+  // device key as a device quota. No key is renamed to a canonical requests.*
+  // counterpart.
+  const legacy = await openProfileSummary(page, context.base, PROFILE_LEGACY.name);
+  const legacyText = await visibleText(legacy);
+  for (const quota of PROFILE_LEGACY.quotas) {
+    const pair = await quotaPair(legacy, quota.key, quota.value);
+    assert.ok(pair.ok, `the legacy Profile summary does not show ${quota.key} = ${quota.value} (${pair.how})`);
+  }
+  for (const extra of [PROFILE_LEGACY.unmanaged, PROFILE_LEGACY.counted]) {
+    const pair = await quotaPair(legacy, extra.key, extra.value);
+    assert.ok(pair.ok, `the legacy Profile summary does not show the unmanaged ${extra.key} = ${extra.value} (${pair.how})`);
+  }
+  assert.match(legacyText, /bare|not enforced|does not enforce|not a device quota|scheduling resource/i,
+    "the legacy Profile summary does not warn that a bare device key is not enforced as a device quota by standard Kubernetes");
+  // An enforced object-count quota is not a raw device key: the warning names
+  // only the bare GPU key and never all unmanaged keys.
+  const warning = (await visibleText(legacy.locator('p.warning[role="note"]'))).trim();
+  assert.ok(warning.includes("nvidia.com/gpu"), "the bare device warning does not name the observed GPU key");
+  assert.ok(!warning.includes(PROFILE_LEGACY.counted.key), "an object-count quota is reported as a raw device key");
+  for (const canonical of ["requests.nvidia.com/gpu", "requests.cpu", "requests.memory"]) {
+    assert.ok(!legacyText.includes(canonical), "the legacy Profile summary silently shows or migrates to the canonical key " + canonical);
+  }
 }
 
 // The Profile update form prefills the observed owner as a read-only value,
@@ -654,15 +879,7 @@ async function checkProfileUpdatePrefill(context) {
   assert.ok(observed, "the observed Profile is missing from the inventory");
   const digest = (observed.details || {})["configDigest"];
   assert.ok(digest, "the observed Profile carries no configuration digest");
-  const drawer = await openProfileSummary(page, context.base, PROFILE_ALPHA.name);
-  const edit = await findVisible(drawer, [
-    { role: "button", name: /^edit profile$/i },
-    { role: "button", name: /edit/i }
-  ], "the Profile edit action");
-  await edit.click();
-  const form = page.locator("#profile-drawer");
-  await form.waitFor({ state: "visible", timeout: 10000 });
-  await page.waitForTimeout(200);
+  const form = await openProfileEdit(page, context.base, PROFILE_ALPHA.name);
 
   // The update selector shows the Profile that is being updated.
   const selected = await form.locator("#profile-update-name").inputValue();
@@ -771,6 +988,97 @@ async function checkProfileUpdateRoundTrip(context) {
   await submit.click();
   await page.waitForTimeout(400);
   assert.equal(capture.operations.length, 1, "the reviewed update was not submitted exactly once");
+}
+
+// An existing Profile may declare quota keys this console has no static field
+// for: the cpu and memory aliases and a device key of its own. They are edited
+// under their own names. The declared key set never changes and no canonical
+// requests.* key is added beside them.
+async function checkLegacyQuotaKeyUpdate(context) {
+  const { page, capture } = context;
+  const observed = await observedProfile(context.base, PROFILE_LEGACY.name);
+  assert.ok(observed, "the legacy Profile is missing from the inventory");
+  const digest = (observed.details || {})["configDigest"];
+  assert.ok(digest, "the observed legacy Profile carries no configuration digest");
+  const drawer = await openProfileEdit(page, context.base, PROFILE_LEGACY.name);
+  assert.equal(await drawer.locator("#profile-kind").inputValue(), "profile.update",
+    "the Profile summary Edit action did not open the update form");
+  // The raw device warning stays visible before the plan is prepared.
+  assert.match(await visibleText(drawer), /bare|normally not enforced|requests\.<device>/i,
+    "the update form does not visibly warn that a bare device key is not enforced as a device quota");
+
+  // Every observed key is editable, prefilled and carries its own name.
+  for (const quota of PROFILE_LEGACY.quotas) {
+    const field = quotaInput(drawer, quota.key);
+    assert.ok(await field.count(), `the update form has no field for the observed quota ${quota.key}`);
+    assert.equal(await field.evaluate(node => node.readOnly === true), false, `the observed quota ${quota.key} is read-only in the update form`);
+    assert.equal(await field.inputValue(), quota.value, `the update form is not prefilled with the observed ${quota.key}`);
+  }
+  // Keys the console does not manage are shown, but never editable. An
+  // object-count quota is preserved exactly like a storage-class quota.
+  for (const observedExtra of [PROFILE_LEGACY.unmanaged, PROFILE_LEGACY.counted]) {
+    const extra = extraQuotaInput(drawer, observedExtra.key);
+    assert.ok(await extra.count(), `the update form does not show the unmanage quota key ${observedExtra.key}`);
+    const extraState = await extra.evaluate(node => ({
+      readOnly: node.readOnly === true,
+      disabled: node.disabled === true,
+      type: node.type,
+      value: node.value
+    }));
+    assert.ok(extraState.readOnly || extraState.disabled || extraState.type === "hidden",
+      "an unmanage quota key is editable in the update form");
+    assert.equal(extraState.value, observedExtra.value, "the unmanage quota key does not keep its observed value");
+  }
+
+  // The visible warning names the bare device key only. An object-count quota
+  // is unmanaged, not a device, and never raises the warning.
+  const editWarning = (await visibleText(drawer.locator("#profile-observed-quota-fields .warning"))).trim();
+  assert.ok(editWarning.includes("nvidia.com/gpu"), "the update form does not warn about the observed bare GPU key");
+  assert.ok(!editWarning.includes(PROFILE_LEGACY.counted.key), "the update form warns about an object-count quota as if it were a device");
+
+  // A device count is a whole number of devices: a fraction never reaches the
+  // plan API.
+  const before = capture.plans.length;
+  await quotaInput(drawer, "nvidia.com/gpu").fill("0.5");
+  await drawer.locator("#profile-reason").fill("Synthetic browser acceptance reason");
+  await drawer.locator('button[type="submit"]').click();
+  await page.waitForTimeout(400);
+  assert.equal(capture.plans.length, before, "a fractional device count reached the plan API");
+
+  // Only the CPU alias changes. The request carries exactly the observed key
+  // set: the aliases and the device key keep their own names.
+  await quotaInput(drawer, "nvidia.com/gpu").fill("4");
+  await quotaInput(drawer, "cpu").fill("96");
+  await drawer.locator('button[type="submit"]').click();
+  const dialog = page.locator("#plan-dialog");
+  await dialog.waitFor({ state: "visible", timeout: 10000 });
+  assert.equal(capture.plans.length, before + 1, "the update did not produce exactly one plan request");
+  const plan = capture.plans[capture.plans.length - 1].body;
+  assert.ok(plan && typeof plan === "object", "the update plan request is not a JSON object");
+  assert.equal(plan.kind, "profile.update", "the update request does not use the typed update kind");
+  assert.equal(plan.name, PROFILE_LEGACY.name, "the update request does not name the Profile");
+  assert.equal(plan.owner, PROFILE_LEGACY.owner, "the update request does not submit the unchanged owner");
+  assert.equal(plan.baseConfigDigest, digest, "the update request does not carry the base configuration digest of the observed Profile");
+  assert.ok(plan.quota && typeof plan.quota === "object", "the update request does not carry the quota values");
+  assert.equal(plan.quota["cpu"], "96", "the changed alias is submitted under its own name");
+  assert.equal(plan.quota["memory"], "256Gi", "the unchanged alias is submitted");
+  assert.equal(plan.quota["nvidia.com/gpu"], "4", "the device key is submitted under its own name");
+  assert.equal(plan.quota["persistentvolumeclaims"], "20", "the claim count is submitted");
+  assert.equal(plan.quota["requests.storage"], "500Gi", "the storage request is submitted");
+  assert.equal(plan.quota[PROFILE_LEGACY.unmanaged.key], PROFILE_LEGACY.unmanaged.value,
+    "the unmanage quota key is returned unchanged");
+  assert.equal(plan.quota[PROFILE_LEGACY.counted.key], PROFILE_LEGACY.counted.value,
+    "the unmanaged object-count quota is returned unchanged");
+  assert.deepEqual(Object.keys(plan.quota).sort(),
+    ["cpu", "memory", "nvidia.com/gpu", "persistentvolumeclaims", "requests.ephemeral-storage", "requests.storage", "count/jobs.batch"].sort(),
+    "the update carries exactly the observed key set");
+  for (const key of ["requests.cpu", "requests.memory", "requests.nvidia.com/gpu", "limits.cpu", "limits.memory", "pods"]) {
+    assert.equal(plan.quota[key], undefined, "the undeclared key " + key + " is never added");
+  }
+  // The validated difference names the changed key under its own name.
+  const changesText = await visibleText(page.locator("#plan-changes"));
+  assert.ok(changesText.includes("quota.cpu"), "the validated difference does not name the changed quota key");
+  assert.ok(changesText.includes("96"), "the validated difference does not show the new quota value");
 }
 
 // A plan that has already expired is never submitted. The expiry is
@@ -983,14 +1291,89 @@ async function checkNamespaceScopedLinks(context) {
   assert.ok(page.url().includes("/notebooks"), `the namespace summary link did not open the notebooks page (url=${page.url()})`);
   assert.ok(page.url().includes(NAMESPACE), "the scoped page lost the namespace scope");
   await page.locator('[data-table="notebooks"] tbody tr').first().waitFor({ timeout: 10000 });
-  const names = await page.locator('[data-table="notebooks"] tbody tr .resource-name > span').allTextContents();
-  const focused = names.map(text => text.trim()).filter(Boolean);
+  const focusedRows = page.locator('[data-table="notebooks"] tbody tr');
+  const focused = [];
+  for (let index = 0; index < await focusedRows.count(); index++) {
+    focused.push(await resourceNameText(focusedRows.nth(index)));
+  }
   assert.ok(focused.length > 0, "the scoped page shows no rows");
   for (const shown of focused) {
     assert.equal(shown, NOTEBOOK.name, `the scoped page shows an unrelated resource (${shown})`);
   }
   const search = await page.locator('[data-table="notebooks"] [data-search]').inputValue();
   assert.equal(search, NOTEBOOK.name, "the scoped page does not show the resource focus in the visible filter");
+
+  // A StatefulSet with the same name as an observed Notebook is its own
+  // resource. Its generated link may stay on the Notebooks page or move to the
+  // Overview, but it always carries kind, namespace and name. The runner
+  // follows the link the console really generated.
+  await gotoTable(page, context.base, "/namespaces", "namespaces");
+  const statefulRow = await rowFor(page, "namespaces", NAMESPACE);
+  const statefulOpener = await findVisible(statefulRow, [
+    { role: "button", name: NAMESPACE, exact: true },
+    `button:has-text("${NAMESPACE}")`
+  ], "the " + NAMESPACE + " namespace control");
+  await statefulOpener.click();
+  const statefulDrawer = page.locator("#namespace-summary-drawer");
+  await statefulDrawer.waitFor({ state: "visible", timeout: 10000 });
+  const statefulLink = await findVisible(statefulDrawer, [
+    { role: "link", name: new RegExp(`StatefulSet\\s+${STATEFULSET_WORK.name}`) },
+    `a[href*="kind=StatefulSet"]`
+  ], "the StatefulSet " + STATEFULSET_WORK.name + " link");
+  const statefulHref = await statefulLink.getAttribute("href");
+  const statefulUrl = new URL(statefulHref, "http://console.invalid");
+  const statefulValues = [...statefulUrl.searchParams.values()].map(value => value.toLowerCase());
+  assert.ok(statefulValues.includes("statefulset"), "the StatefulSet link does not carry its kind (href=" + statefulHref + ")");
+  assert.ok(statefulValues.includes(NAMESPACE), "the StatefulSet link is not namespace scoped (href=" + statefulHref + ")");
+  assert.ok(statefulValues.includes(STATEFULSET_WORK.name), "the StatefulSet link does not carry the resource name (href=" + statefulHref + ")");
+  await statefulLink.click();
+  await page.locator("#page-title").waitFor({ timeout: 10000 });
+  const statefulPath = new URL(page.url()).pathname;
+  if (statefulPath === "/notebooks") {
+    // The Notebooks page only lists Notebook rows: a StatefulSet focus may
+    // never bring a StatefulSet row back into it.
+    const rows = page.locator('[data-table="notebooks"] tbody tr');
+    for (let index = 0; index < await rows.count(); index++) {
+      assert.equal(await rowKind(rows.nth(index)), "Notebook",
+        "a StatefulSet link brought a non-Notebook row back into the Notebooks page");
+    }
+  } else {
+    assert.ok(["/", "/overview"].includes(statefulPath),
+      "the StatefulSet link opened an unrelated page (" + page.url() + ")");
+  }
+
+  // The Notebook link of the same collision stays a Notebook focus: kind,
+  // namespace and name select exactly one Notebook row, never the StatefulSet
+  // or the Pod that share the name.
+  await gotoTable(page, context.base, "/namespaces", "namespaces");
+  const notebookWorkRow = await rowFor(page, "namespaces", NAMESPACE);
+  const notebookWorkOpener = await findVisible(notebookWorkRow, [
+    { role: "button", name: NAMESPACE, exact: true },
+    `button:has-text("${NAMESPACE}")`
+  ], "the " + NAMESPACE + " namespace control");
+  await notebookWorkOpener.click();
+  const notebookWorkDrawer = page.locator("#namespace-summary-drawer");
+  await notebookWorkDrawer.waitFor({ state: "visible", timeout: 10000 });
+  const notebookWorkLink = await findVisible(notebookWorkDrawer, [
+    { role: "link", name: new RegExp(`Notebook\\s+${NOTEBOOK_WORK.name}`) },
+    `a[href*="kind=Notebook"]`
+  ], "the Notebook " + NOTEBOOK_WORK.name + " link");
+  const notebookWorkHref = await notebookWorkLink.getAttribute("href");
+  const notebookWorkUrl = new URL(notebookWorkHref, "http://console.invalid");
+  const notebookWorkValues = [...notebookWorkUrl.searchParams.values()].map(value => value.toLowerCase());
+  assert.ok(notebookWorkValues.includes("notebook"), "the colliding Notebook link does not carry its kind (href=" + notebookWorkHref + ")");
+  assert.ok(notebookWorkValues.includes(NAMESPACE), "the colliding Notebook link is not namespace scoped (href=" + notebookWorkHref + ")");
+  assert.ok(notebookWorkValues.includes(NOTEBOOK_WORK.name), "the colliding Notebook link does not carry the resource name (href=" + notebookWorkHref + ")");
+  await notebookWorkLink.click();
+  await page.locator("#page-title").waitFor({ timeout: 10000 });
+  assert.ok(new URL(page.url()).pathname === "/notebooks", "the Notebook link did not open the Notebooks page (" + page.url() + ")");
+  const workRows = page.locator('[data-table="notebooks"] tbody tr');
+  await workRows.first().waitFor({ timeout: 10000 });
+  assert.equal(await workRows.count(), 1, "the colliding Notebook link did not select exactly one row");
+  assert.equal(await resourceNameText(workRows.first()), NOTEBOOK_WORK.name, "the colliding Notebook link selected another resource");
+  assert.equal(await rowKind(workRows.first()), "Notebook", "the colliding Notebook link selected a non-Notebook row");
+  assert.equal(await page.locator('[data-table="notebooks"] [data-search]').inputValue(), NOTEBOOK_WORK.name,
+    "the colliding Notebook link does not show its exact resource focus");
 }
 
 // Resources of different kinds can share a name, and the same name can exist
@@ -1023,28 +1406,78 @@ async function checkCollidingResourceRows(context) {
   }
   assert.equal(shared.length, 2, `the pods table does not show both Pods named shared-worker (${shared.join(", ")})`);
   assert.deepEqual(shared.sort(), ["team-alpha", "team-beta"], "the Pods named shared-worker are not distinguished by their namespace");
+
+  // A Notebook, a StatefulSet and a Pod share the name "work" in each
+  // namespace. The Notebooks page shows only the Notebook row, and a row is
+  // only matched by its exact kind, namespace and name.
+  for (const namespace of [NAMESPACE, BETA_WORK.namespace]) {
+    await page.goto(context.base + "/notebooks?namespace=" + encodeURIComponent(namespace), { waitUntil: "domcontentloaded" });
+    const table = page.locator('[data-table="notebooks"]');
+    await table.locator("tbody tr").first().waitFor({ timeout: 10000 });
+    await assertNoDetailsControls(table, "the Notebooks table");
+    const scopedRows = table.locator("tbody tr");
+    const work = [];
+    for (let index = 0; index < await scopedRows.count(); index++) {
+      const row = scopedRows.nth(index);
+      assert.equal(await rowKind(row), "Notebook",
+        "the Notebooks page lists a non-Notebook row (kind " + await rowKind(row) + ")");
+      const shown = await resourceNameText(row);
+      if (shown === NOTEBOOK_WORK.name) work.push(row);
+    }
+    assert.equal(work.length, 1,
+      "the Notebooks page does not show exactly one Notebook row named " + NOTEBOOK_WORK.name + " in " + namespace);
+    const meta = (await work[0].locator(".resource-name small").innerText()).trim();
+    assert.ok(meta.includes(namespace), "the Notebook row named work does not carry its namespace " + namespace + " (" + meta + ")");
+  }
+  // A search without a namespace scope finds two Notebooks named "work", not
+  // the six resources of three kinds that share the name.
+  await gotoTable(page, context.base, "/notebooks", "notebooks");
+  await page.locator('[data-table="notebooks"] [data-search]').fill(NOTEBOOK_WORK.name);
+  await page.waitForTimeout(400);
+  const workRows = page.locator('[data-table="notebooks"] tbody tr');
+  const workNamespaces = [];
+  for (let index = 0; index < await workRows.count(); index++) {
+    const row = workRows.nth(index);
+    assert.equal(await rowKind(row), "Notebook", "a Pod or StatefulSet named work is listed on the Notebooks page");
+    if (await resourceNameText(row) !== NOTEBOOK_WORK.name) continue;
+    const meta = (await row.locator(".resource-name small").innerText()).trim();
+    workNamespaces.push(meta.split("·")[1].trim());
+  }
+  assert.equal(workNamespaces.length, 2, "the Notebooks page does not show both Notebooks named work (" + workNamespaces.join(", ") + ")");
+  assert.deepEqual(workNamespaces.sort(), ["team-alpha", "team-beta"],
+    "the Notebooks named work are not distinguished by their namespace");
+  // The Pods and StatefulSet still exist on their own pages; only the
+  // Notebooks page filters them out.
+  await gotoTable(page, context.base, "/pods", "pods");
+  const podWork = [];
+  const podRowsWork = page.locator('[data-table="pods"] tbody tr');
+  for (let index = 0; index < await podRowsWork.count(); index++) {
+    if (await resourceNameText(podRowsWork.nth(index)) === POD_WORK.name) podWork.push(podRowsWork.nth(index));
+  }
+  assert.equal(podWork.length, 2, "the Pods page lost the Pods named work");
+  // The visible Notebook name is its details handle.
+  await page.goto(context.base + "/notebooks?namespace=" + encodeURIComponent(NAMESPACE), { waitUntil: "domcontentloaded" });
+  await page.locator('[data-table="notebooks"] tbody tr').first().waitFor({ timeout: 10000 });
+  const details = await clickResourceName(page, "notebooks", NOTEBOOK_WORK.name);
+  assert.ok((await visibleText(details)).includes("image.notebook"), "the colliding Notebook name did not open its own Notebook details");
+  await page.keyboard.press("Escape");
+  await details.waitFor({ state: "hidden", timeout: 5000 });
 }
 
-// The observed details of a Pod, Node, Notebook and volume open the right
-// hand drawer instead of an inline disclosure.
+// The observed details of a Pod, Node and Notebook open from the visible
+// resource name into the right hand RESOURCE DETAILS drawer. Those tables have
+// no separate Details button or column. Storage keeps its name handle as well.
 async function checkResourceDetailsDrawer(context) {
   const { page } = context;
   const cases = [
     { route: "/pods", table: "pods", resource: POD },
     { route: "/nodes", table: "nodes", resource: NODE },
-    { route: "/notebooks", table: "notebooks", resource: NOTEBOOK },
-    { route: "/storage", table: "storage", resource: CLAIM }
+    { route: "/notebooks", table: "notebooks", resource: NOTEBOOK }
   ];
   for (const testCase of cases) {
     await gotoTable(page, context.base, testCase.route, testCase.table);
-    const row = await rowFor(page, testCase.table, testCase.resource.name);
-    const details = row.locator(`button[aria-label="Details for ${testCase.resource.kind} ${testCase.resource.name}"]`);
-    const control = (await details.count()) ? details.first() : await findVisible(row, [
-      { role: "button", name: /^details/i }
-    ], `the details control of the ${testCase.resource.name} row`);
-    await control.click();
-    const drawer = page.locator("#resource-details-drawer");
-    await drawer.waitFor({ state: "visible", timeout: 10000 });
+    await assertNoDetailsControls(page.locator(`[data-table="${testCase.table}"]`), `the ${testCase.table} table`);
+    const drawer = await clickResourceName(page, testCase.table, testCase.resource.name);
     const title = (await drawer.locator("#resource-details-title").innerText()).trim();
     assert.equal(title, testCase.resource.name, "the details drawer does not name the observed resource");
     const text = await visibleText(drawer);
@@ -1067,6 +1500,265 @@ async function checkResourceDetailsDrawer(context) {
   await assertRightAligned(page, drawer, "the resource details drawer");
 }
 
+// The Notebook details drawer is the one place that opens Notebook
+// management. Manage Notebook binds the exact observed namespace, Notebook and
+// container. Close and Escape return the focus to a visible control of that
+// same Notebook, never to the Manage control inside a closed details drawer.
+async function checkNotebookManagementTarget(context) {
+  const { page, capture } = context;
+  const details = await openNotebookDetails(page, context.base);
+  const modelText = await visibleText(details);
+  assert.ok(modelText.includes(NOTEBOOK_MODEL.claim), "the Notebook details drawer does not show the observed storage claim");
+  assert.ok(modelText.includes(NOTEBOOK_MODEL.container), "the Notebook details drawer does not show the observed container");
+  assert.ok(modelText.includes(NOTEBOOK_MODEL.storageClass), "the Notebook details drawer does not show the observed storage class");
+  assert.ok(modelText.includes(NOTEBOOK_MODEL.image), "the Notebook details drawer does not show the observed container image");
+  assert.ok(modelText.includes("4 CPU / 8Gi"), "the Notebook details drawer does not show the observed requested resources");
+  const manage = await notebookManageControl(details);
+  assert.equal(await manage.isDisabled().catch(() => false), false,
+    "Manage Notebook is disabled while writes and the controller contract are enabled");
+
+  await manage.click();
+  const form = await findVisible(page, [
+    "#notebook-drawer",
+    "#notebook-management-drawer",
+    '[data-drawer="notebook-management"]'
+  ], "the Notebook management drawer");
+  await form.locator("form").first().waitFor({ timeout: 10000 });
+  // The target is preselected from the opened Notebook, not reset or guessed.
+  const namespaceField = await notebookField(form, [
+    '#notebook-form [name="namespace"]',
+    '[name="targetNamespace"]',
+    '#notebook-target-namespace'
+  ]);
+  assert.equal(await namespaceField.inputValue(), NOTEBOOK_MODEL.namespace,
+    "Notebook management is not preselected with the observed namespace");
+  const notebookSelector = await notebookField(form, [
+    "#notebook-selector",
+    '[name="notebookName"]',
+    '#notebook-form select[name="name"]'
+  ]);
+  assert.equal(await notebookSelector.inputValue(), NOTEBOOK_MODEL.name,
+    "Notebook management is not preselected with the observed Notebook");
+  // The container and its declared resources come from the typed detail
+  // document.
+  const containerSelector = await notebookField(form, ["#container-selector", '[name="container"]']);
+  const optionValues = await containerSelector.locator("option").evaluateAll(nodes => nodes.map(node => node.value || node.textContent));
+  assert.ok(optionValues.includes(NOTEBOOK_MODEL.container),
+    "the Notebook management form does not offer the observed container (" + optionValues.join(", ") + ")");
+  // Opening the exact Notebook never silently switches the action to Edit.
+  const action = await notebookField(form, ["#notebook-kind", '[name="kind"]']);
+  assert.equal(await action.inputValue(), "notebook.start", "opening Notebook management silently changed the selected action");
+  // Nothing is planned just by opening the management drawer.
+  assert.equal(capture.plans.length, 0, "opening Notebook management planned a change");
+  assert.equal(capture.operations.length, 0, "opening Notebook management submitted an operation");
+
+  // Close and Escape both return the focus to a visible control of the exact
+  // Notebook. They never focus the Manage control inside a closed drawer.
+  const key = [NOTEBOOK_MODEL.kind, NOTEBOOK_MODEL.namespace, NOTEBOOK_MODEL.name].join("|");
+  await form.locator("[data-close-drawer]").first().click();
+  await form.waitFor({ state: "hidden", timeout: 5000 });
+  await assertNotebookManageFocus(page, details, manage, key);
+
+  // Escape follows the same path. If the console handed the details drawer
+  // over to management, the visible Notebook row control is used again.
+  let reopened = details;
+  let reopenedManage = manage;
+  if (!(await details.isVisible().catch(() => false))) {
+    reopened = await clickResourceName(page, "notebooks", NOTEBOOK_MODEL.name);
+    reopenedManage = await notebookManageControl(reopened);
+  }
+  await reopenedManage.click();
+  await form.waitFor({ state: "visible", timeout: 10000 });
+  await page.keyboard.press("Escape");
+  await form.waitFor({ state: "hidden", timeout: 5000 });
+  await assertNotebookManageFocus(page, reopened, reopenedManage, key);
+}
+
+// The production observation has no Notebook details API and no resource or
+// mount prefill. Those fields intentionally start blank on Edit: a blank field
+// keeps the installed configuration. The runner types a CPU request and one PVC
+// mount itself and proves the typed plan carries exactly those values.
+async function checkNotebookEditBlankAndPayload(context) {
+  const { page, capture } = context;
+  const { form } = await openNotebookManagement(page, context.base, NOTEBOOK_WORK);
+  const action = await notebookField(form, ["#notebook-kind", '[name="kind"]']);
+  assert.equal(await action.inputValue(), "notebook.start", "opening Notebook management silently changed the selected action");
+  await action.selectOption("notebook.edit");
+  await page.waitForTimeout(150);
+
+  // The installed configuration is not projected into these fields. Blank is
+  // the visible "keep current" state.
+  for (const name of ["cpuRequest", "cpuLimit", "memoryRequest", "memoryLimit", "gpuCount"]) {
+    const field = await notebookField(form, [`[name="${name}"]`]);
+    assert.equal(await field.inputValue(), "", "the Edit form invents a " + name + " instead of keeping the installed value");
+  }
+  for (const name of ["image", "gpuPreset"]) {
+    const field = await notebookField(form, [`[name="${name}"]`]);
+    assert.equal(await field.inputValue(), "", "the Edit form invents a " + name + " instead of keeping the installed value");
+  }
+  assert.equal(await form.locator("#replace-mounts").isChecked(), false, "the Edit form replaces mounts by default");
+  assert.equal(await form.locator(".mount-row").count(), 0, "the Edit form invents a PVC mount instead of keeping the installed one");
+  assert.equal(await form.locator('[name="restart"]').isChecked(), false, "the Edit form restarts the Notebook by default");
+  assert.equal(await form.locator("#notebook-selector").inputValue(), NOTEBOOK_WORK.name, "the Edit form lost the selected Notebook");
+  assert.equal(await (await notebookField(form, ["#container-selector", '[name="container"]'])).inputValue(), NOTEBOOK_MODEL.container,
+    "the Edit form did not select the one observed container");
+  // A visible hint explains that a blank field keeps the installed value.
+  const preserveHint = form.locator("#notebook-preserve-hint");
+  assert.equal(await preserveHint.isVisible().catch(() => false), true,
+    "the Edit form does not show the blank-preserve hint");
+  const preserveText = (await visibleText(preserveHint)).trim();
+  assert.match(preserveText, /blank.*preserve|preserve.*existing|mounts are kept|keep the existing/i,
+    "the blank-preserve hint does not explain what a blank field keeps (" + JSON.stringify(preserveText) + ")");
+
+  // Type only the intended change.
+  await (await notebookField(form, ['[name="cpuRequest"]'])).fill("2");
+  await form.locator("#add-mount").click();
+  const row = form.locator(".mount-row").last();
+  await row.locator('[data-field="name"]').fill("team-alpha-claim");
+  await row.locator('[data-field="claim"]').selectOption("team-alpha-claim");
+  await row.locator('[data-field="path"]').fill("/home/jovyan/data");
+  await row.locator('[data-field="readOnly"]').check();
+  await form.locator('[name="reason"]').fill("Synthetic browser acceptance reason");
+
+  const before = capture.plans.length;
+  await form.locator('#notebook-form button[type="submit"]').click();
+  const dialog = page.locator("#plan-dialog");
+  await dialog.waitFor({ state: "visible", timeout: 10000 });
+  assert.equal(capture.plans.length, before + 1, "the Notebook edit did not produce exactly one plan request");
+  const plan = capture.plans[capture.plans.length - 1].body;
+  assert.ok(plan && typeof plan === "object", "the Notebook edit plan is not a JSON object");
+  assert.equal(plan.kind, "notebook.edit", "the Notebook edit request does not use the typed edit kind");
+  assert.equal(plan.namespace, NOTEBOOK_WORK.namespace, "the Notebook edit request does not carry the observed namespace");
+  assert.equal(plan.name, NOTEBOOK_WORK.name, "the Notebook edit request does not carry the observed Notebook");
+  assert.equal(plan.container, NOTEBOOK_MODEL.container, "the Notebook edit request does not carry the observed container");
+  assert.equal(plan.cpuRequest, "2", "the Notebook edit request does not carry the typed CPU request");
+  assert.equal(plan.cpuLimit, undefined, "a blank CPU limit was invented in the Notebook edit request");
+  assert.equal(plan.memoryRequest, undefined, "a blank memory request was invented in the Notebook edit request");
+  assert.equal(plan.memoryLimit, undefined, "a blank memory limit was invented in the Notebook edit request");
+  assert.equal(plan.image, undefined, "a blank image was invented in the Notebook edit request");
+  assert.equal(plan.gpuPreset, undefined, "a blank GPU preset was invented in the Notebook edit request");
+  assert.equal(plan.gpuCount, undefined, "a blank GPU count was invented in the Notebook edit request");
+  assert.equal(plan.restart, false, "the Notebook edit request restarts the workload by default");
+  assert.deepEqual(plan.mounts, [
+    { name: "team-alpha-claim", claim: "team-alpha-claim", path: "/home/jovyan/data", readOnly: true }
+  ], "the Notebook edit request does not carry exactly the typed PVC mount");
+  assert.equal(capture.operations.length, 0, "the Notebook edit was submitted before the plan was reviewed");
+}
+
+// Switching to another Notebook or container is a new target. No typed value,
+// mount row, restart flag or old validation message may travel with it.
+async function checkNotebookSwitchClearsTypedState(context) {
+  const { page } = context;
+  const { form } = await openNotebookManagement(page, context.base, NOTEBOOK_WORK);
+  await (await notebookField(form, ["#notebook-kind", '[name="kind"]'])).selectOption("notebook.edit");
+  await page.waitForTimeout(150);
+  for (const [name, value] of [["cpuRequest", "2"], ["cpuLimit", "3"], ["memoryRequest", "4Gi"], ["memoryLimit", "5Gi"], ["gpuCount", "1"]]) {
+    await (await notebookField(form, [`[name="${name}"]`])).fill(value);
+  }
+  await (await notebookField(form, ['[name="image"]'])).selectOption(NOTEBOOK_MODEL.image);
+  await (await notebookField(form, ['[name="gpuPreset"]'])).selectOption("L4");
+  await form.locator('[name="restart"]').check();
+  await form.locator("#add-mount").click();
+  const row = form.locator(".mount-row").last();
+  await row.locator('[data-field="name"]').fill("old-mount");
+  await row.locator('[data-field="claim"]').selectOption("team-alpha-claim");
+  await row.locator('[data-field="path"]').fill("/home/jovyan/old");
+  await form.locator('[name="reason"]').fill("Reason typed for the first Notebook");
+  // A visible target error from the previous selection must not survive the
+  // switch. It is placed in the drawer exactly as a refused submission leaves it.
+  await form.evaluate(node => {
+    const region = node.querySelector(".form-error");
+    if (!region) return;
+    region.textContent = "The previous Notebook target changed. Reopen it.";
+    region.hidden = false;
+  });
+  assert.equal(await form.locator(".form-error").isVisible().catch(() => false), true,
+    "the test could not place a visible stale form error");
+
+  // Select another observed Notebook. It is a new exact target.
+  await (await notebookField(form, ["#notebook-selector", '[name="notebookName"]'])).selectOption(NOTEBOOK.name);
+  await page.waitForTimeout(250);
+  assert.equal(await (await notebookField(form, ['#notebook-form [name="namespace"]'])).inputValue(), NOTEBOOK.namespace,
+    "switching Notebook lost the namespace target");
+  assert.equal(await (await notebookField(form, ["#notebook-selector", '[name="notebookName"]'])).inputValue(), NOTEBOOK.name,
+    "switching Notebook did not bind the new observed Notebook");
+  for (const name of ["cpuRequest", "cpuLimit", "memoryRequest", "memoryLimit", "gpuCount"]) {
+    assert.equal(await (await notebookField(form, [`[name="${name}"]`])).inputValue(), "",
+      "switching Notebook carried the old " + name + " value");
+  }
+  for (const name of ["image", "gpuPreset"]) {
+    assert.equal(await (await notebookField(form, [`[name="${name}"]`])).inputValue(), "",
+      "switching Notebook carried the old " + name + " value");
+  }
+  assert.equal(await form.locator("#replace-mounts").isChecked(), false, "switching Notebook carried the old mount replacement flag");
+  assert.equal(await form.locator(".mount-row").count(), 0, "switching Notebook carried the old PVC mount row");
+  assert.equal(await form.locator('[name="restart"]').isChecked(), false, "switching Notebook carried the old restart flag");
+  assert.equal(await form.locator(".form-error").isVisible().catch(() => false), false,
+    "switching Notebook carried the old validation message");
+  assert.equal((await form.locator(".form-error").innerText().catch(() => "")).trim(), "",
+    "switching Notebook left the old validation text in the drawer");
+  assert.equal(await form.locator("#notebook-target-warning").isVisible().catch(() => false), false,
+    "a freshly selected observed Notebook shows a target warning");
+  // The selected action is not silently switched on a target change.
+  assert.equal(await (await notebookField(form, ["#notebook-kind", '[name="kind"]'])).inputValue(), "notebook.edit",
+    "switching Notebook silently changed the selected action");
+
+  // A fresh Manage Notebook opening is a new operation context: the reason
+  // typed for the previous Notebook is not reused.
+  const reason = form.locator('#notebook-form [name="reason"]');
+  assert.equal(await reason.inputValue(), "Reason typed for the first Notebook",
+    "the test did not leave the first reason in the form");
+  await form.locator("[data-close-drawer]").first().click();
+  await form.waitFor({ state: "hidden", timeout: 5000 });
+  const reopenedDetails = await clickResourceName(page, "notebooks", NOTEBOOK_WORK.name);
+  const reopenedManage = await notebookManageControl(reopenedDetails);
+  await reopenedManage.click();
+  await form.waitFor({ state: "visible", timeout: 10000 });
+  assert.equal(await reason.inputValue(), "", "a fresh Manage Notebook opening reused the previous reason");
+  assert.equal(await (await notebookField(form, ['[name="cpuRequest"]'])).inputValue(), "",
+    "a fresh Manage Notebook opening reused the previous typed resource");
+
+  // The page-level opener is a new operation context as well: it does not
+  // reuse the reason of the Notebook that was just managed.
+  await reason.fill("Reason typed for the details opener");
+  await form.locator("[data-close-drawer]").first().click();
+  await form.waitFor({ state: "hidden", timeout: 5000 });
+  const pageOpener = await findVisible(page, [
+    '[data-open-drawer="notebook"]',
+    { role: "button", name: /manage notebook/i }
+  ], "the page-level Notebook management control");
+  await pageOpener.click();
+  await form.waitFor({ state: "visible", timeout: 10000 });
+  assert.equal(await reason.inputValue(), "", "the page-level Manage Notebook opener reused the previous reason");
+  assert.equal(await (await notebookField(form, ['[name="cpuRequest"]'])).inputValue(), "",
+    "the page-level Manage Notebook opener reused the previous typed resource");
+}
+
+// Notebook writes depend on two independent capabilities: writes and a
+// confirmed Notebook controller contract. When either is absent, the details
+// drawer never offers an enabled management action.
+async function checkNotebookManagementGated(context, label) {
+  const { page, capture } = context;
+  const state = await fetchJson(context.base + "/__fixture").catch(() => null);
+  const details = await openNotebookDetails(page, context.base);
+  const manage = await notebookManageControl(details, { soft: true });
+  if (!state) {
+    console.log("NOTE  profile_browser_optional: the external fixture does not expose its capabilities; Manage Notebook is " + (manage ? "offered" : "not offered") + " (" + label + ")");
+    return;
+  }
+  if (state.features.notebookWrites !== false) {
+    // An external console was supplied instead of a gated synthetic fixture.
+    console.log("NOTE  profile_browser_optional: the supplied console still projects Notebook writes; " + label + " gating is not probed");
+    return;
+  }
+  if (manage) {
+    assert.equal(await manage.isDisabled().catch(() => false), true,
+      "Manage Notebook is enabled without " + label);
+  }
+  assert.equal(capture.plans.length, 0, "a gated Notebook management action planned a change (" + label + ")");
+  assert.equal(capture.operations.length, 0, "a gated Notebook management action submitted an operation (" + label + ")");
+}
+
 // The configuration precondition of a Profile is an internal request guard:
 // it is never rendered and never searchable.
 async function checkDigestNotExposed(context) {
@@ -1077,20 +1769,17 @@ async function checkDigestNotExposed(context) {
   await gotoTable(page, context.base, "/profiles", "profiles");
   // The precondition is never rendered with the observed Profile.
   const table = page.locator('[data-table="profiles"]');
+  await assertNoDetailsControls(table, "the Profiles table");
   assert.ok(!(await visibleText(table)).includes(digest), "the configuration precondition is rendered");
-  // The observed details drawer hides it as well.
-  const row = await rowFor(page, "profiles", PROFILE_ALPHA.name);
-  const details = row.locator('button[aria-label="Details for Profile team-alpha"]');
-  const control = (await details.count()) ? details.first() : await findVisible(row, [
-    { role: "button", name: /^details/i }
-  ], "the details control of the Profile row");
-  await control.click();
-  const drawer = page.locator("#resource-details-drawer");
-  await drawer.waitFor({ state: "visible", timeout: 10000 });
-  assert.ok(!(await visibleText(drawer)).includes(digest), "the configuration precondition is rendered in the details drawer");
+  // The one Profile summary hides it as well, and there is no generic
+  // resource details drawer behind the Profile name.
+  const drawer = await openProfileSummary(page, context.base, PROFILE_ALPHA.name);
+  assert.ok(!(await visibleText(drawer)).includes(digest), "the configuration precondition is rendered in the Profile summary");
+  assert.equal(await page.locator("#resource-details-drawer").isVisible().catch(() => false), false,
+    "a generic RESOURCE DETAILS drawer was opened for a Profile");
   await page.keyboard.press("Escape");
   await drawer.waitFor({ state: "hidden", timeout: 5000 });
-  // It is not part of the searchable observation either.
+  // The summary digest is never searchable either.
   const search = table.locator("[data-search]");
   await search.fill(digest);
   await page.waitForTimeout(300);
@@ -1170,6 +1859,8 @@ async function checkResponsive(context) {
 
   let base = process.env.DASHBOARD_BASE_URL;
   let gatedBase = base;
+  let readonlyBase = base;
+  let noContractBase = base;
   const fixtures = [];
   let artifactDir = "";
   if (!base) {
@@ -1186,6 +1877,12 @@ async function checkResponsive(context) {
       const gated = await startFixture({ artifact, writes: true, deletion: false, port: GATED_FIXTURE_PORT });
       fixtures.push(gated);
       gatedBase = gated.base;
+      const readonly = await startFixture({ artifact, writes: false, deletion: false, port: READONLY_FIXTURE_PORT });
+      fixtures.push(readonly);
+      readonlyBase = readonly.base;
+      const noContract = await startFixture({ artifact, writes: true, deletion: false, contract: false, port: NOCONTRACT_FIXTURE_PORT });
+      fixtures.push(noContract);
+      noContractBase = noContract.base;
     } catch (error) {
       console.error("FAIL profile_browser_optional: the synthetic fixture could not be built or started (" + error.message + ")");
       for (const fixture of fixtures) fixture.stop();
@@ -1221,7 +1918,7 @@ async function checkResponsive(context) {
     page.on("pageerror", error => errors.push(String((error && error.message) || error)));
     const capture = attachCapture(page);
     try {
-      await fn({ page, capture, errors, base: options.base || base, gatedBase });
+      await fn({ page, capture, errors, base: options.base || base, gatedBase, readonlyBase, noContractBase });
       passed.push(title);
     } catch (error) {
       failures.push(title + ": " + (error && error.message ? error.message : String(error)));
@@ -1240,6 +1937,7 @@ async function checkResponsive(context) {
     await run("the Profile summary shows the apiVersion, owner and quotas", checkProfileSummaryContents);
     await run("the Profile update form is prefilled with the owner and quotas", checkProfileUpdatePrefill);
     await run("an update carries the precondition and the unchanged owner", checkProfileUpdateRoundTrip);
+    await run("an existing alias and device key are edited under their own names", checkLegacyQuotaKeyUpdate);
     await run("a plan that has expired is never submitted", checkExpiredPlanRefused);
     await run("an observed quota of zero never blocks an update", checkZeroQuotaUpdate);
     await run("the destructive Profile action is gated by the deletion capability", checkDeletionCapabilityGated, { base: gatedBase });
@@ -1247,6 +1945,11 @@ async function checkResponsive(context) {
     await run("the namespace summary links are scoped and filtered by name", checkNamespaceScopedLinks);
     await run("resources of different kinds can share a name", checkCollidingResourceRows);
     await run("the observed details open the right hand drawer", checkResourceDetailsDrawer);
+    await run("Manage Notebook binds the exact observed target and returns focus", checkNotebookManagementTarget);
+    await run("Notebook Edit keeps blank fields and sends exactly the typed change", checkNotebookEditBlankAndPayload);
+    await run("switching Notebook clears typed resources, mounts and errors", checkNotebookSwitchClearsTypedState);
+    await run("Manage Notebook is gated when writes are disabled", context => checkNotebookManagementGated(context, "writes"), { base: readonlyBase });
+    await run("Manage Notebook is gated without the controller contract", context => checkNotebookManagementGated(context, "controller contract"), { base: noContractBase });
     await run("the configuration precondition is never rendered or searchable", checkDigestNotExposed);
     await run("clear filters resets the search and the namespace scope", checkClearFilters);
     await run("the sidebar keeps its copyright", checkCopyright);

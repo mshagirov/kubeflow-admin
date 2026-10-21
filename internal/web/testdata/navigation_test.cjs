@@ -116,6 +116,8 @@ for (const drawer of ["profile-drawer", "storage-drawer", "notebook-drawer", "pr
 assert.equal((html.match(/aria-modal="true"/g) || []).length >= 8, true);
 assert.ok(html.includes('id="resource-details-body"') && html.includes('aria-labelledby="resource-details-title"'), "the observed resource details drawer is a labelled modal dialog");
 assert.ok(app.includes("openResourceDetails") && app.includes("detailEntries"), "observed resource details open the right-side drawer");
+assert.ok(app.includes('(resource?.kind || "") === "Profile"') && app.includes('openProfileSummary(resource.name || "", opener)'), "generic Profile details always hand over to the consolidated summary");
+assert.ok(app.includes("logic.notebookResources(scoped)") && app.includes("nameDetailsKinds"), "Notebook rows are Notebook CRs only and names open resource details");
 assert.equal(app.includes("detailsNode"), false, "resource details never use an inline disclosure");
 assert.ok(app.includes('el("details", undefined, "stage-details")'), "audit stage details keep their lazy disclosure");
 assert.ok(app.includes("data-clear-filters") && app.includes("clearFilters"), "every table offers a clear-filters control");
@@ -142,6 +144,7 @@ assert.ok(app.includes("profileNameValidation") && app.includes("profileFormValu
 assert.ok(app.includes("profile-use-suggestion") && app.includes("aria-describedby"), "the name suggestion is explicit and accessible");
 for (const kind of ["profile", "storage", "notebook"]) assert.ok(html.includes(`data-open-drawer="${kind}"`));
 assert.ok(html.includes('id="profile-form"') && html.includes('id="storage-form"') && html.includes('id="notebook-form"') && html.includes('id="pod-restart-form"') && html.includes('id="node-cordon-form"'));
+assert.ok(html.includes("notebook-preserve-hint") && html.includes("Blank resource and image fields preserve") && html.includes("PVC mounts are kept unless Replace is selected") && html.includes("validated plan’s before/after changes"), "Notebook management states that blanks preserve current configuration and mounts stay unless replaced");
 assert.ok(html.includes('name="kind" value="pod.restart"'));
 assert.ok(html.includes('name="kind" value="node.cordon"'));
 assert.ok(html.includes("spec.unschedulable=true") || app.includes("spec.unschedulable=true"), "cordon description explains the exact effect");
@@ -386,7 +389,12 @@ async function bootHarness(options = {}) {
     profileControls.profileOwner, profileControls.profileBaseConfigDigest, profileControls.reason, ...profileQuotaInputs];
   // The unmanaged quota keys are round-tripped through hidden controls the
   // application creates at runtime, exactly as a browser would submit them.
-  Object.defineProperty(forms[0], "controls", { get() { return [...staticProfileControls, ...registryMatches("[data-profile-quota-extra]")]; } });
+  // The editable fields the application creates for an observed key are part
+  // of the form as well, so they are submitted the same way.
+  Object.defineProperty(forms[0], "controls", { get() {
+    const runtime = registryMatches("[data-profile-quota]").filter(input => !staticProfileControls.includes(input));
+    return [...staticProfileControls, ...registryMatches("[data-profile-quota-extra]"), ...runtime];
+  } });
   const deleteControls = { kind: control("kind", "profile.delete"), name: control("name"), reason: control("reason"), confirmName: control("confirmName") };
   for (const [id, name] of [["#profile-delete-name", "name"], ["#profile-delete-reason", "reason"], ["#profile-delete-confirm", "confirmName"]]) {
     const stub = get(id);
@@ -394,7 +402,36 @@ async function bootHarness(options = {}) {
     deleteControls[name] = stub;
   }
   forms[4].controls = [deleteControls.kind, deleteControls.name, deleteControls.reason, deleteControls.confirmName];
-  forms[2].controls = [control("kind", "notebook.stop"), control("namespace", "team-a"), control("name", "work-000"), control("reason", "Synthetic retry reason")];
+  // The Notebook form controls are the same nodes the application resolves:
+  // changing a target can be observed in the payload exactly as in a browser.
+  const notebookEdit = get("#notebook-edit");
+  const notebookControls = {
+    kind: get("#notebook-kind"), namespace: get('#notebook-form [name="namespace"]'),
+    name: get("#notebook-selector"), container: get("#container-selector"),
+    image: get('#notebook-form [name="image"]'), cpuRequest: get('#notebook-form [name="cpuRequest"]'),
+    cpuLimit: get('#notebook-form [name="cpuLimit"]'), memoryRequest: get('#notebook-form [name="memoryRequest"]'),
+    memoryLimit: get('#notebook-form [name="memoryLimit"]'), gpuPreset: get('#notebook-form [name="gpuPreset"]'),
+    gpuCount: get('#notebook-form [name="gpuCount"]'), restart: get('#notebook-form [name="restart"]'),
+    reason: get('#notebook-form [name="reason"]')
+  };
+  for (const [name, controlNode] of Object.entries(notebookControls)) {
+    controlNode.name = name;
+    controlNode.tagName = ["kind", "namespace", "name", "container", "image", "gpuPreset"].includes(name) ? "SELECT" : "INPUT";
+    if (name === "restart") { controlNode.type = "checkbox"; controlNode.checked = false; }
+    if (["image", "gpuPreset", "kind"].includes(name)) controlNode.type = "select";
+    if (name === "gpuCount") controlNode.type = "number";
+    if (!controlNode.value) controlNode.value = "";
+  }
+  forms[2].append(notebookControls.kind, notebookControls.namespace, notebookControls.name, notebookEdit);
+  notebookEdit.append(notebookControls.container, notebookControls.image, notebookControls.cpuRequest, notebookControls.cpuLimit,
+    notebookControls.memoryRequest, notebookControls.memoryLimit, notebookControls.gpuPreset, notebookControls.gpuCount,
+    notebookControls.restart, get("#replace-mounts"), get("#mount-rows"));
+  Object.defineProperty(forms[2], "controls", { get() {
+    return [notebookControls.kind, notebookControls.namespace, notebookControls.name, notebookControls.container,
+      notebookControls.image, notebookControls.cpuRequest, notebookControls.cpuLimit, notebookControls.memoryRequest,
+      notebookControls.memoryLimit, notebookControls.gpuPreset, notebookControls.gpuCount, notebookControls.restart,
+      notebookControls.reason];
+  } });
   forms[1].controls = [control("kind", "pvc.create"), control("namespace", "team-a"), control("name", "data")];
   forms[3].controls = [control("kind", "pod.restart"), control("namespace", "team-a"), control("name", "work-0"), control("reason", "Synthetic retry reason")];
   const nodeCordonForm = get("#node-cordon-form");
@@ -472,7 +509,7 @@ async function bootHarness(options = {}) {
     observedAt: options.observedAt || "2000-01-01T00:00:00Z",
     resources: options.resources || [
       { kind: "Profile", name: "team", uid: "uid-profile-team", state: "Active", owner: "alice@example.test",
-        details: { apiVersion: "kubeflow.org/v1", ownerKind: "User", configDigest: "sha256:teamdigest", "quota.requests.cpu": "4", "quota.requests.memory": "8Gi", "quota.example.com/gpu": "1" } },
+        details: { apiVersion: "kubeflow.org/v1", ownerKind: "User", createdAt: "2026-01-01T00:00:00Z", resourceVersion: "7", configDigest: "sha256:teamdigest", "quota.requests.cpu": "4", "quota.requests.memory": "8Gi", "quota.example.com/gpu": "1" } },
       { kind: "Profile", name: "guarded", uid: "uid-profile-guarded", state: "Protected", owner: "bob@example.test",
         details: { apiVersion: "kubeflow.org/v1", ownerKind: "User", configDigest: "sha256:guardeddigest" } },
       { kind: "Namespace", name: "team", uid: "uid-namespace-team", state: "Active", details: { createdAt: "2026-01-01T00:00:00Z" } },
@@ -892,20 +929,31 @@ async function bootHarness(options = {}) {
   assert.equal(scopeTest.location.search, "", "the cluster-wide clear control removes the shared namespace scope");
 
   // ---- Observed resource details drawer -------------------------------------
-  // Inline disclosures are replaced by a control that opens the right-side
-  // modal drawer with the same inert, focus and Escape behaviour.
+  // Names open the right-side modal drawer with the same inert, focus and
+  // Escape behaviour. Profiles, Notebooks, Pods and Nodes no longer carry a
+  // separate inline Details column or button.
   const detailsTest = await bootHarness({});
-  for (const table of ["pods", "nodes", "notebooks", "storage"]) {
+  for (const table of ["profiles", "pods", "nodes", "notebooks"]) {
     await detailsTest.click(table);
     const container = detailsTest.get(`[data-table="${table}"]`);
     assert.equal(detailsTest.walk(container, node => node.tagName === "DETAILS").length, 0, `${table} no longer uses an inline details disclosure`);
-    assert.ok(detailsTest.walk(container, node => node.tagName === "BUTTON" && node.textContent === "Details").length > 0, `${table} exposes a details control`);
+    assert.equal(detailsTest.walk(container, node => node.tagName === "BUTTON" && node.textContent === "Details").length, 0, `${table} removes the separate Details control`);
   }
+  await detailsTest.click("storage");
+  assert.ok(detailsTest.walk(detailsTest.get('[data-table="storage"]'), node => node.tagName === "BUTTON" && node.textContent === "Details").length > 0, "storage keeps its existing details control");
+  await detailsTest.click("nodes");
+  const nodeName = detailsTest.walk(detailsTest.get('[data-table="nodes"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Node node-1")[0];
+  assert.ok(nodeName && nodeName.textContent === "node-1", "the Node name opens its resource details");
+  nodeName.click();
+  assert.equal(detailsTest.get("#resource-details-drawer").hidden, false, "the Node name opens the right-side resource details");
+  assert.ok(detailsTest.textOf(detailsTest.get("#resource-details-body")).includes("containerd://2.0"), "the Node details keep the observed facts");
+  detailsTest.closers[0].listeners.click[0]();
   await detailsTest.click("pods");
   const detailsPods = detailsTest.get('[data-table="pods"]');
   const detailsButton = detailsTest.walk(detailsPods, node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Pod work-0")[0];
-  assert.ok(detailsButton, "each resource row exposes its own details control");
-  assert.equal(detailsButton.attributes["aria-label"], "Details for Pod work-0", "the details control names the observed resource");
+  assert.ok(detailsButton, "the Pod name is the control that opens its own details");
+  assert.equal(detailsButton.textContent, "work-0", "the Pod name itself opens the details drawer");
+  assert.equal(detailsButton.attributes["aria-label"], "Details for Pod work-0", "the name control names the observed resource");
   // A pointer click does not always move the focus. The clicked control is the
   // opener, not whatever happened to be focused before.
   detailsButton.click();
@@ -964,6 +1012,208 @@ async function bootHarness(options = {}) {
   assert.equal(goneText.includes("latest inventory observation"), false, "a stale body never claims to be the latest observation");
   assert.ok(goneTest.textOf(goneTest.get("#notifications")).includes("no longer present"), "the missing resource is also reported as a notice");
 
+  // ---- Notebooks are the Notebook custom resource only ----------------------
+  const notebookTest = await bootHarness({});
+  await notebookTest.click("notebooks");
+  const notebookTable = notebookTest.get('[data-table="notebooks"]');
+  const notebookText = notebookTest.textOf(notebookTable);
+  assert.equal(notebookTest.walk(notebookTable, node => node.tagName === "TR").length, 2, "only the observed Notebook CR is listed");
+  assert.ok(notebookText.includes("Notebook") && notebookText.includes("work"), "the Notebook row is shown");
+  assert.equal(notebookText.includes("StatefulSet"), false, "a same-name StatefulSet is never a Notebook row");
+  assert.equal(notebookText.includes("work-0"), false, "a same-name Pod is never a Notebook row");
+  assert.equal(notebookTest.walk(notebookTable, node => node.tagName === "BUTTON" && node.textContent === "Details").length, 0, "the Notebooks table has no separate Details control");
+  const notebookName = notebookTest.walk(notebookTable, node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Notebook work")[0];
+  assert.ok(notebookName && notebookName.textContent === "work", "the Notebook name opens its resource details");
+  notebookName.click();
+  assert.equal(notebookTest.get("#resource-details-drawer").hidden, false, "the Notebook name opens the right-side resource details");
+  assert.ok(notebookTest.textOf(notebookTest.get("#resource-details-body")).includes("image.main"), "the Notebook details show the observed container image");
+  const manageNotebook = notebookTest.walk(notebookTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0];
+  assert.ok(manageNotebook, "the Notebook resource details offer Manage Notebook");
+  assert.equal(manageNotebook.disabled, false, "Manage Notebook is enabled when writes and the controller contract are confirmed");
+  manageNotebook.click();
+  assert.equal(notebookTest.get("#notebook-drawer").hidden, false, "Manage Notebook opens the Notebook management drawer");
+  assert.equal(notebookTest.get("#resource-details-drawer").hidden, true, "the resource details drawer hands over to Notebook management");
+  assert.equal(notebookTest.get('#notebook-form [name="namespace"]').value, "team", "the exact Notebook namespace is preselected");
+  assert.equal(notebookTest.get("#notebook-selector").value, "work", "the exact Notebook name is preselected");
+  assert.equal(notebookTest.get("#container-selector").value, "main", "the exact observed container is preselected");
+  assert.equal(notebookTest.get("#notebook-kind").value, "notebook.start", "the selected action is not silently switched to Edit");
+  assert.equal(notebookTest.get("#notebook-target-warning").hidden, true, "a bound target starts without a warning");
+  notebookTest.closers[0].listeners.click[0]();
+  assert.equal(notebookTest.get("#notebook-drawer").hidden, true, "the management drawer closes");
+  assert.equal(notebookTest.activeElement, notebookName, "closing Notebook management restores the exact visible Notebook row control");
+  assert.notEqual(notebookTest.activeElement, manageNotebook, "the focus never returns to a control inside the closed details drawer");
+
+  // Notebook management follows the existing policy gates.
+  const noNotebookContract = await bootHarness({ notebookWrites: false });
+  await noNotebookContract.click("notebooks");
+  noNotebookContract.walk(noNotebookContract.get('[data-table="notebooks"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Notebook work")[0].click();
+  const contractManage = noNotebookContract.walk(noNotebookContract.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0];
+  assert.ok(contractManage && contractManage.disabled, "Manage Notebook stays disabled without the confirmed controller contract");
+  assert.ok(String(contractManage.title).includes("controller contract"), "the disabled action explains the contract gate");
+  noNotebookContract.closers[0].listeners.click[0]();
+  noNotebookContract.openers[2].listeners.click[0]();
+  assert.equal(noNotebookContract.get("#notebook-drawer").hidden, true, "the page-level Notebook opener is defensively refused without the controller contract");
+  const noWrites = await bootHarness({ writes: false });
+  await noWrites.click("notebooks");
+  noWrites.walk(noWrites.get('[data-table="notebooks"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Notebook work")[0].click();
+  const writesManage = noWrites.walk(noWrites.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0];
+  assert.ok(writesManage && writesManage.disabled, "Manage Notebook stays disabled when writes are disabled by policy");
+  assert.ok(String(writesManage.title).includes("disabled by server policy"), "the disabled action explains the write policy gate");
+  noWrites.closers[0].listeners.click[0]();
+  noWrites.openers[2].listeners.click[0]();
+  assert.equal(noWrites.get("#notebook-drawer").hidden, true, "the page-level Notebook opener is defensively refused when writes are disabled");
+
+  // A refresh that replaces the bound Notebook is reported and refused before
+  // any request; the form is never retargeted to another Notebook.
+  const notebookRefreshTest = await bootHarness({ resources: [
+    { kind: "Profile", name: "team", uid: "uid-profile-team", state: "Active", owner: "alice@example.test", details: { configDigest: "sha256:teamdigest", "quota.requests.cpu": "4" } },
+    { kind: "Namespace", name: "team", uid: "uid-namespace-team", state: "Active" },
+    { kind: "Notebook", name: "work", namespace: "team", uid: "uid-notebook-work", state: "Running / Ready", details: { "image.main": "image" } },
+    { kind: "Notebook", name: "other-work", namespace: "team", uid: "uid-notebook-other", state: "Running / Ready", details: { "image.other": "image" } }
+  ] });
+  await notebookRefreshTest.click("notebooks");
+  notebookRefreshTest.walk(notebookRefreshTest.get('[data-table="notebooks"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Notebook work")[0].click();
+  const refreshManage = notebookRefreshTest.walk(notebookRefreshTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0];
+  refreshManage.click();
+  assert.equal(notebookRefreshTest.get("#notebook-selector").value, "work", "the selected resource is the exact Notebook, not the other one");
+  // An explicit selection of another observed Notebook is a new target.
+  const notebookSelect = notebookRefreshTest.get("#notebook-selector");
+  notebookSelect.value = "other-work";
+  for (const handler of notebookSelect.listeners.change || []) handler();
+  assert.equal(notebookRefreshTest.get('#notebook-form [name="namespace"]').value, "team", "the namespace stays the observed one");
+  // Reopen the first Notebook, then replace it under the open form.
+  notebookSelect.value = "work";
+  for (const handler of notebookSelect.listeners.change || []) handler();
+  notebookRefreshTest.setResources(notebookRefreshTest.resources().map(resource =>
+    resource.kind === "Notebook" && resource.name === "work" ? { ...resource, uid: "uid-notebook-work-replaced" } : resource));
+  notebookRefreshTest.get("#refresh").listeners.click[0]();
+  await notebookRefreshTest.settle();
+  assert.equal(notebookRefreshTest.get("#notebook-target-warning").hidden, false, "a replaced bound Notebook is visible in the drawer");
+  assert.ok(notebookRefreshTest.textOf(notebookRefreshTest.get("#notebook-target-warning")).includes("replaced"), "the warning names the replacement");
+  assert.equal(notebookRefreshTest.get("#notebook-selector").value, "work", "a refresh never silently retargets the form to another Notebook");
+  const notebookBefore = notebookRefreshTest.bodies.length;
+  await notebookRefreshTest.submitForm(2);
+  assert.equal(notebookRefreshTest.bodies.length, notebookBefore, "a replaced Notebook never reaches the API");
+  assert.ok(notebookRefreshTest.error.textContent.includes("replaced"), "the refusal names the replaced target");
+
+  // A resource that disappears under the open details drawer cannot be managed.
+  const notebookGoneTest = await bootHarness({});
+  await notebookGoneTest.click("notebooks");
+  notebookGoneTest.walk(notebookGoneTest.get('[data-table="notebooks"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Notebook work")[0].click();
+  notebookGoneTest.setResources(notebookGoneTest.resources().filter(resource => !(resource.kind === "Notebook" && resource.name === "work")));
+  notebookGoneTest.get("#refresh").listeners.click[0]();
+  await notebookGoneTest.settle();
+  const goneManage = notebookGoneTest.walk(notebookGoneTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0];
+  assert.ok(goneManage && goneManage.disabled, "a Notebook that is gone cannot be managed");
+
+  // Changing the namespace, Notebook or container never carries the previous
+  // Notebook's typed resources, mounts, restart or replace flag into another
+  // target. Blank fields keep their existing "preserve" meaning.
+  const notebookBleedTest = await bootHarness({ resources: [
+    { kind: "Namespace", name: "team", uid: "uid-namespace-team", state: "Active" },
+    { kind: "Namespace", name: "team-two", uid: "uid-namespace-team-two", state: "Active" },
+    { kind: "Notebook", name: "work", namespace: "team", uid: "uid-notebook-work", state: "Running / Ready", details: { "image.main": "image" } },
+    { kind: "Notebook", name: "other-work", namespace: "team-two", uid: "uid-notebook-other", state: "Running / Ready", details: { "image.main": "image", "image.sidecar": "proxy" } }
+  ] });
+  await notebookBleedTest.click("notebooks");
+  notebookBleedTest.walk(notebookBleedTest.get('[data-table="notebooks"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Notebook work")[0].click();
+  notebookBleedTest.walk(notebookBleedTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0].click();
+  const bleedKind = notebookBleedTest.get("#notebook-kind");
+  bleedKind.value = "notebook.edit";
+  for (const handler of bleedKind.listeners.change || []) handler();
+  const bleedField = selector => notebookBleedTest.get(selector);
+  bleedField('#notebook-form [name="cpuRequest"]').value = "4";
+  bleedField('#notebook-form [name="cpuLimit"]').value = "6";
+  bleedField('#notebook-form [name="memoryRequest"]').value = "1Gi";
+  bleedField('#notebook-form [name="memoryLimit"]').value = "2Gi";
+  bleedField('#notebook-form [name="image"]').value = "registry.example/work:v1";
+  bleedField('#notebook-form [name="gpuPreset"]').value = "gpu";
+  bleedField('#notebook-form [name="gpuCount"]').value = "2";
+  bleedField('#notebook-form [name="restart"]').checked = true;
+  notebookBleedTest.get("#replace-mounts").checked = true;
+  // Namespace change clears every edit value before the new options are built.
+  const bleedNamespace = bleedField('#notebook-form [name="namespace"]');
+  bleedNamespace.value = "team-two";
+  for (const handler of bleedNamespace.listeners.change || []) handler();
+  assert.equal(bleedField('#notebook-form [name="cpuRequest"]').value, "", "a namespace change clears the previous CPU request");
+  assert.equal(bleedField('#notebook-form [name="image"]').value, "", "a namespace change clears the previous image");
+  assert.equal(bleedField('#notebook-form [name="gpuCount"]').value, "", "a namespace change clears the previous GPU count");
+  assert.equal(bleedField('#notebook-form [name="restart"]').checked, false, "a namespace change clears the previous restart flag");
+  assert.equal(notebookBleedTest.get("#replace-mounts").checked, false, "a namespace change clears the previous replace-mounts flag");
+  // An explicit new Notebook selection binds the new observed UID.
+  const bleedNotebook = notebookBleedTest.get("#notebook-selector");
+  bleedNotebook.value = "other-work";
+  for (const handler of bleedNotebook.listeners.change || []) handler();
+  assert.equal(bleedField('#notebook-form [name="namespace"]').value, "team-two", "the selected namespace is kept");
+  assert.equal(notebookBleedTest.get("#notebook-target-warning").hidden, true, "an explicit new Notebook choice binds the current observed UID");
+  // A container change preserves the chosen container but clears its fields.
+  const bleedContainer = notebookBleedTest.get("#container-selector");
+  bleedContainer.value = "sidecar";
+  for (const handler of bleedContainer.listeners.change || []) handler();
+  assert.equal(bleedField('#notebook-form [name="cpuRequest"]').value, "", "a container change clears the previous CPU request");
+  assert.equal(bleedContainer.value, "sidecar", "a container change keeps the newly chosen container");
+  bleedField('#notebook-form [name="cpuRequest"]').value = "3";
+  // Switch back to the blank preserve contract: changing the container again
+  // drops the value just typed for the other container.
+  bleedContainer.value = "main";
+  for (const handler of bleedContainer.listeners.change || []) handler();
+  assert.equal(bleedField('#notebook-form [name="cpuRequest"]').value, "", "another container never inherits the previous container's resource edit");
+  await notebookBleedTest.submitForm(2);
+  const bleedBody = notebookBleedTest.bodies[notebookBleedTest.bodies.length - 1];
+  assert.equal(bleedBody.kind, "notebook.edit", "the explicitly selected action is preserved");
+  assert.equal(bleedBody.namespace, "team-two", "the plan targets the newly selected namespace");
+  assert.equal(bleedBody.name, "other-work", "the plan targets the newly selected Notebook");
+  assert.equal(bleedBody.container, "main", "the plan targets the newly selected container");
+  for (const key of ["cpuRequest", "cpuLimit", "memoryRequest", "memoryLimit", "image", "gpuPreset", "gpuCount"]) {
+    assert.equal(bleedBody[key], undefined, "the old " + key + " is never sent to another target");
+  }
+  assert.equal(bleedBody.restart, false, "the old restart flag is never sent to another target");
+  assert.equal(bleedBody.mounts, undefined, "the old mount replacement is never sent to another target");
+
+  // Reopening the page-level control after a closed details drawer starts a
+  // fresh context: stale values, reason and error are cleared and the current
+  // observed UID is bound, so no stale target can be submitted.
+  const notebookReopenTest = await bootHarness({ resources: [
+    { kind: "Namespace", name: "team", uid: "uid-namespace-team", state: "Active" },
+    { kind: "Notebook", name: "work", namespace: "team", uid: "uid-notebook-work", state: "Running / Ready", details: { "image.main": "image" } }
+  ] });
+  await notebookReopenTest.click("notebooks");
+  notebookReopenTest.walk(notebookReopenTest.get('[data-table="notebooks"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Notebook work")[0].click();
+  notebookReopenTest.walk(notebookReopenTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0].click();
+  const reopenKind = notebookReopenTest.get("#notebook-kind");
+  reopenKind.value = "notebook.edit";
+  for (const handler of reopenKind.listeners.change || []) handler();
+  notebookReopenTest.get('#notebook-form [name="cpuRequest"]').value = "8";
+  notebookReopenTest.get('#notebook-form [name="gpuCount"]').value = "4";
+  notebookReopenTest.get('#notebook-form [name="restart"]').checked = true;
+  notebookReopenTest.get('#notebook-form [name="reason"]').value = "old typed reason";
+  notebookReopenTest.error.textContent = "old form error";
+  notebookReopenTest.error.hidden = false;
+  notebookReopenTest.closers[0].listeners.click[0]();
+  // The observation replaces the Notebook under the same name.
+  notebookReopenTest.setResources(notebookReopenTest.resources().map(resource =>
+    resource.kind === "Notebook" && resource.name === "work" ? { ...resource, uid: "uid-notebook-work-fresh" } : resource));
+  notebookReopenTest.get("#refresh").listeners.click[0]();
+  await notebookReopenTest.settle();
+  notebookReopenTest.openers[2].listeners.click[0]();
+  assert.equal(notebookReopenTest.get("#notebook-drawer").hidden, false, "the page-level Notebook opener opens a fresh management context");
+  assert.equal(notebookReopenTest.get('#notebook-form [name="cpuRequest"]').value, "", "stale CPU edits are cleared on a fresh management open");
+  assert.equal(notebookReopenTest.get('#notebook-form [name="gpuCount"]').value, "", "stale GPU edits are cleared on a fresh management open");
+  assert.equal(notebookReopenTest.get('#notebook-form [name="restart"]').checked, false, "a stale restart flag is cleared on a fresh management open");
+  assert.equal(notebookReopenTest.get('#notebook-form [name="reason"]').value, "", "a stale reason is cleared on a fresh management open");
+  assert.equal(notebookReopenTest.error.hidden, true, "a stale form error is cleared on a fresh management open");
+  assert.equal(notebookReopenTest.get("#notebook-target-warning").hidden, true, "the fresh observation is bound without a warning");
+  await notebookReopenTest.submitForm(2);
+  const reopenBody = notebookReopenTest.bodies[notebookReopenTest.bodies.length - 1];
+  assert.equal(reopenBody.kind, "notebook.edit", "the explicitly selected action survives the fresh open");
+  assert.equal(reopenBody.namespace, "team", "the fresh open keeps the observed namespace");
+  assert.equal(reopenBody.name, "work", "the fresh open keeps the observed Notebook name");
+  for (const key of ["cpuRequest", "cpuLimit", "memoryRequest", "memoryLimit", "image", "gpuPreset", "gpuCount"]) {
+    assert.equal(reopenBody[key], undefined, "a fresh open never resubmits the stale " + key);
+  }
+  assert.equal(reopenBody.restart, false, "a fresh open never resubmits a stale restart");
+  assert.equal(reopenBody.reason, undefined, "a fresh open never resubmits a stale reason");
+
   // Storage claim and volume names open the same observed-details drawer.
   const storageTest = await bootHarness({});
   await storageTest.click("storage");
@@ -993,7 +1243,7 @@ async function bootHarness(options = {}) {
   const linkTo = href => scopedTest.walk(scopedBody, node => node.tagName === "A" && node.href === href)[0];
   const scopedNotebook = linkTo("/notebooks?namespace=team&kind=Notebook&resource=work");
   assert.ok(scopedNotebook, "the namespace summary links an individual notebook");
-  assert.ok(linkTo("/notebooks?namespace=team&kind=StatefulSet&resource=work"), "the namespace summary links an individual StatefulSet");
+  assert.ok(linkTo("/?namespace=team&kind=StatefulSet&resource=work"), "a StatefulSet links to the Overview table, not the Notebooks page");
   assert.ok(linkTo("/pods?namespace=team&kind=Pod&resource=work-0"), "the namespace summary links an individual pod");
   assert.ok(linkTo("/storage?namespace=team&kind=PersistentVolumeClaim&resource=data"), "the namespace summary links an individual claim");
   assert.ok(linkTo("/?namespace=team&kind=Event&resource=scheduled"), "the namespace summary links an individual event");
@@ -1010,6 +1260,15 @@ async function bootHarness(options = {}) {
   scopedClear.listeners.click[0]();
   assert.equal(scopedNotebooks.querySelector("[data-search]").value, "", "clearing removes the resource focus from the visible filter");
   assert.equal(scopedTest.location.search, "", "clearing removes the namespace scope and the resource identity from the URL");
+
+  // A StatefulSet kind deep link lands on the Overview table, which keeps the
+  // aggregate StatefulSet observation. It never opens an empty Notebooks view.
+  const statefulScopeTest = await bootHarness({ path: "/?namespace=team&kind=StatefulSet&resource=work" });
+  await statefulScopeTest.settle();
+  assert.equal(statefulScopeTest.get("#overview-table").hidden, false, "a StatefulSet resource link expands the Overview table");
+  const statefulOverview = statefulScopeTest.get('[data-table="overview"]');
+  assert.equal(statefulScopeTest.walk(statefulOverview, node => node.tagName === "TR").length, 2, "only the selected StatefulSet remains");
+  assert.ok(statefulScopeTest.textOf(statefulOverview).includes("StatefulSet"), "the selected resource is the StatefulSet");
 
   // A claim is never confused with the volume or the storage class that share
   // its name.
@@ -1286,8 +1545,12 @@ async function bootHarness(options = {}) {
   assert.ok(summaryText.includes("Scoped views"), "the scoped views stay above the configuration");
   assert.ok(summaryText.includes("kubeflow.org/v1"), "the summary shows the observed API version");
   assert.ok(summaryText.includes("alice@example.test"), "the summary shows the observed owner");
+  assert.ok(summaryText.includes("Active") && summaryText.includes("Cluster scoped"), "the summary shows the observed state and scope");
+  assert.ok(summaryText.includes("2026-01-01T00:00:00Z") && summaryText.includes("Resource version") && summaryText.includes("7"), "the summary shows the safe metadata facts");
   assert.ok(summaryText.includes("requests.cpu") && summaryText.includes("4"), "the summary shows the observed quota values");
   assert.ok(summaryText.includes("example.com/gpu"), "the summary shows every projected quota key");
+  assert.equal(summaryText.split("alice@example.test").length - 1, 1, "the owner is shown once, never duplicated");
+  assert.equal(summaryText.split("requests.cpu").length - 1, 1, "each observed quota key is shown once, never duplicated");
   const copyButton = summaryTest.walk(summaryTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Copy")[0];
   assert.ok(copyButton, "the owner email can be copied");
 
@@ -1307,7 +1570,13 @@ async function bootHarness(options = {}) {
   const cpuInput = summaryTest.profileQuotaInputs.find(input => input.dataset.profileQuota === "requests.cpu");
   assert.equal(cpuInput.value, "4", "the observed quota is prefilled");
   assert.equal(cpuInput.required, true, "an existing managed key may not be omitted");
-  assert.ok(summaryTest.textOf(summaryTest.get("#profile-extra-quota-fields")).includes("example.com/gpu"), "an unmanaged observed key is shown read-only");
+  // An observed device key this console has no static field for is edited
+  // under its own name. It is never renamed to a canonical requests.* key.
+  const deviceInput = summaryTest.walk(summaryTest.get("#profile-observed-quota-fields"), node => node.dataset && node.dataset.profileQuota === "example.com/gpu")[0];
+  assert.ok(deviceInput, "the observed device key has an editable field");
+  assert.equal(deviceInput.value, "1", "the observed device key is prefilled");
+  assert.equal(deviceInput.required, true, "an observed key may not be omitted");
+  assert.ok(summaryTest.textOf(summaryTest.get("#profile-observed-quota-fields")).includes("example.com/gpu"), "the observed device key is labelled with its own name");
 
   // The update payload carries the unchanged owner, the precondition and every
   // managed quota key.
@@ -1320,7 +1589,8 @@ async function bootHarness(options = {}) {
   assert.equal(updateBody.baseConfigDigest, "sha256:teamdigest", "the precondition travels with the request");
   assert.equal(updateBody.quota["requests.cpu"], "8", "the changed quota is submitted");
   assert.equal(updateBody.quota["requests.memory"], "8Gi", "an unchanged managed key is still submitted");
-  assert.equal(updateBody.quota["example.com/gpu"], "1", "an unmanaged observed key round-trips unchanged");
+  assert.equal(updateBody.quota["example.com/gpu"], "1", "the observed device key round-trips unchanged");
+  assert.equal(updateBody.quota["requests.nvidia.com/gpu"], undefined, "no canonical device key is added beside the observed one");
   assert.equal(updateBody.confirmName, undefined, "an update never carries a confirmation");
   assert.equal(updateBody.storageClass, undefined, "an update never carries an unrelated field");
 
@@ -1347,6 +1617,129 @@ async function bootHarness(options = {}) {
   assert.equal(summaryTest.bodies.length, removalBefore, "a removed quota key never reaches the API");
   assert.ok(summaryTest.error.textContent.includes("removing a quota key is unsupported"), "the removal of an existing key is refused in the drawer");
   cpuInput.value = "4";
+
+  // An existing Profile may declare quota keys this console has no static
+  // field for: the cpu and memory aliases and a device key of its own. They
+  // are edited under their own names. The declared key set never changes, no
+  // canonical requests.* key is added beside them and a key this console does
+  // not manage stays read-only.
+  const legacyResources = [
+    { kind: "Profile", name: "legacy", uid: "uid-profile-legacy", state: "Active", owner: "legacy.owner@example.test",
+      details: { apiVersion: "kubeflow.org/v1", ownerKind: "User", configDigest: "sha256:legacydigest",
+        "quota.cpu": "128", "quota.memory": "256Gi", "quota.nvidia.com/gpu": "4",
+        "quota.persistentvolumeclaims": "20", "quota.requests.storage": "500Gi",
+        // A key this console does not manage. It stays read-only and is
+        // returned unchanged.
+        "quota.requests.ephemeral-storage": "5Gi" } },
+    { kind: "Namespace", name: "legacy", uid: "uid-namespace-legacy", state: "Active", details: { createdAt: "2026-01-04T00:00:00Z" } }
+  ];
+  const legacyQuotaTest = await bootHarness({ resources: legacyResources });
+  await legacyQuotaTest.click("profiles");
+  const legacyRow = legacyQuotaTest.walk(legacyQuotaTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "legacy")[0];
+  assert.ok(legacyRow, "the legacy Profile opens its summary");
+  legacyRow.listeners.click[0]();
+  const legacySummaryText = legacyQuotaTest.textOf(legacyQuotaTest.get("#profile-summary-body"));
+  assert.ok(legacySummaryText.includes("nvidia.com/gpu"), "the consolidated summary shows the observed bare device key");
+  assert.ok(legacySummaryText.includes("requests.<device>") && legacySummaryText.includes("normally not enforced"), "an existing bare GPU key is visibly explained before any edit");
+  assert.ok(legacySummaryText.includes("does not rename the key") && legacySummaryText.includes("does not activate enforcement"), "the warning never claims that editing migrates the key");
+  const legacyEdit = legacyQuotaTest.walk(legacyQuotaTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit profile")[0];
+  assert.ok(legacyEdit, "the legacy Profile offers the edit action");
+  legacyEdit.listeners.click[0]();
+  assert.equal(legacyQuotaTest.get("#profile-kind").value, "profile.update", "the legacy Profile opens in update mode");
+  const observedField = key => legacyQuotaTest.walk(legacyQuotaTest.get("#profile-observed-quota-fields"), node => node.dataset && node.dataset.profileQuota === key)[0];
+  const legacyCpu = observedField("cpu");
+  assert.ok(legacyCpu, "the observed cpu alias has an editable field");
+  assert.equal(legacyCpu.value, "128", "the observed cpu alias is prefilled");
+  assert.equal(legacyCpu.required, true, "an observed key may not be omitted");
+  const legacyMemory = observedField("memory");
+  assert.ok(legacyMemory, "the observed memory alias has an editable field");
+  assert.equal(legacyMemory.value, "256Gi", "the observed memory alias is prefilled");
+  const legacyGpu = observedField("nvidia.com/gpu");
+  assert.ok(legacyGpu, "the observed device key has an editable field");
+  assert.equal(legacyGpu.value, "4", "the observed device key is prefilled");
+  assert.equal(legacyGpu.type, "number", "the device key counts whole devices");
+  assert.equal(legacyGpu.min, "0", "the device key accepts a zero limit");
+  assert.equal(legacyGpu.step, "1", "the device key stays an integer");
+  const legacyClaims = legacyQuotaTest.profileQuotaInputs.find(input => input.dataset.profileQuota === "persistentvolumeclaims");
+  assert.equal(legacyClaims.value, "20", "the observed claim count is prefilled");
+  const legacyStorage = legacyQuotaTest.profileQuotaInputs.find(input => input.dataset.profileQuota === "requests.storage");
+  assert.equal(legacyStorage.value, "500Gi", "the observed storage request is prefilled");
+  assert.ok(legacyQuotaTest.textOf(legacyQuotaTest.get("#profile-observed-quota-fields")).includes("nvidia.com/gpu"), "the observed device key is labelled with its own name");
+  assert.ok(legacyQuotaTest.textOf(legacyQuotaTest.get("#profile-observed-quota-fields")).includes("normally not enforced"), "the bare device warning is visible before the plan is prepared");
+  assert.ok(legacyQuotaTest.textOf(legacyQuotaTest.get("#profile-extra-quota-fields")).includes("requests.ephemeral-storage"), "an unmanaged observed key stays read-only");
+
+  // A device count is a whole number of objects.
+  legacyGpu.value = "0.5";
+  const fractionBefore = legacyQuotaTest.bodies.length;
+  await legacyQuotaTest.submitForm(0);
+  assert.equal(legacyQuotaTest.bodies.length, fractionBefore, "a fractional device count never reaches the API");
+  assert.ok(legacyQuotaTest.error.textContent.includes("whole number"), "a fractional device count is refused in the drawer");
+
+  // Only the CPU alias changes: the payload carries exactly the observed key
+  // set. No canonical requests.cpu, requests.memory or requests.nvidia.com/gpu
+  // key is added beside the observed ones.
+  legacyCpu.value = "96";
+  legacyGpu.value = "4";
+  await legacyQuotaTest.submitForm(0);
+  const legacyQuotaBody = legacyQuotaTest.bodies[legacyQuotaTest.bodies.length - 1];
+  assert.equal(legacyQuotaBody.kind, "profile.update");
+  assert.equal(legacyQuotaBody.name, "legacy");
+  assert.equal(legacyQuotaBody.quota["cpu"], "96", "the changed alias is submitted under its own name");
+  assert.equal(legacyQuotaBody.quota["memory"], "256Gi", "the unchanged alias is submitted");
+  assert.equal(legacyQuotaBody.quota["nvidia.com/gpu"], "4", "the device key is submitted under its own name");
+  assert.equal(legacyQuotaBody.quota["persistentvolumeclaims"], "20", "the claim count is submitted");
+  assert.equal(legacyQuotaBody.quota["requests.storage"], "500Gi", "the storage request is submitted");
+  assert.equal(legacyQuotaBody.quota["requests.ephemeral-storage"], "5Gi", "the unmanaged key round-trips unchanged");
+  assert.deepEqual(Object.keys(legacyQuotaBody.quota).sort(), ["cpu", "memory", "nvidia.com/gpu", "persistentvolumeclaims", "requests.ephemeral-storage", "requests.storage"],
+    "the update carries exactly the observed key set");
+  for (const key of ["requests.cpu", "requests.memory", "requests.nvidia.com/gpu", "limits.cpu", "limits.memory", "pods"]) {
+    assert.equal(legacyQuotaBody.quota[key], undefined, "the undeclared key " + key + " is never added");
+  }
+
+  // Only the device key changes: the same key set travels with the request.
+  legacyCpu.value = "128";
+  legacyGpu.value = "2";
+  await legacyQuotaTest.submitForm(0);
+  const legacyGpuBody = legacyQuotaTest.bodies[legacyQuotaTest.bodies.length - 1];
+  assert.equal(legacyGpuBody.quota["cpu"], "128", "the unchanged alias travels with the request");
+  assert.equal(legacyGpuBody.quota["nvidia.com/gpu"], "2", "the changed device key travels under its own name");
+  assert.deepEqual(Object.keys(legacyGpuBody.quota).sort(), ["cpu", "memory", "nvidia.com/gpu", "persistentvolumeclaims", "requests.ephemeral-storage", "requests.storage"],
+    "the device edit never changes the key set");
+
+  // A zero device limit is a real value and is submitted.
+  legacyGpu.value = "0";
+  await legacyQuotaTest.submitForm(0);
+  const legacyZeroBody = legacyQuotaTest.bodies[legacyQuotaTest.bodies.length - 1];
+  assert.equal(legacyZeroBody.quota["nvidia.com/gpu"], "0", "a zero device limit is submitted");
+
+  // Native whole-number spellings are accepted exactly as typed. The raw text
+  // is submitted unchanged; the server owns the authoritative whole-quantity
+  // validation.
+  const countNotationTest = await bootHarness({ resources: [
+    { kind: "Profile", name: "counts", uid: "uid-profile-counts", state: "Active", owner: "counts@example.test",
+      details: { apiVersion: "kubeflow.org/v1", configDigest: "sha256:countsdigest", "quota.pods": "10", "quota.nvidia.com/gpu": "1" } }
+  ] });
+  await countNotationTest.click("profiles");
+  countNotationTest.walk(countNotationTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "counts")[0].click();
+  countNotationTest.walk(countNotationTest.get("#profile-summary-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit profile")[0].click();
+  const countPods = countNotationTest.profileQuotaInputs.find(input => input.dataset.profileQuota === "pods");
+  const countGpu = countNotationTest.walk(countNotationTest.get("#profile-observed-quota-fields"), node => node.dataset && node.dataset.profileQuota === "nvidia.com/gpu")[0];
+  assert.ok(countPods && countGpu, "the pods count and the raw GPU key are editable");
+  countPods.value = "1e2";
+  countGpu.value = "1e0";
+  await countNotationTest.submitForm(0);
+  const countNotationBody = countNotationTest.bodies[countNotationTest.bodies.length - 1];
+  assert.equal(countNotationBody.kind, "profile.update", "a whole-number notation prepares a plan");
+  assert.equal(countNotationBody.quota["pods"], "1e2", "the typed pods count is submitted unchanged");
+  assert.equal(countNotationBody.quota["nvidia.com/gpu"], "1e0", "the typed raw device count is submitted unchanged");
+  assert.deepEqual(Object.keys(countNotationBody.quota).sort(), ["nvidia.com/gpu", "pods"], "the typed notation never renames or adds a key");
+
+  // An observed key may not be omitted.
+  legacyGpu.value = "";
+  const legacyRemovalBefore = legacyQuotaTest.bodies.length;
+  await legacyQuotaTest.submitForm(0);
+  assert.equal(legacyQuotaTest.bodies.length, legacyRemovalBefore, "a removed observed key never reaches the API");
+  assert.ok(legacyQuotaTest.error.textContent.includes("removing a quota key is unsupported"), "the removal of an observed key is refused in the drawer");
 
   // The deletion drawer is gated by the server opt-in and the protection of
   // the observed Profile.
@@ -1491,13 +1884,12 @@ async function bootHarness(options = {}) {
   const digestRow = digestTest.walk(digestTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "team")[0];
   digestRow.listeners.click[0]();
   assert.equal(digestTest.textOf(digestTest.get("#profile-summary-body")).includes("sha256:teamdigest"), false, "the Profile summary never shows the precondition hash");
-  const digestDetails = digestTest.walk(digestTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Profile team")[0];
-  assert.ok(digestDetails, "a Profile row exposes its observed details");
-  digestDetails.listeners.click[0]();
-  const digestText = digestTest.textOf(digestTest.get("#resource-details-body"));
-  assert.equal(digestText.includes("sha256:teamdigest"), false, "the observed details never show the precondition hash");
+  assert.equal(digestTest.walk(digestTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.textContent === "Details").length, 0, "a Profile row exposes no generic Details control");
+  assert.equal(digestTest.walk(digestTest.get('[data-table="profiles"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Profile team").length, 0, "a Profile name opens the consolidated summary, not generic resource details");
+  const digestText = digestTest.textOf(digestTest.get("#profile-summary-body"));
+  assert.equal(digestText.includes("sha256:teamdigest"), false, "the summary never shows the precondition hash");
   assert.equal(digestText.includes("configDigest"), false, "the precondition key is not rendered at all");
-  assert.ok(digestText.includes("apiVersion: kubeflow.org/v1"), "the observed details keep their labels");
+  assert.ok(digestText.includes("kubeflow.org/v1") && digestText.includes("alice@example.test"), "the consolidated summary keeps the safe Profile facts");
   digestTest.closers[0].listeners.click[0];
   // The precondition hash is not searchable either.
   const hashSearch = digestTest.get('[data-table="profiles"]').querySelector("[data-search]");

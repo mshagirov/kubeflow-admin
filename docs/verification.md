@@ -2,6 +2,48 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
+## UI and deployed-quota follow-up — 22 October 2026 (unpublished)
+
+This follow-up is local work, not part of the published image receipt below.
+Live-cluster acceptance has not been performed.
+
+- Profile quota edits support the existing `cpu`/`memory` aliases and existing
+  non-reserved raw device keys under their original names. Editing one value
+  does not automatically rename keys or add duplicate canonical limits.
+  New raw device keys remain unsupported; approved canonical keys retain the
+  existing explicit authoring policy.
+- Unmanaged keys, including `count/<resource>` object quotas and storage-class
+  quotas, remain read-only and are preserved literally. They are not rejected
+  against an incomplete duplicate of Kubernetes' quota-key validator.
+- Bare device declarations such as `nvidia.com/gpu` need a warning: standard
+  Kubernetes device accounting uses `requests.nvidia.com/gpu`. Matching
+  `status.hard` is not proof of enforcement. No migration is performed.
+- UI interaction changes consolidate Profile information into Profile Summary,
+  move Notebook/Pod/Node detail opening to resource-name clicks, and keep the
+  Notebooks table limited to Notebook custom resources. A Notebook's details
+  offer its preselected management workflow.
+
+Implementation and intermediate review used OpenCode Go DeepSeek V4.1 Flash
+with high thinking; the lead personally reviewed the combined changes and
+corrected quota classification and Notebook cross-target edit handling.
+
+Verified before publication:
+
+- Both JavaScript regression scripts passed.
+- `GOTOOLCHAIN=go1.27.3 GOMAXPROCS=2 go test -mod=readonly -race -p 1 -count=1 ./...`
+  passed all ten packages; `go vet -mod=readonly ./...` and whitespace checks passed.
+- Configured real Chrome/Playwright acceptance passed **26/26** checks, with
+  zero failures/skips and zero horizontal overflow at 390px and 1280px on all
+  seven resource pages. Coverage includes consolidated summaries, exact legacy
+  quota-key payloads, name-driven drawers, Notebook-only rows, preselected
+  management, write/controller gates, focus restoration and clearing stale edits.
+- These browser checks use a loopback-only synthetic fixture, not a cluster.
+  Notebook resource/image edit fields intentionally start blank (preserve);
+  mounts remain unchanged unless replacement is explicitly selected. No
+  individual Notebook-details API or full editable-configuration prefill exists.
+
+Publication and live-cluster acceptance remain pending.
+
 ## Profile workflows and resource drawers — 21 October 2026
 
 This release adds unique DNS-1123/63-character Profile names with explicit

@@ -1403,3 +1403,459 @@ func TestProfileCreateConvergesWithEitherRoleBindingSubjectAPIGroup(t *testing.T
 		})
 	}
 }
+
+// --- existing legacy quota keys: the cpu and memory aliases and a device key ---
+
+// legacyQuotaHard is the hard map of an existing Profile that declares the
+// Kubernetes quota aliases and a device key of its own. It is the shape an
+// operator has to be able to edit: the aliases charge the same pod request as
+// their requests.* counterparts and the device key counts whole devices.
+func legacyQuotaHard() map[string]any {
+	return map[string]any{
+		"cpu":                    "128",
+		"memory":                 "256Gi",
+		"nvidia.com/gpu":         "4",
+		"persistentvolumeclaims": "20",
+		"requests.storage":       "500Gi",
+	}
+}
+
+// setNamespaceQuota seeds the Profile-owned resource quota of a namespace with
+// the exact hard map the Profile declares: the same keys in spec.hard and in
+// status.hard, exactly as the installed Profile controller mirrors them.
+func setNamespaceQuota(t *testing.T, k *fake.Clientset, api *crAPI, name string, hard map[string]any) {
+	t.Helper()
+	rl := corev1.ResourceList{}
+	for key, v := range hard {
+		q, err := resource.ParseQuantity(fmt.Sprint(v))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rl[corev1.ResourceName(key)] = q
+	}
+	p := api.get("profiles", "", name)
+	if p == nil {
+		t.Fatalf("profile %s missing", name)
+	}
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "kf-resource-quota", Namespace: name, UID: "quota-legacy-1", OwnerReferences: owner(p.GetUID(), "Profile", name)},
+		Spec:       corev1.ResourceQuotaSpec{Hard: rl},
+		Status:     corev1.ResourceQuotaStatus{Hard: rl},
+	}
+	if _, err := k.CoreV1().ResourceQuotas(name).Create(context.Background(), quota, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mergedHard returns the hard map a prepared quota patch would write.
+func mergedHard(t *testing.T, w *work) map[string]any {
+	t.Helper()
+	for _, op := range w.ops {
+		if m, ok := op.Value.(map[string]any); ok {
+			return m
+		}
+	}
+	t.Fatalf("no hard map in the prepared patch: %+v", w.ops)
+	return nil
+}
+
+// An existing Profile may declare quota keys this console has no static field
+// for: the cpu and memory aliases and a device key the Profile already
+// declares. They are edited under their own names. The key set never changes,
+// no canonical requests.* key is added beside them and no key is renamed.
+func TestProfileUpdateEditsExistingLegacyQuotaKeys(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	hard := legacyQuotaHard()
+	setProfileHard(t, api, "alice", hard)
+	setNamespaceQuota(t, k, api, "alice", hard)
+	quotaController(k, api)
+
+	// Only the CPU alias changes.
+	w, err := s.build(ctx, updateAction(t, api, map[string]string{
+		"cpu": "96", "memory": "256Gi", "nvidia.com/gpu": "4",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := mergedHard(t, w)
+	if len(merged) != len(hard) {
+		t.Fatalf("the declared key set changed: %v", merged)
+	}
+	if merged["cpu"] != "96" {
+		t.Fatalf("the cpu alias was not edited: %v", merged)
+	}
+	for _, key := range []string{"memory", "nvidia.com/gpu", "persistentvolumeclaims", "requests.storage"} {
+		if _, found := merged[key]; !found {
+			t.Fatalf("the key %s was dropped: %v", key, merged)
+		}
+	}
+	for _, key := range []string{"requests.cpu", "requests.memory", "requests.nvidia.com/gpu", "limits.cpu"} {
+		if _, found := merged[key]; found {
+			t.Fatalf("a canonical key %s was added: %v", key, merged)
+		}
+	}
+	assertNoWrites(t, api)
+
+	// Only the device key changes. The key names stay exactly as declared.
+	w, err = s.build(ctx, updateAction(t, api, map[string]string{
+		"cpu": "128", "memory": "256Gi", "nvidia.com/gpu": "2",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged = mergedHard(t, w)
+	if len(merged) != len(hard) {
+		t.Fatalf("the declared key set changed: %v", merged)
+	}
+	if merged["nvidia.com/gpu"] != "2" {
+		t.Fatalf("the device key was not edited: %v", merged)
+	}
+	if merged["cpu"] != "128" || merged["memory"] != "256Gi" {
+		t.Fatalf("an untouched key changed: %v", merged)
+	}
+	assertNoWrites(t, api)
+}
+
+// The legacy keys are edited under their own names and nothing else. A
+// fractional device count, a new device key and an omitted key are refused
+// before any mutation, and a reserved storage capacity key stays unmanaged.
+func TestProfileUpdateRefusesLegacyQuotaKeyAbuse(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	hard := legacyQuotaHard()
+	hard["foo.storageclass.storage.k8s.io/requests.storage"] = "1Ti"
+	setProfileHard(t, api, "alice", hard)
+	setNamespaceQuota(t, k, api, "alice", hard)
+
+	base := map[string]string{
+		"cpu": "128", "memory": "256Gi", "nvidia.com/gpu": "4",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+		"foo.storageclass.storage.k8s.io/requests.storage": "1Ti",
+	}
+	// A fraction of a device is not a quota.
+	action := updateAction(t, api, map[string]string{
+		"cpu": "128", "memory": "256Gi", "nvidia.com/gpu": "0.5",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+		"foo.storageclass.storage.k8s.io/requests.storage": "1Ti",
+	})
+	if _, err := s.build(ctx, action); err == nil || !strings.Contains(err.Error(), "a quota count must be a whole number of objects") {
+		t.Fatalf("a fractional device count was accepted: %v", err)
+	}
+	// Zero devices is a real limit and stays editable.
+	action = updateAction(t, api, map[string]string{
+		"cpu": "128", "memory": "256Gi", "nvidia.com/gpu": "0",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+		"foo.storageclass.storage.k8s.io/requests.storage": "1Ti",
+	})
+	if _, err := s.build(ctx, action); err != nil {
+		t.Fatalf("a zero device limit was refused: %v", err)
+	}
+	// A device key the Profile does not declare is never introduced.
+	action = updateAction(t, api, map[string]string{
+		"cpu": "128", "memory": "256Gi", "nvidia.com/gpu": "4",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+		"foo.storageclass.storage.k8s.io/requests.storage": "1Ti",
+		"amd.com/gpu": "1",
+	})
+	if _, err := s.build(ctx, action); err == nil || !strings.Contains(err.Error(), "unsupported quota resource") {
+		t.Fatalf("a new device key was accepted: %v", err)
+	}
+	// A reserved cluster quota key stays operator managed: it is preserved
+	// verbatim and it may not be changed.
+	action = updateAction(t, api, map[string]string{
+		"cpu": "128", "memory": "256Gi", "nvidia.com/gpu": "4",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+		"foo.storageclass.storage.k8s.io/requests.storage": "2Ti",
+	})
+	if _, err := s.build(ctx, action); err == nil || !strings.Contains(err.Error(), "changing an unsupported quota key is unsupported") {
+		t.Fatalf("a reserved cluster quota key was changed: %v", err)
+	}
+	// An existing key may not be omitted, not even a legacy one.
+	omitted := map[string]string{}
+	for key, value := range base {
+		if key == "cpu" {
+			continue
+		}
+		omitted[key] = value
+	}
+	action = updateAction(t, api, omitted)
+	if _, err := s.build(ctx, action); err == nil || !strings.Contains(err.Error(), "quota key removal is unsupported by this adapter") {
+		t.Fatalf("an omitted legacy key was accepted: %v", err)
+	}
+	// A stale precondition is refused before the merge.
+	action = updateAction(t, api, base)
+	action.BaseConfigDigest = "sha256:stale"
+	if _, err := s.build(ctx, action); err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("a stale precondition was accepted: %v", err)
+	}
+	assertNoWrites(t, api)
+}
+
+// The edited legacy quota converges with the installed controller: the
+// Profile-owned resource quota carries the same keys in spec.hard and in
+// status.hard. A controller that never reconciles is a timed failure, not a
+// definite rejection.
+func TestProfileUpdateConvergesOnLegacyQuotaKeys(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	hard := legacyQuotaHard()
+	setProfileHard(t, api, "alice", hard)
+	setNamespaceQuota(t, k, api, "alice", hard)
+	quotaController(k, api)
+	prepared, err := s.Prepare(ctx, updateAction(t, api, map[string]string{
+		"cpu": "96", "memory": "256Gi", "nvidia.com/gpu": "2",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Execute(ctx, prepared, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	cur := api.get("profiles", "", "alice")
+	declared, _, _ := unstructured.NestedMap(cur.Object, "spec", "resourceQuotaSpec", "hard")
+	if len(declared) != len(hard) || declared["cpu"] != "96" || declared["nvidia.com/gpu"] != "2" {
+		t.Fatalf("the declared quota is not the reviewed one: %v", declared)
+	}
+	quota, err := k.CoreV1().ResourceQuotas("alice").Get(ctx, "kf-resource-quota", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range hard {
+		if key == "cpu" {
+			want = "96"
+		}
+		if key == "nvidia.com/gpu" {
+			want = "2"
+		}
+		observed, found := quota.Spec.Hard[corev1.ResourceName(key)]
+		if !found || observed.String() != want {
+			t.Fatalf("the resource quota does not carry %s = %s: %v", key, want, quota.Spec.Hard)
+		}
+		observed, found = quota.Status.Hard[corev1.ResourceName(key)]
+		if !found || observed.String() != want {
+			t.Fatalf("the resource quota status does not carry %s = %s: %v", key, want, quota.Status.Hard)
+		}
+	}
+}
+
+// A Profile that declares both the cpu alias and the canonical requests.cpu
+// key keeps both: they are two declared limits, they are edited independently
+// and neither is dropped or merged into the other.
+func TestProfileUpdateKeepsAliasAndCanonicalKeysIndependent(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	hard := map[string]any{"cpu": "128", "requests.cpu": "64", "memory": "256Gi"}
+	setProfileHard(t, api, "alice", hard)
+	setNamespaceQuota(t, k, api, "alice", hard)
+	quotaController(k, api)
+	w, err := s.build(ctx, updateAction(t, api, map[string]string{"cpu": "96", "requests.cpu": "64", "memory": "256Gi"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := mergedHard(t, w)
+	if len(merged) != len(hard) {
+		t.Fatalf("a declared key was dropped: %v", merged)
+	}
+	if merged["cpu"] != "96" {
+		t.Fatalf("the alias was not edited: %v", merged)
+	}
+	if merged["requests.cpu"] != "64" {
+		t.Fatalf("the canonical key was changed or merged: %v", merged)
+	}
+	if merged["memory"] != "256Gi" {
+		t.Fatalf("an untouched key changed: %v", merged)
+	}
+	// Omitting one of the two is a removal and is refused.
+	action := updateAction(t, api, map[string]string{"cpu": "96", "memory": "256Gi"})
+	if _, err = s.build(ctx, action); err == nil || !strings.Contains(err.Error(), "quota key removal is unsupported by this adapter") {
+		t.Fatalf("an omitted declared key was accepted: %v", err)
+	}
+	assertNoWrites(t, api)
+}
+
+// A new Profile never declares a raw device key: only the canonical key of an
+// approved preset may introduce a device resource.
+func TestProfileCreateRefusesARawDeviceQuotaKey(t *testing.T) {
+	s, api, _ := testService(t)
+	ctx := context.Background()
+	action := model.Action{Kind: "profile.create", Name: "bob", Owner: "bob@example.test", Quota: map[string]string{"cpu": "4", "memory": "8Gi"}}
+	if _, err := s.build(ctx, action); err != nil {
+		t.Fatalf("the quota aliases were refused for a new Profile: %v", err)
+	}
+	action = model.Action{Kind: "profile.create", Name: "bob", Owner: "bob@example.test", Quota: map[string]string{"nvidia.com/gpu": "1"}}
+	if _, err := s.build(ctx, action); err == nil || !strings.Contains(err.Error(), "unsupported quota resource") {
+		t.Fatalf("a raw device key was accepted for a new Profile: %v", err)
+	}
+	assertNoWrites(t, api)
+}
+
+// unenforcedDeviceWarnings returns the plan warnings that state a declared raw
+// device quota key is not enforced as a device request quota.
+func unenforcedDeviceWarnings(warnings []string) []string {
+	const marker = "does not enforce it as a device request quota"
+	var out []string
+	for _, warning := range warnings {
+		if strings.Contains(warning, marker) {
+			out = append(out, warning)
+		}
+	}
+	return out
+}
+
+// An existing raw device quota key is inert: Kubernetes records it but does
+// not charge or evaluate it as a device request quota. Every plan built from
+// such a Profile warns about that fact, even when only the CPU alias changes,
+// because the original GPU declaration must never be presented as a limit this
+// edit re-enforces. The key stays exactly where it is: no canonical key is
+// added, no key is renamed and no limit is activated.
+func TestProfileUpdateWarnsOnDeclaredRawDeviceQuotaForAnyEdit(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	hard := legacyQuotaHard()
+	setProfileHard(t, api, "alice", hard)
+	setNamespaceQuota(t, k, api, "alice", hard)
+	quotaController(k, api)
+
+	// The exact fixture: only the CPU alias changes, from 128 to 96.
+	w, err := s.build(ctx, updateAction(t, api, map[string]string{
+		"cpu": "96", "memory": "256Gi", "nvidia.com/gpu": "4",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := mergedHard(t, w)
+	if len(merged) != len(hard) {
+		t.Fatalf("the declared key set changed: %v", merged)
+	}
+	if merged["cpu"] != "96" || merged["nvidia.com/gpu"] != "4" {
+		t.Fatalf("the reviewed edit is wrong: %v", merged)
+	}
+	for _, key := range []string{"requests.cpu", "requests.memory", "requests.nvidia.com/gpu"} {
+		if _, found := merged[key]; found {
+			t.Fatalf("a canonical key %s was inserted: %v", key, merged)
+		}
+	}
+	warnings := unenforcedDeviceWarnings(w.prepared.Warnings)
+	if len(warnings) != 1 {
+		t.Fatalf("expected exactly one raw device warning, got %v", w.prepared.Warnings)
+	}
+	for _, want := range []string{
+		`"nvidia.com/gpu"`,
+		"declared but standard Kubernetes does not enforce it as a device request quota",
+		"enforcement uses requests.nvidia.com/gpu",
+		"editing retains the key",
+		"does not migrate or activate the limit",
+	} {
+		if !strings.Contains(warnings[0], want) {
+			t.Fatalf("the warning lacks %q: %s", want, warnings[0])
+		}
+	}
+	assertNoWrites(t, api)
+}
+
+// Editing a declared raw device value is allowed under its own key name, and
+// the plan still warns that the new value is not enforced as a device request
+// quota. The guarded legacy alias carries the same warning.
+func TestProfileUpdateWarnsWhenARawDeviceQuotaValueChanges(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	hard := legacyQuotaHard()
+	setProfileHard(t, api, "alice", hard)
+	setNamespaceQuota(t, k, api, "alice", hard)
+	quotaController(k, api)
+
+	quota := map[string]string{
+		"cpu": "128", "memory": "256Gi", "nvidia.com/gpu": "2",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+	}
+	w, err := s.build(ctx, updateAction(t, api, quota))
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := mergedHard(t, w)
+	if merged["nvidia.com/gpu"] != "2" {
+		t.Fatalf("the raw device key was not edited under its own name: %v", merged)
+	}
+	if _, found := merged["requests.nvidia.com/gpu"]; found {
+		t.Fatalf("a canonical device key was inserted: %v", merged)
+	}
+	warnings := unenforcedDeviceWarnings(w.prepared.Warnings)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "requests.nvidia.com/gpu") {
+		t.Fatalf("the raw device edit was not warned factually: %v", w.prepared.Warnings)
+	}
+
+	// The legacy profile.quota.change alias is the same guarded update.
+	action := updateAction(t, api, quota)
+	action.Kind = "profile.quota.change"
+	w, err = s.build(ctx, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warnings = unenforcedDeviceWarnings(w.prepared.Warnings)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], `"nvidia.com/gpu"`) {
+		t.Fatalf("the alias plan lost the raw device warning: %v", w.prepared.Warnings)
+	}
+	assertNoWrites(t, api)
+}
+
+// The canonical requests.<device> key and the ordinary cpu and memory aliases
+// are enforced quota resources: they must never produce the raw device
+// warning, and the canonical key stays edited under its own name.
+func TestProfileUpdateDoesNotWarnOnCanonicalOrOrdinaryQuotaKeys(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	s.Config.Notebooks.GPUPresets = []config.GPUPreset{{Name: "gpu", ResourceKey: "nvidia.com/gpu"}}
+	hard := map[string]any{
+		"cpu": "128", "memory": "256Gi", "requests.nvidia.com/gpu": "4",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+	}
+	setProfileHard(t, api, "alice", hard)
+	setNamespaceQuota(t, k, api, "alice", hard)
+	quotaController(k, api)
+
+	w, err := s.build(ctx, updateAction(t, api, map[string]string{
+		"cpu": "96", "memory": "256Gi", "requests.nvidia.com/gpu": "2",
+		"persistentvolumeclaims": "20", "requests.storage": "500Gi",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warnings := unenforcedDeviceWarnings(w.prepared.Warnings); len(warnings) != 0 {
+		t.Fatalf("a canonical or ordinary quota key was misclassified: %v", warnings)
+	}
+	merged := mergedHard(t, w)
+	if merged["cpu"] != "96" || merged["requests.nvidia.com/gpu"] != "2" {
+		t.Fatalf("the reviewed edits are wrong: %v", merged)
+	}
+	assertNoWrites(t, api)
+}
+
+// Only an existing raw extended device key is warned about. A qualified
+// cluster key such as foo.storageclass.storage.k8s.io/requests.storage is
+// operator managed, not a device, and must never be misclassified.
+func TestProfileUpdateDoesNotWarnOnReservedQualifiedQuotaKeys(t *testing.T) {
+	s, api, k := testService(t)
+	ctx := context.Background()
+	const reservedKey = "foo.storageclass.storage.k8s.io/requests.storage"
+	hard := map[string]any{"cpu": "8", reservedKey: "1Ti"}
+	setProfileHard(t, api, "alice", hard)
+	setNamespaceQuota(t, k, api, "alice", hard)
+
+	w, err := s.build(ctx, updateAction(t, api, map[string]string{"cpu": "4"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warnings := unenforcedDeviceWarnings(w.prepared.Warnings); len(warnings) != 0 {
+		t.Fatalf("a reserved qualified quota key was misclassified: %v", warnings)
+	}
+	merged := mergedHard(t, w)
+	if merged["cpu"] != "4" || merged[reservedKey] != "1Ti" {
+		t.Fatalf("the reserve key was not preserved exactly: %v", merged)
+	}
+	assertNoWrites(t, api)
+}

@@ -149,6 +149,13 @@ func observations() []resource {
 				"quota.requests.ephemeral-storage": "5Gi",
 				"configDigest":                     configDigest("synthetic-config-team-alpha"),
 				"createdAt":                        ago(50 * day),
+				// Safe, non-sensitive metadata. It may be shown in the Profile
+				// summary. The configuration precondition above may not.
+				"resourceVersion":                 "4242",
+				"labels":                          "app.kubernetes.io/part-of=synthetic-workspace",
+				"annotations":                     "kubeflow.org/owner=admin@example.org",
+				"label.app.kubernetes.io/part-of": "synthetic-workspace",
+				"annotation.kubeflow.org/owner":   "admin@example.org",
 			},
 		},
 		{
@@ -164,8 +171,32 @@ func observations() []resource {
 				"createdAt":                        ago(49 * day),
 			},
 		},
+		{
+			// A Profile whose quota declares the Kubernetes aliases and a device
+			// key of its own. Those keys are edited under their own names: the
+			// key set never changes and no canonical requests.* key is added.
+			Kind: "Profile", Name: "team-legacy", Owner: "legacy.owner@example.org", State: "Active",
+			Details: map[string]string{
+				"apiVersion":                   "kubeflow.org/v1",
+				"ownerKind":                    "User",
+				"quota.cpu":                    "128",
+				"quota.memory":                 "256Gi",
+				"quota.nvidia.com/gpu":         "4",
+				"quota.persistentvolumeclaims": "20",
+				"quota.requests.storage":       "500Gi",
+				// Quota keys the console does not manage. They have to stay
+				// read-only and are returned unchanged in an update. A
+				// count/<resource> object quota is not a raw device key and
+				// must not raise the bare-device warning.
+				"quota.requests.ephemeral-storage": "5Gi",
+				"quota.count/jobs.batch":           "5",
+				"configDigest":                     configDigest("synthetic-config-team-legacy"),
+				"createdAt":                        ago(47 * day),
+			},
+		},
 		{Kind: "Namespace", Name: "team-alpha", State: "Active", Details: map[string]string{"createdAt": ago(50 * day)}},
 		{Kind: "Namespace", Name: "team-beta", State: "Active", Details: map[string]string{"createdAt": ago(49 * day)}},
+		{Kind: "Namespace", Name: "team-legacy", State: "Active", Details: map[string]string{"createdAt": ago(47 * day)}},
 		// A namespace without a Profile. Its name is reserved: a new Profile
 		// can never adopt an existing namespace.
 		{Kind: "Namespace", Name: "team-delta", State: "Active", Details: map[string]string{"createdAt": ago(48 * day)}},
@@ -185,6 +216,51 @@ func observations() []resource {
 				"node": "node-b", "volume": "team-beta-claim", "condition.Ready": "False",
 				"image.notebook": "kubeflownotebookswg/jupyter:1.9.0",
 				"createdAt":      ago(19 * day),
+			},
+		},
+		{
+			// A Notebook, a StatefulSet and a Pod share the name "work" in the
+			// same namespace. The Notebooks page lists only the Notebook row;
+			// the other kinds are different resources and stay on their own
+			// pages. The same collision exists in a second namespace, so a row
+			// is only identified by kind, namespace and name.
+			Kind: "Notebook", Namespace: "team-alpha", Name: "work", Owner: "admin@example.org", State: "Running",
+			Details: map[string]string{
+				"requested": "2 CPU / 4Gi", "capacity": "2 CPU / 4Gi", "storageClass": "standard",
+				"node": "node-a", "volume": "work", "condition.Ready": "True",
+				"image.notebook": "kubeflownotebookswg/jupyter:1.9.0",
+				"createdAt":      ago(5 * day),
+			},
+		},
+		{
+			Kind: "Notebook", Namespace: "team-beta", Name: "work", Owner: "beta.owner@example.org", State: "Stopped",
+			Details: map[string]string{
+				"requested": "1 CPU / 1Gi", "capacity": "1 CPU / 1Gi", "storageClass": "standard",
+				"node": "node-b", "volume": "work", "condition.Ready": "False",
+				"image.notebook": "kubeflownotebookswg/jupyter:1.9.0",
+				"createdAt":      ago(4 * day),
+			},
+		},
+		{
+			Kind: "StatefulSet", Namespace: "team-alpha", Name: "work", State: "Running",
+			Details: map[string]string{"replicas": "1", "ready": "1", "service": "work", "createdAt": ago(5 * day)},
+		},
+		{
+			Kind: "StatefulSet", Namespace: "team-beta", Name: "work", State: "Running",
+			Details: map[string]string{"replicas": "1", "ready": "0", "service": "work", "createdAt": ago(4 * day)},
+		},
+		{
+			Kind: "Pod", Namespace: "team-alpha", Name: "work", Owner: "StatefulSet/work", State: "Running",
+			Details: map[string]string{
+				"ready": "1/1", "containers": "notebook", "restarts": "0", "node": "node-a",
+				"createdAt": ago(5 * day),
+			},
+		},
+		{
+			Kind: "Pod", Namespace: "team-beta", Name: "work", Owner: "StatefulSet/work", State: "Running",
+			Details: map[string]string{
+				"ready": "0/1", "containers": "notebook", "restarts": "2", "node": "node-b",
+				"createdAt": ago(4 * day),
 			},
 		},
 		{
@@ -319,7 +395,7 @@ func observations() []resource {
 // resource keys, allowed images, approved storage class and template names
 // and the optional footer text.
 // No database path, no kubeconfig location and no secret ever reaches it.
-func projection(writes, deletion bool) map[string]any {
+func projection(writes, deletion, notebookContract bool) map[string]any {
 	return map[string]any{
 		"Identity": map[string]any{
 			"Email":             fixtureIdentity.Email,
@@ -338,7 +414,7 @@ func projection(writes, deletion bool) map[string]any {
 				"ProfileDeletion": deletion && writes,
 			},
 			"Notebooks": map[string]any{
-				"ControllerContractConfirmed": true,
+				"ControllerContractConfirmed": notebookContract,
 				"GPUPresets":                  []map[string]string{{"Name": "L4", "ResourceKey": "nvidia.com/gpu"}},
 				"AllowedImages":               []string{"kubeflownotebookswg/jupyter:1.9.0"},
 			},
@@ -409,13 +485,14 @@ type capture struct {
 }
 
 type server struct {
-	mu       sync.Mutex
-	captures []capture
-	warnings []string
-	writes   bool
-	deletion bool
-	tmpl     *template.Template
-	assets   string
+	mu             sync.Mutex
+	captures       []capture
+	warnings       []string
+	writes         bool
+	deletion       bool
+	notebookWrites bool
+	tmpl           *template.Template
+	assets         string
 }
 
 func main() {
@@ -430,11 +507,15 @@ func main() {
 	}
 	writes := os.Getenv("KF_ADMIN_WRITES") != "0"
 	deletion := os.Getenv("KF_ADMIN_PROFILE_DELETION") != "0"
+	// The installed Notebook controller contract is an independent capability:
+	// a deployment may enable writes without confirming it.
+	notebookWrites := writes && os.Getenv("KF_ADMIN_NOTEBOOK_CONTRACT") != "0"
 	s := &server{
-		writes:   writes,
-		deletion: deletion,
-		tmpl:     template.Must(template.New("index.html").Parse(string(page))),
-		assets:   assets,
+		writes:         writes,
+		deletion:       deletion,
+		notebookWrites: notebookWrites,
+		tmpl:           template.Must(template.New("index.html").Parse(string(page))),
+		assets:         assets,
 	}
 
 	mux := http.NewServeMux()
@@ -446,6 +527,10 @@ func main() {
 	for _, list := range []string{"overview", "profiles", "namespaces", "pvs", "pvcs", "notebooks", "storage-classes", "pods", "events", "quotas", "limit-ranges", "role-bindings", "statefulsets", "nodes"} {
 		mux.HandleFunc("GET /api/v1/"+list, s.handleInventory)
 	}
+	// Production exposes no Notebook details API: the inventory projection is
+	// the only Notebook observation. The fixture therefore serves no synthetic
+	// per-Notebook detail endpoint and never implies a fuller configuration
+	// model than the console can observe.
 	mux.HandleFunc("GET /api/v1/operations", func(w http.ResponseWriter, r *http.Request) {
 		historyHeaders(w, "recent-plus-unresolved")
 		writeJSON(w, 200, []any{})
@@ -471,7 +556,7 @@ func main() {
 		log.Fatalf("fixture: listen on the loopback interface: %v", err)
 	}
 	base := "http://" + listener.Addr().String()
-	fmt.Printf("FIXTURE_READY %s writes=%v deletion=%v\n", base, writes, deletion && writes)
+	fmt.Printf("FIXTURE_READY %s writes=%v deletion=%v notebookWrites=%v\n", base, writes, deletion && writes, notebookWrites)
 	_ = os.Stdout.Sync()
 	log.Fatal(http.Serve(listener, mux))
 }
@@ -485,7 +570,7 @@ func port() string {
 
 // handlePage renders the real console template with the projection.
 func (s *server) handlePage(w http.ResponseWriter, r *http.Request) {
-	view := projection(s.writes, s.deletion)
+	view := projection(s.writes, s.deletion, s.notebookWrites)
 	if gaps := missingProjectionFields(s.tmpl, view); len(gaps) > 0 {
 		warning := "projection gap: " + strings.Join(gaps, ", ")
 		s.mu.Lock()
@@ -633,14 +718,19 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.record("operation", body, r)
 	now := time.Now().UTC()
+	// The fixture records a request; it never executes a controller. The answer
+	// therefore stays a pending synthetic record and never claims that a
+	// cluster mutation succeeded.
 	writeJSON(w, 202, map[string]any{
 		"id":        "operation-synthetic-0001",
 		"planID":    stringField(body, "planID"),
 		"actor":     "https://synthetic.invalid|fixture-operator",
-		"target":    "profile:team-alpha",
-		"action":    "profile.create",
-		"state":     "Succeeded",
-		"step":      "complete",
+		"target":    "synthetic-recording",
+		"action":    "synthetic.record",
+		"state":     "Pending",
+		"step":      "recorded",
+		"synthetic": true,
+		"note":      "Recorded in memory by the offline fixture; no controller executed and no cluster was contacted.",
 		"createdAt": now,
 		"updatedAt": now,
 	})
@@ -657,12 +747,14 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 			"notificationScope": fixtureIdentity.NotificationScope,
 		},
 		"features": map[string]any{
-			"writesEnabled":   s.writes,
-			"staticStorage":   true,
-			"pvcExpansion":    true,
-			"podRestarts":     true,
-			"nodeCordon":      true,
-			"profileDeletion": s.deletion && s.writes,
+			"writesEnabled":    s.writes,
+			"staticStorage":    true,
+			"pvcExpansion":     true,
+			"podRestarts":      true,
+			"nodeCordon":       true,
+			"profileDeletion":  s.deletion && s.writes,
+			"notebookWrites":   s.notebookWrites,
+			"notebookContract": s.notebookWrites,
 		},
 		"forbiddenStrings": []string{
 			// Values the projection must never carry. They are set here only

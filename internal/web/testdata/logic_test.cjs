@@ -232,10 +232,73 @@ assert.deepEqual(namespaceGroups.map(group => [group.kind, group.label, group.co
 ]);
 assert.equal(namespaceGroups.find(group => group.kind === "Notebook").href, "/notebooks");
 assert.equal(namespaceGroups.find(group => group.kind === "ResourceQuota").href, "/");
+// StatefulSets no longer appear on the Notebooks page. Their scoped group and
+// resource links land on the Overview table, never on an empty Notebook view.
+assert.equal(namespaceGroups.find(group => group.kind === "StatefulSet").href, "/");
 assert.equal(namespaceGroups.find(group => group.kind === "Pod").items[0].name, "work-0");
 assert.deepEqual(logic.namespaceResources(profileList, "empty"), [], "empty groups are omitted, never inferred");
 assert.deepEqual(logic.namespaceResources(profileList, ""), []);
 assert.equal(namespaceGroups.some(group => group.kind === "Namespace"), false, "the Namespace object is not listed as its own content");
+
+// Only kubeflow Notebook custom resources are Notebook rows: a Pod or
+// StatefulSet with the same name is a different resource.
+assert.deepEqual(logic.notebookResources(profileList).map(resource => resource.name), ["work", "system"]);
+assert.deepEqual(logic.notebookResources([{kind:"Pod",name:"work"},{kind:"StatefulSet",name:"work"}]), [], "Pods and StatefulSets are never Notebook resources");
+
+// ---- Quota key classification ---------------------------------------------
+// The standard quota aliases stay editable builtins, including the enforced
+// cpu/memory aliases and whole-object counts.
+for (const key of ["requests.cpu", "limits.cpu", "requests.memory", "limits.memory", "requests.storage", "pods", "persistentvolumeclaims", "cpu", "memory"]) {
+  assert.equal(logic.profileQuotaKind(key, []), "builtin", key + " is a builtin quota resource");
+}
+// count/<resource>.<group> is an enforced object-count quota, not an inert
+// bare device. It stays unmanaged/read-only and never raises the GPU warning.
+assert.equal(logic.deviceQuotaKey("count/jobs.batch"), false, "count/ quotas are object counts, not device resources");
+assert.equal(logic.profileQuotaKind("count/jobs.batch", []), "unmanaged", "an enforced count quota is never editable as a device");
+assert.equal(logic.profileDeviceQuotaWarning({"count/jobs.batch":"5"}), "", "an enforced count quota raises no GPU warning");
+// A reserved storage-capacity key is operator managed, never a raw device.
+assert.equal(logic.deviceQuotaKey("class.storage.k8s.io/requests.storage"), false);
+assert.equal(logic.profileQuotaKind("class.storage.k8s.io/requests.storage", []), "unmanaged");
+// An existing raw GPU key is an editable device under its own name; the
+// canonical approved preset key is a device and counts whole devices.
+assert.equal(logic.deviceQuotaKey("nvidia.com/gpu"), true);
+assert.equal(logic.profileQuotaKind("nvidia.com/gpu", []), "device");
+assert.equal(logic.profileQuotaKind("requests.nvidia.com/gpu", ["requests.nvidia.com/gpu"]), "device");
+assert.equal(logic.profileQuotaKind("requests.nvidia.com/gpu", []), "unmanaged", "a canonical key without an approved preset is not authored");
+assert.equal(logic.profileQuotaCounts("requests.nvidia.com/gpu", ["requests.nvidia.com/gpu"]), true, "an approved device preset counts whole devices");
+assert.equal(logic.profileQuotaCounts("requests.cpu", []), false, "CPU quantity is not a count");
+// The device domain follows DNS-1123 subdomain grammar; an invalid Profile key
+// is never offered as editable.
+for (const key of ["bad..domain/gpu", "-bad.domain/gpu", "bad-.domain/gpu", "UPPER.example/gpu", "a".repeat(64) + ".example/gpu", "nvidia.com/" + "g".repeat(64), "nvidia.com/bad name", "nvidia.com/bad/name"]) {
+  assert.equal(logic.deviceQuotaKey(key), false, key + " is not a valid raw device key");
+}
+assert.equal(logic.deviceQuotaKey("gpu.example.com/a100"), true);
+
+// Every finite non-negative integer spelling is a valid count value. The raw
+// text is never rewritten.
+for (const value of ["0", "1", "1.0", "1e2", "2E3", 5]) {
+  assert.equal(logic.isWholeQuotaCountValue(value), true, String(value) + " is a whole count");
+}
+for (const value of ["", "0.5", "-1", "abc", NaN, Infinity, -Infinity]) {
+  assert.equal(logic.isWholeQuotaCountValue(value), false, String(value) + " is not a whole count");
+}
+const gpuWarning = logic.profileDeviceQuotaWarning({"nvidia.com/gpu":"1"});
+assert.ok(gpuWarning.includes("requests.<device>"), "the warning names the enforced canonical form");
+assert.ok(gpuWarning.includes("declared but is normally not enforced"), "the warning states the bare key is not enforced");
+assert.ok(gpuWarning.includes("does not rename the key") && gpuWarning.includes("does not activate enforcement"), "the warning never claims an implicit migration");
+assert.ok(gpuWarning.includes("explicit authorization"), "a migration requires explicit authorization");
+assert.equal(logic.profileDeviceQuotaWarning({"requests.nvidia.com/gpu":"1"}), "", "a canonical key raises no bare-device warning");
+const summaryDetails = logic.profileSummaryDetails({kind:"Profile",name:"team",state:"Protected",owner:"a@b.test",
+  details:{apiVersion:"kubeflow.org/v1",ownerKind:"User",createdAt:"2026-01-01T00:00:00Z",resourceVersion:"7",configDigest:"sha256:secret","quota.cpu":"4"}});
+assert.equal(summaryDetails.apiVersion, "kubeflow.org/v1");
+assert.equal(summaryDetails.owner, "a@b.test");
+assert.equal(summaryDetails.ownerKind, "User");
+assert.equal(summaryDetails.state, "Protected");
+assert.equal(summaryDetails.scope, "Cluster scoped");
+assert.equal(summaryDetails.createdAt, "2026-01-01T00:00:00Z");
+assert.equal(summaryDetails.resourceVersion, "7");
+assert.deepEqual(summaryDetails.quota, {cpu:"4"});
+assert.equal(JSON.stringify(summaryDetails).includes("sha256:secret"), false, "the summary never carries the configuration digest");
 
 // Concise kubectl-style ages.
 assert.equal(logic.formatAge("2026-01-01T00:00:00Z", Date.parse("2026-01-01T00:00:45Z")), "45s");
@@ -488,4 +551,38 @@ assert.equal(deletePreview.includes("The server removes the Profile and the name
 assert.equal(deletePreview.includes("guaranteed"), false, "the preview never promises a complete erase");
 assert.equal(deletePreview.includes("permanently deleted"), false);
 assert.equal(deletePreview.includes("all data is removed"), false);
+
+// The observed quota keys of an existing Profile. The cpu and memory aliases
+// are standard Kubernetes quota resources, a device key of the Profile's own is
+// an extended device resource, and everything else stays operator managed.
+const legacyQuotas = { cpu: "128", memory: "256Gi", "nvidia.com/gpu": "4", persistentvolumeclaims: "20", "requests.storage": "500Gi" };
+assert.equal(logic.profileQuotaKind("cpu", []), "builtin", "the cpu alias is a builtin quota resource");
+assert.equal(logic.profileQuotaKind("memory", []), "builtin", "the memory alias is a builtin quota resource");
+assert.equal(logic.profileQuotaKind("requests.storage", []), "builtin", "the storage request is a builtin quota resource");
+assert.equal(logic.profileQuotaKind("nvidia.com/gpu", []), "device", "an observed device key is a device resource");
+assert.equal(logic.profileQuotaKind("example.com/gpu", []), "device", "an observed extended device key is a device resource");
+assert.equal(logic.profileQuotaKind("requests.nvidia.com/gpu", []), "unmanaged", "a canonical device key without an approved preset stays unmanaged");
+assert.equal(logic.profileQuotaKind("requests.nvidia.com/gpu", ["requests.nvidia.com/gpu"]), "device", "an approved preset key is a device resource");
+assert.equal(logic.profileQuotaKind("foo.storageclass.storage.k8s.io/requests.storage", []), "unmanaged", "a reserved storage capacity key stays unmanaged");
+assert.equal(logic.profileQuotaKind("storage.k8s.io/requests.storage", []), "unmanaged", "a reserved cluster domain stays unmanaged");
+assert.equal(logic.profileQuotaKind("requests.ephemeral-storage", []), "unmanaged", "an unmanaged canonical key stays unmanaged");
+assert.equal(logic.profileQuotaCounts("nvidia.com/gpu", []), true, "a device key counts whole devices");
+assert.equal(logic.profileQuotaCounts("pods", []), true, "a pod count counts whole objects");
+assert.equal(logic.profileQuotaCounts("cpu", []), false, "a cpu alias measures a resource");
+assert.equal(logic.deviceQuotaKey("nvidia.com/gpu"), true);
+assert.equal(logic.deviceQuotaKey("requests.nvidia.com/gpu"), false, "a canonical device key is never a raw device key");
+assert.equal(logic.deviceQuotaKey("cpu"), false, "a bare name is never a device key");
+// The submitted payload keeps the observed key names. No canonical key is
+// added beside an observed alias and nothing is renamed.
+const legacyPayload = buildAction([
+  ["kind", "profile.update"], ["name", "legacy"], ["owner", "legacy.owner@example.test"],
+  ["baseConfigDigest", "sha256:legacydigest"],
+  ["quota.cpu", "96"], ["quota.memory", "256Gi"], ["quota.nvidia.com/gpu", "2"],
+  ["quota.persistentvolumeclaims", "20"], ["quota.requests.storage", "500Gi"]
+]);
+assert.deepEqual(legacyPayload.quota, { cpu: "96", memory: "256Gi", "nvidia.com/gpu": "2", persistentvolumeclaims: "20", "requests.storage": "500Gi" },
+  "the payload carries exactly the observed key names");
+assert.equal(legacyPayload.quota["requests.cpu"], undefined, "no canonical cpu key is added beside the observed alias");
+assert.equal(legacyPayload.quota["requests.memory"], undefined, "no canonical memory key is added beside the observed alias");
+assert.equal(legacyPayload.quota["requests.nvidia.com/gpu"], undefined, "no canonical device key is added beside the observed one");
 console.log("Dashboard action, exact preview, typed sorting, target grammar, profile counts, profile naming, audit grouping and navigation tests passed.");

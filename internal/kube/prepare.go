@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"kubeflow-admin/internal/model"
 )
 
@@ -226,14 +227,20 @@ func quotaQuantity(s string) (resource.Quantity, error) {
 // countQuotaKey reports whether a quota key counts objects instead of
 // measuring a resource. A Pod count, a claim count and a configured extended
 // device count are whole numbers: a fraction of a Pod is not a quota.
-func countQuotaKey(key string, presets []string) bool {
+func countQuotaKey(key string, existing map[string]any, presets []string) bool {
 	switch key {
 	case "pods", "persistentvolumeclaims":
 		return true
 	}
 	// The approved presets are the configured extended device resources, which
 	// are counted per device.
-	return has(presets, key)
+	if has(presets, key) {
+		return true
+	}
+	// An extended device resource the Profile already declares counts whole
+	// devices as well: a fraction of a GPU is not a quota.
+	_, declared := existing[key]
+	return declared && existingDeviceQuotaKey(key)
 }
 
 // wholeQuantity reports whether a quota quantity is a whole number of objects.
@@ -247,7 +254,7 @@ func wholeQuantity(q resource.Quantity) bool {
 
 // quotaCountQuantity validates a declared count quota value. It is a whole,
 // non-negative number of objects.
-func quotaCountQuantity(key, raw string, presets []string) (resource.Quantity, error) {
+func quotaCountQuantity(key, raw string, existing map[string]any, presets []string) (resource.Quantity, error) {
 	q, err := quotaQuantity(raw)
 	if err != nil {
 		return resource.Quantity{}, err
@@ -258,7 +265,29 @@ func quotaCountQuantity(key, raw string, presets []string) (resource.Quantity, e
 	return q, nil
 }
 
-var builtinQuotaResources = []string{"requests.cpu", "limits.cpu", "requests.memory", "limits.memory", "requests.storage", "persistentvolumeclaims", "pods"}
+// builtinQuotaResources are the quota resources this adapter may author
+// without an approved device preset.
+//
+// "cpu" and "memory" are the upstream ResourceQuota aliases of requests.cpu
+// and requests.memory: Kubernetes lists both as standard quota resources and
+// charges them against the same pod request. A Profile that already declares
+// them is therefore edited under its own key names. The key is never renamed
+// to a requests.* key and no second, redundant limit is added beside it.
+var builtinQuotaResources = []string{
+	"requests.cpu", "limits.cpu", "requests.memory", "limits.memory",
+	"requests.storage", "persistentvolumeclaims", "pods",
+	"cpu", "memory",
+}
+
+// countQuotaDomain is the reserved resource-name prefix Kubernetes uses for
+// object-count quotas ("count/jobs.batch"). It is a quota namespace, never an
+// extended device domain.
+const countQuotaDomain = "count"
+
+// reservedQuotaDomains are the API groups that never describe an editable
+// device. The cluster's own namespaces describe storage capacity and
+// control-plane resources, never a GPU an operator may count.
+var reservedQuotaDomains = []string{"kubernetes.io", "k8s.io"}
 
 // supportedQuotaResource reports whether this adapter may author the hard key.
 // Anything else is operator/controller managed and must never be introduced or
@@ -267,9 +296,87 @@ func supportedQuotaResource(k string, presets []string) bool {
 	return has(builtinQuotaResources, k) || has(presets, k)
 }
 
+// quotaPrefix reports whether a quota key part carries the canonical
+// "requests." or "limits." prefix of a quota resource name.
+func quotaPrefix(part string) bool {
+	return strings.HasPrefix(part, "requests.") || strings.HasPrefix(part, "limits.")
+}
+
+// reservedQuotaDomain reports whether a resource domain belongs to the
+// cluster's own reserved namespaces.
+func reservedQuotaDomain(domain string) bool {
+	d := strings.ToLower(domain)
+	for _, reserved := range reservedQuotaDomains {
+		if d == reserved || strings.HasSuffix(d, "."+reserved) {
+			return true
+		}
+	}
+	return false
+}
+
+// existingDeviceQuotaKey reports whether a quota key is a raw extended device
+// resource: a domain/resource name whose domain is not a reserved cluster
+// namespace, whose resource part is a plain device name and that carries no
+// canonical quota prefix.
+//
+// The rule is deliberately narrow. It admits a key such as "nvidia.com/gpu"
+// that a Profile already declares, so an existing legacy device quota is
+// edited under its own name instead of being renamed. It refuses a canonical
+// key ("requests.nvidia.com/gpu"), a reserved cluster domain
+// ("foo.storageclass.storage.k8s.io/requests.storage") and everything that is
+// not a plain device name. It approves no new device resource: the caller
+// only offers a key the Profile already declares.
+func existingDeviceQuotaKey(key string) bool {
+	domain, name, found := strings.Cut(key, "/")
+	if !found || domain == "" || name == "" || strings.Contains(name, "/") {
+		return false
+	}
+	// "count/<resource>" counts objects of a resource. It is a reserved quota
+	// namespace, not an extended device domain, and must never be edited as a
+	// bare GPU quota.
+	if domain == countQuotaDomain {
+		return false
+	}
+	// A canonical quota key prefixes the resource ("requests.nvidia.com/gpu").
+	if quotaPrefix(domain) || quotaPrefix(name) {
+		return false
+	}
+	if reservedQuotaDomain(domain) {
+		return false
+	}
+	if len(validation.IsDNS1123Subdomain(domain)) > 0 {
+		return false
+	}
+	return len(validation.IsQualifiedName(name)) == 0
+}
+
+// authorableQuotaKey reports whether this adapter may write the value of a
+// quota key in one operation.
+//
+//   - A builtin quota resource, including the cpu and memory aliases, is
+//     always authorable.
+//   - A configured device preset contributes its canonical requests.<device>
+//     key.
+//   - An extended device resource the Profile already declares is authorable
+//     for an edit, so an existing legacy device quota can be corrected under
+//     its own key name. A device resource that is not declared yet is never
+//     introduced.
+//
+// Every other key is operator/controller managed: it is preserved verbatim
+// and may only be round-tripped with an identical value.
+func authorableQuotaKey(key string, existing map[string]any, presets []string) bool {
+	if supportedQuotaResource(key, presets) {
+		return true
+	}
+	_, declared := existing[key]
+	return declared && existingDeviceQuotaKey(key)
+}
+
 // quota validates the complete desired set for a new Profile. Introducing an
 // unsupported key here would create a Profile owned quota the adapter cannot
-// later reconcile, so it is rejected.
+// later reconcile, so it is rejected. A new Profile only ever declares the
+// canonical resources: an extended device resource is only ever introduced
+// under the canonical requests.<device> key of an approved preset.
 func quota(a map[string]string, presets []string) (map[string]any, error) {
 	if len(a) == 0 {
 		return nil, errors.New("nonempty quota required; removing quotas is unsupported")
@@ -279,8 +386,8 @@ func quota(a map[string]string, presets []string) (map[string]any, error) {
 		if !supportedQuotaResource(k, presets) {
 			return nil, errors.New("unsupported quota resource")
 		}
-		if countQuotaKey(k, presets) {
-			q, err := quotaCountQuantity(k, v, presets)
+		if countQuotaKey(k, nil, presets) {
+			q, err := quotaCountQuantity(k, v, nil, presets)
 			if err != nil {
 				return nil, err
 			}
@@ -299,10 +406,14 @@ func quota(a map[string]string, presets []string) (map[string]any, error) {
 // mergeQuota reconciles a quota change against the Profile's existing hard map.
 // Every existing key is retained: unsupported (operator/controller managed) keys
 // are preserved verbatim and may only be round-tripped with an identical value,
-// while supported keys must be supplied as positive quantities so that a changed
-// value is intentional. Dropping an existing supported key stays a no-op error,
+// while supported keys must be supplied as non-negative quantities so a changed
+// value is intentional. Dropping an existing supported key remains an error,
 // preserving the no-removal guard. The returned map replaces the whole hard map,
 // so preserved keys survive the patch.
+//
+// An extended device resource the Profile already declares is supported for
+// this edit: it is written under its own key name, never renamed to a
+// canonical requests.<device> key and never paired with a second key.
 func mergeQuota(existing map[string]any, requested map[string]string, presets []string) (map[string]any, error) {
 	if len(requested) == 0 {
 		return nil, errors.New("quota removal is unsupported")
@@ -312,7 +423,7 @@ func mergeQuota(existing map[string]any, requested map[string]string, presets []
 		out[k] = v
 	}
 	for k, raw := range requested {
-		if !supportedQuotaResource(k, presets) {
+		if !authorableQuotaKey(k, existing, presets) {
 			old, ok := existing[k]
 			if !ok {
 				return nil, errors.New("unsupported quota resource")
@@ -335,8 +446,8 @@ func mergeQuota(existing map[string]any, requested map[string]string, presets []
 		if err != nil {
 			return nil, err
 		}
-		if countQuotaKey(k, presets) {
-			q, err = quotaCountQuantity(k, raw, presets)
+		if countQuotaKey(k, existing, presets) {
+			q, err = quotaCountQuantity(k, raw, existing, presets)
 			if err != nil {
 				return nil, err
 			}
@@ -344,7 +455,7 @@ func mergeQuota(existing map[string]any, requested map[string]string, presets []
 		out[k] = q.String()
 	}
 	for k := range existing {
-		if supportedQuotaResource(k, presets) {
+		if authorableQuotaKey(k, existing, presets) {
 			if _, ok := requested[k]; !ok {
 				return nil, errors.New("quota key removal is unsupported by this adapter")
 			}

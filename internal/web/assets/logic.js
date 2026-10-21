@@ -334,6 +334,30 @@
     // when a namespace filter is active on another page.
     return (Array.isArray(resources) ? resources : []).filter(resource => resource.kind === "Profile");
   }
+  // The Notebooks page lists the kubeflow.org Notebook custom resource only.
+  // Pods and StatefulSets are owned workloads with their own views; they are
+  // never mixed into the Notebook table under the same name.
+  function notebookResources(resources) {
+    return (Array.isArray(resources) ? resources : []).filter(resource => resource.kind === "Notebook");
+  }
+  // The safe, consolidated facts of one Profile. The internal configuration
+  // precondition is excluded by visibleResourceDetails and is never part of
+  // the summary; the owner and quota are each projected exactly once.
+  function profileSummaryDetails(resource) {
+    const details = visibleResourceDetails(resource);
+    return {
+      kind: String(resource?.kind || "Profile"),
+      name: String(resource?.name || ""),
+      apiVersion: String(details.apiVersion ?? ""),
+      owner: String(resource?.owner ?? "") || String(details.owner ?? ""),
+      ownerKind: String(details.ownerKind ?? ""),
+      state: String(resource?.state ?? ""),
+      scope: resource?.namespace ? String(resource.namespace) : "Cluster scoped",
+      createdAt: String(details.createdAt ?? ""),
+      resourceVersion: String(details.resourceVersion ?? ""),
+      quota: profileQuotaValues(resource)
+    };
+  }
 
   // ---- Profile naming, form values and deletion confirmation --------------
   // A Profile name is also its namespace name, so it must be a Kubernetes
@@ -418,6 +442,97 @@
     }
     return values;
   }
+  // The quota keys this console may author without an approved device preset.
+  // "cpu" and "memory" are the Kubernetes ResourceQuota aliases of
+  // requests.cpu and requests.memory: Kubernetes charges them against the same
+  // pod request. A Profile that declares them is edited under its own key
+  // names. The key is never renamed and no second limit is added beside it.
+  const builtinQuotaKeys = ["requests.cpu", "limits.cpu", "requests.memory", "limits.memory", "requests.storage", "persistentvolumeclaims", "pods", "cpu", "memory"];
+  // The quota keys that count whole objects instead of measuring a resource.
+  const builtinQuotaCounts = ["pods", "persistentvolumeclaims"];
+  // The API groups that never describe an editable device. The cluster's own
+  // namespaces describe storage capacity and control-plane resources.
+  const reservedQuotaDomains = ["kubernetes.io", "k8s.io"];
+  // quotaPrefix reports whether a quota key part carries the canonical
+  // "requests." or "limits." prefix of a quota resource name.
+  function quotaPrefix(part) { return part.startsWith("requests.") || part.startsWith("limits."); }
+  // reservedQuotaDomain reports whether a resource domain belongs to the
+  // cluster's own reserved namespaces.
+  function reservedQuotaDomain(domain) {
+    const name = String(domain || "").toLowerCase();
+    return reservedQuotaDomains.some(reserved => name === reserved || name.endsWith("." + reserved));
+  }
+  // validQuotaDomain validates the domain of a quota key as a DNS-1123
+  // subdomain: at most 253 characters, dot-separated labels of 1-63 lowercase
+  // alphanumerics and hyphens, each starting and ending with an alphanumeric.
+  // The server is authoritative, but a key that cannot be a qualified resource
+  // name must never be presented as an editable device.
+  function validQuotaDomain(domain) {
+    const text = String(domain || "");
+    if (!text || text.length > 253) return false;
+    return text.split(".").every(label => label.length >= 1 && label.length <= 63 && /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(label));
+  }
+  // deviceQuotaKey reports whether a quota key is a raw extended device
+  // resource: a domain/resource name whose domain is not a reserved cluster
+  // namespace, whose resource part is a plain device name and that carries no
+  // canonical quota prefix. A canonical key ("requests.nvidia.com/gpu"), a
+  // reserved storage capacity key ("foo.storageclass.storage.k8s.io/
+  // requests.storage") and an enforced object count ("count/jobs.batch") are
+  // never raw device keys. The server owns the decision; the browser only uses
+  // this to label an observed key.
+  function deviceQuotaKey(key) {
+    const text = String(key || "");
+    const cut = text.indexOf("/");
+    if (cut <= 0) return false;
+    const domain = text.slice(0, cut), name = text.slice(cut + 1);
+    if (!name || name.includes("/")) return false;
+    // count/<resource>.<group> is an enforced object-count quota, not a device.
+    if (domain === "count") return false;
+    if (quotaPrefix(domain) || quotaPrefix(name)) return false;
+    if (reservedQuotaDomain(domain)) return false;
+    if (!validQuotaDomain(domain)) return false;
+    if (name.length > 63) return false;
+    return /^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$/.test(name);
+  }
+  // profileQuotaKind classifies an observed quota key: "builtin", "device" or
+  // "unmanaged". An unmanaged key is operator/controller managed: it is
+  // preserved verbatim and it is never editable.
+  function profileQuotaKind(key, presetKeys) {
+    if (builtinQuotaKeys.includes(key)) return "builtin";
+    if (Array.isArray(presetKeys) && presetKeys.includes(key)) return "device";
+    if (deviceQuotaKey(key)) return "device";
+    return "unmanaged";
+  }
+  // profileQuotaCounts reports whether an observed quota key counts whole
+  // objects: a fraction of a GPU is not a quota.
+  function profileQuotaCounts(key, presetKeys) {
+    if (builtinQuotaCounts.includes(key)) return true;
+    return profileQuotaKind(key, presetKeys) === "device";
+  }
+  // isWholeQuotaCountValue accepts every finite, non-negative integer spelling
+  // a count field may carry (0, 1.0, 1e2). It never rewrites the value: the
+  // raw string is what the server receives and validates. A fraction,
+  // negative number, NaN or Infinity is refused before the request.
+  function isWholeQuotaCountValue(value) {
+    if (value === "" || value === null || value === undefined) return false;
+    const number = typeof value === "number" ? value : Number(String(value).trim());
+    return Number.isFinite(number) && Number.isInteger(number) && number >= 0;
+  }
+  // bareDeviceQuotaKeys returns the extended device quota keys the Profile
+  // declares without the canonical requests.<device> prefix. Kubernetes
+  // normally enforces a device quota only under requests.<device>; a bare key
+  // is declared but is not enforced by ResourceQuota admission.
+  function bareDeviceQuotaKeys(quota) {
+    return Object.keys(quota || {}).filter(key => deviceQuotaKey(key)).sort();
+  }
+  // profileDeviceQuotaWarning explains an existing bare device key. It never
+  // claims that editing renames the key or activates enforcement, and it never
+  // offers an automatic migration: that requires explicit authorization.
+  function profileDeviceQuotaWarning(quota) {
+    const keys = bareDeviceQuotaKeys(quota);
+    if (!keys.length) return "";
+    return `This Profile declares the bare extended device quota ${keys.join(", ")}. Standard Kubernetes charges devices under requests.<device>; a bare key is declared but is normally not enforced by ResourceQuota admission. Editing its value here does not rename the key and does not activate enforcement. Migrating the key requires explicit authorization and a separate reviewed change.`;
+  }
   // The configuration precondition is an internal request guard. It travels
   // with a Profile update and is read from the observation only to be sent
   // back, so its raw hash is never rendered and never searchable.
@@ -466,7 +581,10 @@
     { kind: "Notebook", label: "Notebooks", href: "/notebooks" },
     { kind: "Pod", label: "Pods", href: "/pods" },
     { kind: "PersistentVolumeClaim", label: "Persistent volume claims", href: "/storage" },
-    { kind: "StatefulSet", label: "StatefulSets", href: "/notebooks" },
+    // StatefulSets no longer appear on the Notebooks page, which lists the
+    // Notebook custom resource only. Their aggregate observation stays on the
+    // Overview table, focused by its canonical kind.
+    { kind: "StatefulSet", label: "StatefulSets", href: "/" },
     { kind: "ResourceQuota", label: "Resource quotas", href: "/" },
     { kind: "LimitRange", label: "Limit ranges", href: "" },
     { kind: "RoleBinding", label: "Role bindings", href: "" },
@@ -635,8 +753,9 @@
     quantityValue, timeValue, severityValue, readyValue, naturalCompare, isMissing,
     sortRows, searchMatch, filterRows, paginate,
     parseTarget, actorLabel, groupAudit,
-    namespaceOptions, profileNames, profileSummary, profileResources,
+    namespaceOptions, profileNames, profileSummary, profileResources, profileSummaryDetails, notebookResources,
     profileNameMaxLength, profileNameValidation, profileFormValues, profileQuotaValues, profileDeleteValidation, visibleResourceDetails,
+    builtinQuotaKeys, deviceQuotaKey, profileQuotaKind, profileQuotaCounts, isWholeQuotaCountValue, bareDeviceQuotaKeys, profileDeviceQuotaWarning,
     namespaceResources, formatAge, workspaceHealthSummary,
     routeFor, queryNamespace, hrefFor, historyHref, needsRefresh,
     notificationID, shouldRememberDismissals, dismissalStorageKey,

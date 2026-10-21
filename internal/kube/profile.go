@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/mail"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -249,6 +250,31 @@ func sameQuotaValue(a, b any) bool {
 // applied to a configuration nobody reviewed.
 const profileReloadMessage = "Reload the console and review the current Profile configuration before changing quotas"
 
+// existingDeviceQuotaKeys returns the raw extended device quota keys an
+// observed hard map declares, in a stable order. Only keys the
+// existingDeviceQuotaKey rule accepts are returned, so a warning name is always
+// a validated quota key and never arbitrary text from the Profile.
+func existingDeviceQuotaKeys(hard map[string]any) []string {
+	keys := make([]string, 0, len(hard))
+	for key := range hard {
+		if existingDeviceQuotaKey(key) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// existingDeviceQuotaWarning states the factual enforcement gap of a raw
+// device quota key a live Profile already declares. Kubernetes accepts and
+// records such a key, but its quota accounting does not charge or evaluate it
+// as a device request quota: only requests.<device> is enforced. The warning
+// never claims the limit is enforced, migrated, renamed or widened, because
+// editing retains the key exactly as declared.
+func existingDeviceQuotaWarning(key string) string {
+	return fmt.Sprintf("The live Profile quota key %q is declared but standard Kubernetes does not enforce it as a device request quota; enforcement uses requests.%s; editing retains the key and does not migrate or activate the limit.", key, key)
+}
+
 // prepareProfileUpdate plans a guarded quota update of an existing Profile.
 //
 // The owner identity is immutable. The installed Profile controller refuses an
@@ -305,6 +331,16 @@ func (s *Service) prepareProfileUpdate(ctx context.Context, a model.Action, w *w
 	old, _, err := unstructured.NestedMap(p.Object, "spec", "resourceQuotaSpec", "hard")
 	if err != nil {
 		return errors.New("unsupported Profile quota shape")
+	}
+	// A live Profile may declare a raw extended device key such as
+	// "nvidia.com/gpu". Kubernetes accepts and records it, but does not charge
+	// or evaluate it as a device request quota: only requests.<device> is
+	// enforced. Warn on every plan built from such a Profile, even when only an
+	// unrelated key changes, so the original inert value is never presented as
+	// a re-enforced GPU limit. The key is retained exactly as declared; the
+	// warning migrates and activates nothing.
+	for _, key := range existingDeviceQuotaKeys(old) {
+		w.prepared.Warnings = append(w.prepared.Warnings, existingDeviceQuotaWarning(key))
 	}
 	if len(a.Quota) == 0 {
 		return errors.New("quota removal is unsupported")

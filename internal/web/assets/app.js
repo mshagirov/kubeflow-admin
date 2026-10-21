@@ -20,7 +20,7 @@
     profiles: ["Profiles", "Manage ownership, namespaces and resource quotas."],
     namespaces: ["Namespaces", "Observed namespaces and the resources they contain."],
     storage: ["Storage", "Provision and grow persistent storage with explicit safeguards."],
-    notebooks: ["Notebooks", "Manage workloads and resources with observed-state verification."],
+    notebooks: ["Notebooks", "Kubeflow Notebook custom resources only, with observed-state verification."],
     pods: ["Pods", "Observed workloads, ownership and requested resources."],
     nodes: ["Nodes", "Cluster node health, capacity context and cordon controls."],
     history: ["History", "Operations and audit records in one accountable view."]
@@ -37,6 +37,12 @@
   // resource across an inventory refresh and identifies the control that may
   // take the focus back.
   let drawerResource = null;
+  // The exact Notebook the management drawer was opened for. It binds the
+  // namespace, name and observed UID so a refresh or a different selection can
+  // never quietly submit an edit to another Notebook.
+  let notebookTarget = null;
+  let notebookManagementFromDetails = false;
+  let notebookReturnKey = "";
   let overviewTableExpanded = false;
   let errorTipSeq = 0;
   let rowCache = {};
@@ -258,7 +264,13 @@
   function resourceKey(resource) {
     return [resource?.kind || "", resource?.namespace || "", resource?.name || ""].join("|");
   }
+  // Names are the visible handle for the kinds whose full observation belongs
+  // in the right-side details drawer. The separate Details control is removed
+  // for these tables (Profiles opens its consolidated summary instead).
+  const nameDetailsKinds = new Set(["Notebook", "Pod", "Node"]);
+  const inlineDetailsKinds = new Set(["Profile", "Notebook", "Pod", "Node"]);
   function detailsButton(resource) {
+    if (inlineDetailsKinds.has(resource.kind)) return null;
     if (!detailEntries(resource).length) return null;
     const button = el("button", "Details", "detail-button");
     button.type = "button";
@@ -277,9 +289,10 @@
       open.type = "button";
       open.addEventListener("click", event => openProfileSummary(resource.name, event?.currentTarget));
       node.append(open);
-    } else if (options.openDetails) {
-      // Storage names are the visible handle for a volume or claim, so they
-      // open the same observed-details drawer as the inline details control.
+    } else if (options.openDetails || nameDetailsKinds.has(resource.kind)) {
+      // The observed name is the visible handle for a resource whose details
+      // belong in the right-side drawer. Storage claim and volume names keep
+      // the same behaviour they already had.
       const open = el("button", resource.name || "Unnamed", "link-button");
       open.type = "button";
       open.dataset.openDrawer = "resource-details";
@@ -398,7 +411,7 @@
       columns: [{ key: "name", label: "Resource" }, { key: "type", label: "Resource Type" }, { key: "requested", label: "Requested", type: "quantity" }, { key: "state", label: "Observed", type: "severity" }, { key: "capacity", label: "Capacity", type: "quantity" }, { key: "storageClass", label: "Storage class" }]
     },
     notebooks: {
-      label: "notebook resources", empty: "No matching Notebooks or workload resources. Choose another namespace or refresh inventory.",
+      label: "Notebook resources", empty: "No matching Notebook custom resources. Choose another namespace or refresh inventory. Pods and StatefulSets have their own views.",
       columns: [{ key: "name", label: "Resource" }, { key: "desired", label: "Desired / requested", type: "mixed" }, { key: "state", label: "Observed", type: "severity" }, { key: "condition", label: "Capacity / condition", type: "text" }, { key: "owner", label: "Owner" }]
     },
     pods: {
@@ -466,7 +479,9 @@
     const resources = inventory?.resources || [];
     const scoped = logic.scopedResources(resources, namespaceContext);
     if (stateKey === "overview") {
-      return scoped.filter(resource => ["Notebook", "PersistentVolumeClaim", "PersistentVolume", "Pod", "Node", "ResourceQuota", "Event"].includes(resource.kind)).map(resource =>
+      // StatefulSets stay visible as aggregate workload observations in the
+      // Overview table even though the Notebooks page lists Notebook CRs only.
+      return scoped.filter(resource => ["Notebook", "StatefulSet", "PersistentVolumeClaim", "PersistentVolume", "Pod", "Node", "ResourceQuota", "Event"].includes(resource.kind)).map(resource =>
         resourceRow(resource, () => [resourceNameNode(resource), desired(resource), badge(resource.state), capacity(resource)]));
     }
     if (stateKey === "profiles") {
@@ -486,7 +501,10 @@
         resourceRow(resource, () => [resourceNameNode(resource, { openDetails: ["PersistentVolume", "PersistentVolumeClaim"].includes(resource.kind) }), resource.kind || "—", resource.details?.requested || "—", badge(resource.state), capacity(resource), resource.details?.storageClass || "—"]));
     }
     if (stateKey === "notebooks") {
-      return scoped.filter(resource => ["Notebook", "Pod", "StatefulSet"].includes(resource.kind)).map(resource =>
+      // The Notebooks page lists only kubeflow.org Notebook custom resources.
+      // A Pod or StatefulSet with the same name is a different observed
+      // resource and must never appear as a Notebook row.
+      return logic.notebookResources(scoped).map(resource =>
         resourceRow(resource, () => [resourceNameNode(resource), desired(resource), badge(resource.state), notebookCondition(resource), resource.owner || "Not reported"]));
     }
     if (stateKey === "pods") {
@@ -882,6 +900,10 @@
     // The open details drawer follows the observed resource. A refresh never
     // rewrites a form the administrator is working in.
     syncResourceDetailsDrawer();
+    // The Notebook management drawer follows the exact bound target. A
+    // disappeared or replaced Notebook is reported instead of being silently
+    // retargeted to another Notebook.
+    syncNotebookManagement();
     // A refreshed observation can make a client-side validation message
     // stale. A server answer is never cleared by an unrelated refresh.
     for (const form of [$("#profile-form"), $("#profile-delete-form")]) {
@@ -1138,6 +1160,12 @@
   // message stays in the drawer and is never sent to the server.
   function preSubmitError(form) {
     if (form.id === "profile-form") return profileSubmitError();
+    if (form.id === "notebook-form") {
+      // A Notebook management form opened for one observed resource never
+      // submits against a target that disappeared, was replaced or is no
+      // longer the selected resource.
+      return notebookTargetError();
+    }
     if (form.id === "profile-delete-form") {
       const name = String($("#profile-delete-name")?.value || "");
       const reason = String($("#profile-delete-reason")?.value || "");
@@ -1184,6 +1212,14 @@
   function restoreDrawerFocus(drawer) {
     let target = focusEligible(drawerOpener) ? drawerOpener : null;
     if (!target && drawer?.id === "resource-details-drawer" && drawerResource) target = resourceDetailsOpener(drawerResource.key);
+    if (!target && drawer?.id === "notebook-drawer" && notebookManagementFromDetails) {
+      // A management drawer opened from the details drawer returns to the
+      // visible control of the very same Notebook row, or to the page heading.
+      // It never focuses a control inside a closed details drawer or an
+      // unrelated page-level management button.
+      target = notebookReturnKey ? resourceDetailsOpener(notebookReturnKey) : null;
+      if (!target) target = $("#page-title");
+    }
     if (!target) {
       const kind = String(drawer?.id || "").replace(/-drawer$/, "");
       // The management control of the drawer, when it is visible. Another
@@ -1210,12 +1246,25 @@
     else drawerOpener = null;
     // The closed details drawer no longer follows a resource.
     if (last?.id === "resource-details-drawer") drawerResource = null;
+    if (last?.id === "notebook-drawer") {
+      notebookManagementFromDetails = false;
+      notebookReturnKey = "";
+      notebookTarget = null;
+      notebookTargetWarning("");
+    }
   }
   function focusable(drawer) {
     return $$("a[href], button:not([disabled]), input:not([type='hidden']):not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])", drawer)
       .filter(node => !node.hidden && !node.closest("[hidden]") && (typeof node.getClientRects !== "function" || node.getClientRects().length > 0));
   }
   function openResourceDetails(resource, opener) {
+    // A Profile has one consolidated summary. Every context that would open
+    // generic resource details for a Profile hands over to that summary, so
+    // the same owner and quota are never presented twice.
+    if ((resource?.kind || "") === "Profile") {
+      openProfileSummary(resource.name || "", opener);
+      return;
+    }
     const drawer = $("#resource-details-drawer");
     drawerResource = {
       key: resourceKey(resource),
@@ -1261,6 +1310,22 @@
       body.append(rows);
     } else {
       body.append(el("p", "No additional projected details were observed for this resource.", "hint"));
+    }
+    if ((resource.kind || "") === "Notebook") {
+      const actions = el("div", undefined, "drawer-actions");
+      const manage = el("button", "Manage Notebook", "secondary");
+      manage.type = "button";
+      manage.setAttribute("aria-label", `Manage Notebook ${resource.namespace || ""}/${name}`.trim());
+      manage.disabled = !writes || !notebookWrites || !!options.gone;
+      if (!writes) manage.title = "Changes are disabled by server policy.";
+      else if (!notebookWrites) manage.title = "Notebook changes require the confirmed Notebook controller contract.";
+      else if (options.gone) manage.title = "This Notebook is no longer observed. Refresh inventory before managing it.";
+      else manage.title = "Open Notebook management for this exact observed Notebook.";
+      // The same drawer, prefill and policy gates as the page-level Notebook
+      // action are reused. The selected action is never silently switched.
+      manage.addEventListener("click", () => openNotebookManagement(resource));
+      actions.append(manage);
+      body.append(actions);
     }
   }
   // The observed resource behind the open drawer, if any.
@@ -1343,7 +1408,7 @@
   // namespace and name, so a claim never selects its volume. Kinds without a
   // listing page stay plain text.
   const resourceScopeTargets = {
-    Notebook: "/notebooks", StatefulSet: "/notebooks", Pod: "/pods",
+    Notebook: "/notebooks", StatefulSet: "/", Pod: "/pods",
     PersistentVolumeClaim: "/storage", ResourceQuota: "/", Event: "/"
   };
   function resourceScopeCell(resource) {
@@ -1437,6 +1502,12 @@
   $$("[data-open-drawer]").forEach(button => button.addEventListener("click", () => {
     // The Profile management drawer always starts from a clean create form.
     if (button.dataset.openDrawer === "profile") openProfileCreate();
+    // The page-level Notebook action starts from a clean context and binds the
+    // currently selected observed Notebook instead of bypassing the UID guard.
+    if (button.dataset.openDrawer === "notebook") {
+      openNotebookPageManagement(button);
+      return;
+    }
     openDrawer($(`#${button.dataset.openDrawer}-drawer`));
   }));
   $$("[data-close-drawer]").forEach(button => button.addEventListener("click", () => closeDrawers(true)));
@@ -1534,6 +1605,152 @@
     $("#container-selector").required = edit;
     mountFields();
   }
+  // ---- Notebook management target binding ---------------------------------
+  function observedNotebook(namespace, name) {
+    return (inventory?.resources || []).find(resource =>
+      resource.kind === "Notebook" && (resource.namespace || "") === String(namespace || "") && (resource.name || "") === String(name || "")) || null;
+  }
+  function notebookTargetWarning(text) {
+    const warning = $("#notebook-target-warning");
+    if (!warning) return;
+    warning.textContent = String(text || "");
+    warning.hidden = !text;
+  }
+  // Selecting a different observed Notebook replaces the bound target. An
+  // unknown target is refused instead of being submitted against the wrong
+  // Notebook.
+  function bindNotebookSelection() {
+    const namespace = String($('#notebook-form [name="namespace"]')?.value || "");
+    const name = String($("#notebook-selector")?.value || "");
+    if (!namespace || !name) { notebookTarget = null; notebookTargetWarning(""); return; }
+    const found = observedNotebook(namespace, name);
+    notebookTarget = found ? { namespace, name, uid: found.uid || "" } : null;
+    notebookTargetWarning(found ? "" : `The Notebook ${namespace}/${name} is not part of the current observation. Refresh inventory and select it again.`);
+  }
+  // A previous target's edit values are never carried into another Notebook.
+  // Blank resource and image fields keep their existing "preserve" meaning; a
+  // changed target always drops old mounts, the replace flag and restart.
+  // A container change preserves the chosen container itself.
+  function clearNotebookEditState(options = {}) {
+    const preserveContainer = !!(options && options.preserveContainer === true);
+    const edit = $("#notebook-edit");
+    if (!edit) return;
+    const container = $("#container-selector");
+    const keptContainer = preserveContainer && container ? container.value : "";
+    $$("input,select", edit).forEach(input => {
+      if (input === container && preserveContainer) return;
+      if (input.type === "checkbox") { input.checked = false; return; }
+      input.value = "";
+    });
+    if (preserveContainer && container) container.value = keptContainer;
+    const rows = $("#mount-rows"); if (rows) rows.replaceChildren();
+    const replace = $("#replace-mounts"); if (replace) replace.checked = false;
+    mountFields();
+  }
+  function notebookReasonInput() { return $('#notebook-form [name="reason"]'); }
+  // A new management context never inherits the previous target's edit values,
+  // reason or a client-side error. The selected action is not changed.
+  function resetNotebookManagementContext() {
+    clearNotebookEditState();
+    const reason = notebookReasonInput();
+    if (reason) reason.value = "";
+    clearFormError($("#notebook-form"));
+    notebookTargetWarning("");
+  }
+  function clearNotebookTargetChangeState() {
+    clearNotebookEditState();
+    clearFormError($("#notebook-form"));
+  }
+  function notebookManagementAllowed() { return writes && notebookWrites; }
+  // Prefill the existing Notebook management form from one exact observed
+  // resource: its namespace, its Notebook name and its observed container.
+  // The lifecycle/resource/mount helpers of the form are reused as they are.
+  function prefillNotebookTarget(resource) {
+    const namespace = String(resource?.namespace || "");
+    const name = String(resource?.name || "");
+    if (!namespace || !name) return false;
+    const namespaceSelect = $('#notebook-form [name="namespace"]');
+    const notebookSelect = $("#notebook-selector");
+    if (!namespaceSelect || !notebookSelect) return false;
+    const namespaces = scopeNamespaces();
+    if (!namespaces.includes(namespace)) namespaces.push(namespace);
+    fillSelect(namespaceSelect, namespaces, "Select a namespace");
+    namespaceSelect.value = namespace;
+    const names = (inventory?.resources || []).filter(candidate => candidate.kind === "Notebook" && (candidate.namespace || "") === namespace).map(candidate => candidate.name);
+    fillSelect(notebookSelect, names, "Select a notebook");
+    if (!names.includes(name)) return false;
+    notebookSelect.value = name;
+    clearNotebookEditState();
+    containerOptions();
+    const containers = logic.containerNames(resource);
+    const containerSelect = $("#container-selector");
+    if (containerSelect) containerSelect.value = containers.length === 1 ? containers[0] : "";
+    return true;
+  }
+  function openNotebookManagement(resource) {
+    // The visible control is already disabled by policy, but the opener stays
+    // defensive so no code path can open a management form it cannot submit.
+    if (!notebookManagementAllowed()) return false;
+    const found = observedNotebook(resource?.namespace, resource?.name);
+    if (!found || found.kind !== "Notebook") {
+      notify("error", `The Notebook ${resource?.namespace || ""}/${resource?.name || ""} is not observed any more. Refresh inventory and open it again.`, "action", { persist: false });
+      return false;
+    }
+    // This is a new operation context: an old reason, error and edit values
+    // from another Notebook are never reused. The selected action is kept.
+    resetNotebookManagementContext();
+    if (!prefillNotebookTarget(found)) {
+      notify("error", "The selected Notebook is not part of the current observation. Refresh inventory and open it again.", "action", { persist: false });
+      return false;
+    }
+    notebookTarget = { namespace: found.namespace || "", name: found.name || "", uid: found.uid || "" };
+    notebookManagementFromDetails = true;
+    notebookReturnKey = resourceKey(found);
+    notebookFields();
+    // The exact visible row control of this Notebook is the preferred return
+    // target. The page heading is the fallback when the row is gone.
+    const rowControl = resourceDetailsOpener(notebookReturnKey);
+    openDrawer($("#notebook-drawer"), rowControl || undefined);
+    return true;
+  }
+  // The page-level Manage notebook control is deliberately unbound on open:
+  // it starts from a clean management context, then binds the currently
+  // selected observed Notebook so a stale UID can never be submitted.
+  function openNotebookPageManagement(opener) {
+    if (!notebookManagementAllowed()) return false;
+    resetNotebookManagementContext();
+    containerOptions();
+    notebookFields();
+    bindNotebookSelection();
+    openDrawer($("#notebook-drawer"), opener);
+    return true;
+  }
+  function syncNotebookManagement() {
+    if (!notebookTarget) { notebookTargetWarning(""); return ""; }
+    const found = observedNotebook(notebookTarget.namespace, notebookTarget.name);
+    let message = "";
+    if (!found) message = `The Notebook ${notebookTarget.namespace}/${notebookTarget.name} is no longer observed. Refresh inventory and open it again.`;
+    else if (notebookTarget.uid && found.uid && found.uid !== notebookTarget.uid) message = `The Notebook ${notebookTarget.namespace}/${notebookTarget.name} was replaced by a new observation. Reopen it before submitting a change.`;
+    notebookTargetWarning(message);
+    return message;
+  }
+  function notebookTargetError() {
+    if (!notebookTarget) return "";
+    const found = observedNotebook(notebookTarget.namespace, notebookTarget.name);
+    if (!found) return `The Notebook ${notebookTarget.namespace}/${notebookTarget.name} is no longer observed. Refresh inventory and select it again; no change was sent.`;
+    if (notebookTarget.uid && found.uid && notebookTarget.uid !== found.uid) {
+      return `The Notebook ${notebookTarget.namespace}/${notebookTarget.name} was replaced by a new observation. Reopen it to review the current configuration; no change was sent.`;
+    }
+    const namespace = String($('#notebook-form [name="namespace"]')?.value || "");
+    const name = String($("#notebook-selector")?.value || "");
+    if (namespace !== notebookTarget.namespace || name !== notebookTarget.name) {
+      const selected = observedNotebook(namespace, name);
+      if (!selected) return "Select an observed Notebook; the current selection is not part of the latest observation.";
+      notebookTarget = { namespace, name, uid: selected.uid || "" };
+      notebookTargetWarning("");
+    }
+    return "";
+  }
   // ---- Profile management ---------------------------------------------------
   // The owner of an existing Profile is read-only: the installed Profile
   // controller cannot transfer it. An update therefore submits the exact
@@ -1548,12 +1765,63 @@
   }
   function profileQuotaInputs() { return $$('[data-profile-quota]'); }
   function profileExtraQuotaInputs() { return $$('[data-profile-quota-extra]'); }
+  // The device keys the deployment approves. The server owns the same list; the
+  // browser only uses it to label an observed key.
+  function presetQuotaKeys() { return $$('[data-profile-quota-device]').map(input => input.dataset.profileQuotaDevice); }
+  // The observed quota keys that have no static field of their own and that
+  // this console may author: the cpu and memory aliases, and a device key the
+  // Profile already declares.
+  function observedQuotaFields(quota, managed) {
+    const presets = presetQuotaKeys();
+    const fields = [];
+    for (const key of Object.keys(quota).sort()) {
+      if (managed.has(key)) continue;
+      const kind = logic.profileQuotaKind(key, presets);
+      if (kind === "unmanaged") continue;
+      fields.push({ key, kind });
+    }
+    return fields;
+  }
+  // Render one editable field per observed key. The label names the observed
+  // key, so an operator always edits the key the Profile really declares.
+  function renderObservedQuotaFields(fields, quota) {
+    const host = $("#profile-observed-quota-fields");
+    if (!host) return;
+    host.replaceChildren();
+    if (!fields.length) return;
+    host.append(el("p", "These quota keys are declared by this Profile. They are edited under their own names:", "hint"));
+    for (const field of fields) {
+      const label = el("label", "Quota · " + field.key);
+      const input = el("input");
+      input.name = "quota." + field.key;
+      input.dataset.profileQuota = field.key;
+      if (field.kind === "device") { input.type = "number"; input.min = "0"; input.step = "1"; }
+      const value = quota[field.key];
+      input.value = value === undefined ? "" : String(value);
+      // An existing key may not be omitted: the server rejects a removal.
+      input.required = true;
+      label.append(input);
+      host.append(label);
+    }
+    // An existing bare extended device key is declared but normally not
+    // enforced. Editing its own field never renames it or activates
+    // enforcement; a migration needs explicit authorization.
+    if (fields.some(field => field.kind === "device")) {
+      const warning = logic.profileDeviceQuotaWarning(quota);
+      if (warning) {
+        const note = el("p", warning, "warning");
+        note.setAttribute("role", "note");
+        host.append(note);
+      }
+    }
+  }
   // Every mode change starts from an empty Profile state: an owner, a quota
   // or a digest of a previous selection never bleeds into the next one.
   function clearProfileState() {
     const owner = $("#profile-update-owner"); if (owner) owner.value = "";
     const digest = $("#profile-update-digest"); if (digest) digest.value = "";
     const extra = $("#profile-extra-quota-fields"); if (extra) extra.replaceChildren();
+    const observed = $("#profile-observed-quota-fields"); if (observed) observed.replaceChildren();
     const summary = $("#profile-update-extra"); if (summary) summary.replaceChildren();
     for (const input of profileQuotaInputs()) { input.value = ""; input.required = false; }
     profileSnapshot = null;
@@ -1600,6 +1868,14 @@
       // An existing managed key may not be omitted: the server rejects a removal.
       input.required = value !== undefined && value !== "";
     }
+    // An existing Profile may declare a quota key this console has no static
+    // field for: the cpu and memory aliases, or a device key the Profile
+    // already declares. Such a key is edited under its own name. It is never
+    // renamed to a canonical requests.* key and no second key is added beside
+    // it.
+    const observed = observedQuotaFields(quota, managed);
+    renderObservedQuotaFields(observed, quota);
+    for (const field of observed) managed.add(field.key);
     // Observed quota keys this console does not manage are returned unchanged.
     const extra = Object.entries(quota).filter(([key]) => !managed.has(key));
     const host = $("#profile-extra-quota-fields");
@@ -1693,6 +1969,14 @@
         if (input.required && !String(input.value || "").trim()) {
           return `The quota key ${input.dataset.profileQuota} is already set on this Profile. Keep its current value: removing a quota key is unsupported.`;
         }
+        // A count is a whole number of objects: a fraction of a device is not
+        // a quota. Every finite non-negative integer spelling is accepted as
+        // typed (1.0, 1e2); the raw value is submitted unchanged and the
+        // server validates the authoritative whole Kubernetes quantity.
+        const value = String(input.value || "").trim();
+        if (value && logic.profileQuotaCounts(input.dataset.profileQuota, presetQuotaKeys()) && !logic.isWholeQuotaCountValue(value)) {
+          return `The quota key ${input.dataset.profileQuota} counts whole objects: use a whole number of 0 or more.`;
+        }
       }
       if (!profileQuotaChanged(snapshot.quota)) return "Nothing would change: the quota values are identical to the observed Profile quota.";
       return "";
@@ -1751,27 +2035,34 @@
     }
     setTimeout(() => { button.textContent = "Copy"; }, 2000);
   }
-  // The observed Profile configuration, shown under the scoped views of the
-  // Profile summary. Only projected values are rendered.
+  // The consolidated safe Profile summary, shown under the scoped views. Every
+  // projected fact of the Profile is rendered here once: the internal
+  // configuration precondition is excluded by the shared safe-details helper
+  // and is never rendered or searchable.
   function profileConfiguration(name) {
     const profile = observedProfile(name);
-    const details = profile?.details || {};
+    const summary = logic.profileSummaryDetails(profile || { kind: "Profile", name });
     const section = el("section", undefined, "profile-configuration");
     section.append(el("h3", "Profile configuration"));
     const facts = el("dl", undefined, "detail-list");
-    facts.append(el("dt", "API version"), el("dd", details.apiVersion || "Not reported"));
-    const owner = profile?.owner || details.owner || "";
+    facts.append(el("dt", "Kind"), el("dd", summary.kind || "Profile"));
+    facts.append(el("dt", "API version"), el("dd", summary.apiVersion || "Not reported"));
     const ownerValue = el("dd");
-    ownerValue.append(el("span", owner || "Not reported"));
-    if (owner) {
+    ownerValue.append(el("span", summary.owner || "Not reported"));
+    if (summary.owner) {
       const copy = el("button", "Copy", "secondary small");
       copy.type = "button";
-      copy.setAttribute("aria-label", "Copy the owner email " + owner);
-      copy.addEventListener("click", () => copyOwnerEmail(owner, copy));
+      copy.setAttribute("aria-label", "Copy the owner email " + summary.owner);
+      copy.addEventListener("click", () => copyOwnerEmail(summary.owner, copy));
       ownerValue.append(copy);
     }
     facts.append(el("dt", "Owner"), ownerValue);
-    const quota = logic.profileQuotaValues(profile);
+    if (summary.ownerKind) facts.append(el("dt", "Owner kind"), el("dd", summary.ownerKind));
+    facts.append(el("dt", "Observed state"), el("dd", summary.state || "Not reported"));
+    facts.append(el("dt", "Scope"), el("dd", summary.scope || "Cluster scoped"));
+    facts.append(el("dt", "Created"), el("dd", summary.createdAt || "Not reported"));
+    facts.append(el("dt", "Resource version"), el("dd", summary.resourceVersion || "Not reported"));
+    const quota = summary.quota;
     const quotaValue = el("dd");
     if (Object.keys(quota).length) {
       const list = el("ul", undefined, "quota-list");
@@ -1784,6 +2075,15 @@
     } else quotaValue.textContent = "No resource quota is observed for this Profile.";
     facts.append(el("dt", "resourceQuotaSpec"), quotaValue);
     section.append(facts);
+    const warning = logic.profileDeviceQuotaWarning(quota);
+    if (warning) {
+      const note = el("p", warning, "warning");
+      note.setAttribute("role", "note");
+      section.append(note);
+    }
+    // Scopes and plugins are preserved by the server. This console edits only
+    // quota values and never claims to rewrite arbitrary Profile YAML.
+    section.append(el("p", "Scopes and plugins are preserved by the server. This console edits quota values only; it never rewrites arbitrary Profile YAML.", "hint"));
     return section;
   }
   function mountFields() { const enabled = $("#notebook-kind").value === "notebook.edit" && $("#replace-mounts").checked; $$("#mount-rows input,#mount-rows select").forEach(input => { input.disabled = !enabled; }); }
@@ -1942,8 +2242,26 @@
   $("#profile-update-name")?.addEventListener("change", () => applyProfileSelection());
   $("#storage-template").addEventListener("change", () => { const option = $("#storage-template").selectedOptions[0]; if (option?.dataset.class) $("#storage-class").value = option.dataset.class; storageFields(); });
   $("#pv-selector").addEventListener("change", () => { const volume = (inventory?.resources || []).find(resource => resource.kind === "PersistentVolume" && resource.name === $("#pv-selector").value); if (volume) $("#storage-class").value = volume.details?.storageClass || ""; });
-  $('#notebook-form [name="namespace"]').addEventListener("change", () => { notebookOptions(); $("#mount-rows").replaceChildren(); $("#replace-mounts").checked = false; });
-  $("#notebook-selector").addEventListener("change", containerOptions);
+  $('#notebook-form [name="namespace"]').addEventListener("change", () => {
+    // A new namespace is a new target: no previous resource, image, GPU, mount
+    // or restart edit value may travel with it.
+    clearNotebookTargetChangeState();
+    notebookOptions();
+    notebookFields();
+    bindNotebookSelection();
+  });
+  $("#notebook-selector").addEventListener("change", () => {
+    clearNotebookTargetChangeState();
+    containerOptions();
+    notebookFields();
+    bindNotebookSelection();
+  });
+  $("#container-selector").addEventListener("change", () => {
+    // The chosen container itself is kept; only its edit values are cleared.
+    clearNotebookEditState({ preserveContainer: true });
+    clearFormError($("#notebook-form"));
+    notebookFields();
+  });
   $("#add-mount").addEventListener("click", addMount);
   $("#replace-mounts").addEventListener("change", mountFields);
   $('#replace-mounts').closest('fieldset').querySelector('.hint').textContent = "Unchecked preserves current mounts. Checked with no rows requests removal of all PVC mounts from this container; the server rejects removing protected workspace mounts.";
