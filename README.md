@@ -71,3 +71,7 @@ Then: log in as an admin over HTTPS, confirm a non-admin is denied, compare inve
 - `bash scripts/discover.sh YOUR_CONTEXT > discovery.txt`: optional user-run, read-only selected metadata. Review locally before sharing; do not commit its output.
 
 `deploy/base` is a dedicated namespace, one-replica Recreate deployment, hardened nonroot container, reduced read-only RBAC, persistent SQLite and ingress-only NetworkPolicy. Permission overlays do **not** automatically enable feature flags. HTTPS routing and egress isolation are clearly marked site templates, not ready certificates or universal network defaults.
+
+## License
+
+[MIT License](LICENSE) — Copyright (c) 2026 Murat Shagirov.
