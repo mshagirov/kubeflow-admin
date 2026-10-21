@@ -2,10 +2,10 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
-## UI and deployed-quota follow-up — 22 October 2026 (unpublished)
+## UI and deployed-quota follow-up — 22 October 2026
 
-This follow-up is local work, not part of the published image receipt below.
-Live-cluster acceptance has not been performed.
+This follow-up is published in the refreshed `0.4.0` image identified below.
+Live-cluster acceptance has not been performed. Older image receipts are historical.
 
 - Profile quota edits support the existing `cpu`/`memory` aliases and existing
   non-reserved raw device keys under their original names. Editing one value
@@ -47,10 +47,46 @@ The first GitHub CI run for `e42d56f` failed in the security job: the pinned
 `unexpected expr: *ast.KeyValueExpr`. The passing local vulnerability scan used
 `govulncheck v1.9.0`, not that older CI pin. The follow-up CI fix pins `v1.9.0`
 and invokes its installed path explicitly; reachability scanning remains enabled
-and any error or finding still fails the job. Linux verification and replacement
-CI results are recorded when complete.
+and any error or finding still fails the job. Replacement GitHub CI
+[`39636701613`](https://github.com/mshagirov/kubeflow-admin/actions/runs/39636701613)
+for `d418536` passed both security and test jobs, including reachable-vulnerability
+and source scans, race tests, vet/build, manifest/OpenAPI checks and both image
+architectures. Optional locally emulated Linux scanner runs timed out and are
+not counted as evidence; the native Linux CI scanner completed successfully.
 
-Publication and live-cluster acceptance remain pending.
+Additional local release checks passed: module verification, API parity and all
+five Python tests, OpenAPI validation, nine manifest variants and strict
+Kubernetes 1.32 schema validation. Digest-pinned Trivy 0.76.0 found no
+HIGH/CRITICAL vulnerabilities, secrets or manifest misconfigurations in the
+tracked-source snapshot, and no HIGH/CRITICAL vulnerabilities or secrets in
+either offline runtime image. Both platforms' non-root identity, source label
+and byte-identical `/LICENSE` were verified. The image retains application
+source label `e42d56f`; `d418536` changes only CI and this receipt, not runtime
+source or image inputs.
+
+### Published image
+
+- Tag: `docker.io/muratshagirov/kubeflow-admin:0.4.0` (deliberately reused).
+- Multi-platform index:
+  `sha256:52b7cf51cc709d254e1f656c6cea8b9dcf93e3fd666300b46764da5b15df7245`.
+- Linux AMD64 manifest:
+  `sha256:6b1f57e63204edbcd9267fd0199e5aaa574c4cf1cd6f14f68c37297ced870ce6`.
+- Linux ARM64 manifest:
+  `sha256:4fafcd2fbdb6871d75a80a1397331cba337c2be0b5912e2302c97fd74d0ba6ab`.
+- Registry platform manifests exactly match the offline-scanned artifacts;
+  SPDX SBOM and provenance attestations were verified for both platforms.
+
+Pin the fresh immutable index digest in the site overlay, keeping the reference
+on one YAML line:
+
+```yaml
+image: docker.io/muratshagirov/kubeflow-admin@sha256:52b7cf51cc709d254e1f656c6cea8b9dcf93e3fd666300b46764da5b15df7245
+```
+
+No deployment or live cluster mutation was performed. The operator must approve
+a disposable Profile/namespace and registered owner, a disposable Notebook and
+the StorageClass/static template before live create/delete and storage testing.
+Profile deletion remains separately gated and may destroy PVC backing data.
 
 ## Profile workflows and resource drawers — 21 October 2026
 
