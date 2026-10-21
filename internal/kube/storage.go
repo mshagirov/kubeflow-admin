@@ -367,25 +367,7 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 			return safe(err)
 		}
 		size, _ := quantity(a.Size)
-		return s.wait(ctx, func() (bool, error) {
-			cur, err := s.Typed.CoreV1().PersistentVolumeClaims(a.Namespace).Get(ctx, a.Name, metav1.GetOptions{})
-			if err != nil {
-				return false, safe(err)
-			}
-			if cur.UID != p.UID {
-				return false, ErrConflict
-			}
-			cap := cur.Status.Capacity.Storage()
-			if cap.Cmp(size) < 0 {
-				return false, nil
-			}
-			for _, c := range cur.Status.Conditions {
-				if c.Status == corev1.ConditionTrue && (c.Type == corev1.PersistentVolumeClaimResizing || c.Type == corev1.PersistentVolumeClaimFileSystemResizePending) {
-					return false, nil
-				}
-			}
-			return true, nil
-		})
+		return s.waitForPVCExpansion(ctx, a.Namespace, a.Name, p.UID, size)
 	}
 	var reserved *corev1.PersistentVolume
 	static := a.Kind == "storage.create.static"
@@ -480,6 +462,33 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		return v.Status.Phase == corev1.VolumeBound, nil
 	})
 }
+
+// waitForPVCExpansion waits until the claim's status capacity reaches the
+// requested size and no resize condition remains, while preserving the exact
+// claim identity. It is shared by pvc.expand and pvc.edit so both paths use the
+// same convergence rule without changing the persisted action kind.
+func (s *Service) waitForPVCExpansion(ctx context.Context, namespace, name string, uid types.UID, size resource.Quantity) error {
+	return s.wait(ctx, func() (bool, error) {
+		cur, err := s.Typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, safe(err)
+		}
+		if cur.UID != uid {
+			return false, ErrConflict
+		}
+		cap := cur.Status.Capacity.Storage()
+		if cap.Cmp(size) < 0 {
+			return false, nil
+		}
+		for _, c := range cur.Status.Conditions {
+			if c.Status == corev1.ConditionTrue && (c.Type == corev1.PersistentVolumeClaimResizing || c.Type == corev1.PersistentVolumeClaimFileSystemResizePending) {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+}
+
 func (s *Service) quotaObserved(ctx context.Context, ns string, desired map[string]string, uid types.UID) (bool, error) {
 	if len(desired) == 0 {
 		return true, nil

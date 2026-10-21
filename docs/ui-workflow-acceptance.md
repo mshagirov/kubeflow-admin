@@ -26,6 +26,56 @@ Item identifiers are stable and unique per section: `PC` profile create,
 `NR` notebook resource edit, `NM` notebook mount edit, `PR` pod restart,
 `NC` node cordon, `UI` console surfaces, `MR` refusal matrix, `HY` hygiene.
 
+## Restricted storage management follow-up
+
+Run these only against approved disposable storage after deploying a build that
+contains the follow-up. Local synthetic tests do not prove deletion or expansion
+behavior on your storage backend.
+
+- [ ] **SY1** Storage has no separate Details buttons. PV, PVC and StorageClass
+  names open the exact Resource Details, including same-name PV/PVC collisions.
+  StorageClasses offer no edit/delete mutation.
+- [ ] **SY2** With either writes or `storageEditing` off, editing is unavailable
+  with a visible explanation. With both on and reviewed RBAC, Edit fetches a
+  fresh restricted YAML document and identifies exact kind/namespace/name/UID/RV.
+- [ ] **SY3** The YAML editor exposes no backend address/path/volume handle,
+  driver attribute, annotations, unrelated labels, status, owner references or
+  finalizers. Hidden configuration remains unchanged after a supported edit.
+  Changing identity, adding unsupported fields, duplicate keys, aliases or a
+  second document is refused without echoing sensitive input into errors/history.
+- [ ] **SY4** Edit one `kubeflow-admin.io/` label, review the exact before/after
+  plan, execute and verify the live value. Try a concurrent UID/RV change: the
+  stale editor must be refused, never overwrite it. No-op edits are refused.
+- [ ] **SY5** On approved unclaimed Available PVs, verify guarded reclaim-policy
+  editing and visible data-reclamation warning. No backend-source or claimRef
+  edits are permitted. PVC growth additionally requires the existing expansion
+  feature, compatible class/CSI driver and actual resize convergence; shrinkage
+  is refused. Do not use a spec-size change as proof of filesystem expansion.
+- [ ] **SD1** With writes or `storageDeletion` off, Delete is unavailable with an
+  explanation. With both on and separately reviewed RBAC, it requires a reason,
+  exact typed target name, data-loss acknowledgment and a separate validated plan.
+- [ ] **SD2** A PVC referenced by a Pod or Notebook (including a stopped Notebook)
+  is refused. A bound/reserved/referenced or non-Available PV is refused. API list
+  errors, protected namespaces and out-of-scope classes fail closed.
+- [ ] **SD3** Delete only the approved unused disposable resource. Record its
+  original UID and operation ID; success requires actual disappearance. Verify
+  backing data independently according to the reviewed reclaim policy. Retain
+  is not a wipe; Delete may destroy data even when no workload currently uses it.
+- [ ] **SD4** A stale/replaced target, post-checkpoint drift or uncertain API
+  response must not cause replay or forced cleanup. Finalizers may keep the
+  operation unresolved; retain locks and investigate. Never remove finalizers
+  to make this test pass. Coordinate external writers because separate unused
+  checks and Kubernetes writes are not atomic.
+- [ ] **SY6** Close/Escape return focus to the visible exact resource-name
+  control. Switching resources or late document responses cannot overwrite
+  another target's form. Merely opening Edit/Delete sends no mutation.
+- [ ] **UI9** On a Node's Resource Details, **Scoped view** appears above
+  **Observed details** and counts only observed Running Pods assigned to that
+  exact node, across all namespaces. Click the count: the Pods page must show
+  matching Node/Running filter chips and rows, with unrelated namespace/search
+  filters cleared. Verify zero matches, pagination, Back/Forward and Clear filters.
+  This is an inventory snapshot, not live usage or an atomic count.
+
 ## 0. Evidence rules — read before testing
 
 Every row below is a claim about what the console observed. Keep the two apart.
@@ -45,7 +95,7 @@ Rules that apply to every item below:
 - [ ] **R1** Inventory is read-only observation. Never treat a table row as proof that a mutation took effect.
 - [ ] **R2** Accepted ≠ completed. Follow each operation in History → Operations through to a terminal state, and capture the operation ID.
 - [ ] **R3** Preview never mutates and never guarantees admission.
-- [ ] **R4** There is **no forced cleanup** in this release. The console never directly deletes a PVC/PV, removes finalizers or force-deletes a Pod. The separately enabled Profile deletion cascades into its namespace, including PVCs and potentially their backing data. Recovery from an interrupted pilot needs a reviewed operator procedure.
+- [ ] **R4** There is **no forced cleanup**. Direct PVC/PV deletion is separately gated and unused-only; it never removes finalizers or force-deletes resources. Profile deletion cascades into its namespace, including PVCs and potentially their backing data. Recovery from an interrupted pilot needs a reviewed operator procedure.
 - [ ] **R5** Do not use any destructive step to "make the test pass". A refused action is a valid pass result.
 
 ## 1. Preconditions (all must hold before the UI pilot)
@@ -158,7 +208,7 @@ recovery, undo or forced-cleanup path.
 - [ ] **PD3** The plan/preview must state in plain words what is deleted and what is **not** deleted. Confirm the wording before you confirm.
 - [ ] **PD4** **Cleanup is delegated.** The console requests Profile deletion with **background propagation**, matching `kubectl delete`; the installed Profile controller and Kubernetes garbage collection remove the owned namespace and its namespaced objects (including Notebooks, Pods and PVCs). Data reclamation follows PD6. The console issues **no Namespace `DELETE`** and holds no namespace delete permission. Confirm the preview names the affected classes.
 - [ ] **PD5** **Success means both are gone.** The operation succeeds only when the Profile **and** its owned namespace are observed gone. A same-named replacement object, a namespace still `Terminating`, or a read error is **not** gone and must not be reported as success.
-- [ ] **PD6** **PV and data caveat.** The console never directly deletes PVs. PVC deletion applies the bound PV's reclaim policy: **Delete** can irreversibly delete the backing volume and data; **Retain** leaves reclamation to an operator but does not protect against backend lifecycle or later operator deletion. Namespaced VolumeSnapshot objects also disappear; their underlying content follows the VolumeSnapshotContent deletion policy. Verify retained PVs, snapshots, backups and external NFS/CSI data separately.
+- [ ] **PD6** **PV and data caveat.** The Profile deletion action does not directly delete PVs. PVC deletion applies the bound PV's reclaim policy: **Delete** can irreversibly delete the backing volume and data; **Retain** leaves reclamation to an operator but does not protect against backend lifecycle or later operator deletion. Namespaced VolumeSnapshot objects also disappear; their underlying content follows the VolumeSnapshotContent deletion policy. Verify retained PVs, snapshots, backups and external NFS/CSI data separately.
 - [ ] **PD7** **Namespace ownership is required.** The namespace must exist, be active, and be controlled by the exact Profile UID/name with the matching `owner` annotation. Missing, replaced or unowned namespaces are refused; orphaned Profiles require a separate operator procedure.
   - Verify the platform prevents extra/cross-namespace Profile owner references and replacement/reparenting during cleanup. App locks cannot fence external writers; the namespace checks and Profile DELETE are not an atomic transaction. Keep deletion disabled without reviewed admission/RBAC controls and a coordinated maintenance window.
 - [ ] **PD8** **Finalizer timeout.** The console waits for cleanup only within its bounded operation deadline; it never removes finalizers or force-deletes terminating objects. An unfinished deletion becomes `needs-review` and retains its Profile/namespace locks for operator reconciliation.
@@ -170,7 +220,7 @@ recovery, undo or forced-cleanup path.
 ### 2.4 PVC create (dynamic)
 
 - [ ] **VC1** Choose only a class from the approved `storage.allowedStorageClasses` list; the console rejects any other class. Choose the class explicitly — the console does not create a PV for you and does not pick a class for you.
-- [ ] **VC2** The console creates a claim from your inputs (size, class, access mode) in the chosen namespace. It does **not** accept a free-form manifest: there is no YAML/JSON editor, no arbitrary volume source, no arbitrary secret reference.
+- [ ] **VC2** The console creates a claim from typed inputs (size, class, access mode), not a free-form creation manifest. The separate restricted YAML editor for existing PVs/PVCs accepts no arbitrary volume source or secret reference.
 - [ ] **VC3** A claim name that already exists in that namespace is refused (conflict) before any mutation.
 - [ ] **VC4** The plan warns about the StorageClass reclaim policy and, for `WaitForFirstConsumer`, states that the claim will stay `Pending` until a consuming Pod is scheduled.
 - [ ] **VC5** After the operation succeeds, verify with your own tooling that the claim exists and observe its real phase. If it is `Pending`, **that is expected** and is not a provisioning failure; record it as "created, not provisioned".
@@ -272,11 +322,11 @@ recovery, undo or forced-cleanup path.
 | Not available in this release | Why it matters |
 | --- | --- |
 | Arbitrary PV update (editing a PV's spec, backend, capacity, class, access modes or reclaim policy) | PVs are registered or reserved, never edited. There is no "edit PV" workflow |
-| Direct PV/PVC deletion | No individual PV/PVC delete action exists. Profile deletion can cascade through PVCs; the bound PV reclaim policy determines reclamation |
+| Direct PV/PVC deletion | Separately opt-in, unused-only, identity-guarded and confirmed. Referenced PVCs and bound/reserved PVs are refused; reclaim policy can still destroy unused PVC backing data |
 | Forced cleanup, force-delete, finalizer removal, "delete everything" | No forced cleanup exists in any form. Cleanup is an operator-run procedure with its own reviewed data/reclaim plan |
 | Shrinking a PVC | Expansion is upward-only and irreversible |
 | Changing a claim's class, access mode or volume mode | These are immutable in practice and are not exposed |
-| Free-form manifest / raw YAML / arbitrary Kubernetes proxy | The console is deliberately typed: it renders no user manifests |
+| Free-form manifest / raw YAML / arbitrary Kubernetes proxy | Unsupported. Existing PV/PVC editing uses a restricted safe YAML projection, never a full manifest or arbitrary patch |
 | Adopting an existing namespace or relabelling a Profile | Existing namespaces are refused, not adopted |
 | Any delete endpoint other than the typed, separately gated `profile.delete` kind | There is no namespace-delete action, no generic delete route and no Kubernetes proxy; the console exposes one narrow typed kind |
 | Removing a quota key | Removal is unsupported; existing keys must be resubmitted |

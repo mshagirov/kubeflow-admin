@@ -10,6 +10,10 @@ info:
     require enabled writes and applicable validation privileges; no cluster mutation is
     committed until an actor-bound unexpired plan is submitted. No arbitrary
     Kubernetes manifests, proxy, unrestricted deletion or operation replay endpoints exist.
+    Separately gated storage actions accept only a restricted YAML projection,
+    not arbitrary PV/PVC manifests. Unused-only PV/PVC deletion never removes
+    finalizers or forces deletion; an unused observation is not an atomic fence
+    against external workloads or binders.
     The separately gated pod.restart action performs normal PDB-aware eviction
     of a validated Notebook-managed Pod only; no forced deletion is supported.
     The separately gated profile.delete action requests deletion of one existing
@@ -136,6 +140,34 @@ paths:
     get:
       <<: *inventory
       summary: StorageClass projections including approval hint
+  /api/v1/storage-document:
+    get:
+      summary: Fresh restricted PV/PVC YAML projection for guarded storage management
+      description: >-
+        Returns only approved editable fields and immutable identity, never full
+        manifests, backend addresses, volume handles, CSI attributes, annotations,
+        finalizers or status. No Kubernetes mutation is performed. Server-side
+        capability, namespace and StorageClass policies still apply.
+      parameters:
+        - name: kind
+          in: query
+          required: true
+          schema: {type: string, enum: [PersistentVolume, PersistentVolumeClaim]}
+        - name: name
+          in: query
+          required: true
+          schema: {type: string, maxLength: 253}
+        - name: namespace
+          in: query
+          description: Required for a PVC; empty for a cluster-scoped PV
+          schema: {type: string, maxLength: 63}
+      responses:
+        '200':
+          description: No-store restricted editable projection and current object identity
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StorageDocument'}
+        default: {$ref: '#/components/responses/Error'}
   /api/v1/notebooks:
     get:
       <<: *inventory
@@ -353,6 +385,18 @@ components:
         authenticatedAt: {type: string, format: date-time}
         expiresAt: {type: string, format: date-time}
         csrf: {type: string}
+    StorageDocument:
+      type: object
+      additionalProperties: false
+      required: [kind, name, uid, resourceVersion, yaml]
+      properties:
+        kind: {type: string, enum: [PersistentVolume, PersistentVolumeClaim]}
+        namespace: {type: string, description: Present for PVCs only}
+        name: {type: string}
+        uid: {type: string}
+        resourceVersion: {type: string}
+        yaml: {type: string, description: 'Restricted projection, never a full Kubernetes manifest'}
+        warnings: {type: array, items: {type: string}}
     Action:
       type: object
       additionalProperties: false
@@ -386,7 +430,12 @@ components:
             namespace are both observed gone; a replacement object or a read
             error is not gone. profile.delete additionally requires the
             separately reviewed profile-deletion opt-in on the server.
-          enum: [profile.create, profile.quota.change, profile.update, profile.delete, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, notebook.start, notebook.stop, notebook.edit, pod.restart, node.cordon, node.uncordon]
+            pv.edit and pvc.edit require storageEditing plus writes, current
+            targetUID and targetResourceVersion, and a restricted storageYAML
+            document. pv.delete and pvc.delete require storageDeletion plus
+            writes, current identity, reason and exact confirmName. Referenced
+            PVCs and bound/reserved PVs are refused; no forced cleanup exists.
+          enum: [profile.create, profile.quota.change, profile.update, profile.delete, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, pv.edit, pvc.edit, pv.delete, pvc.delete, notebook.start, notebook.stop, notebook.edit, pod.restart, node.cordon, node.uncordon]
         namespace: {type: string}
         name:
           type: string
@@ -399,15 +448,15 @@ components:
         reason:
           type: string
           maxLength: 500
-          description: 'Administrator input only; required and nonblank for pod.restart, node.cordon, node.uncordon, and profile.delete'
+          description: 'Administrator input only; required and nonblank for pod.restart, node.cordon, node.uncordon, profile.delete, pv.delete and pvc.delete; optional for storage edits'
         confirmName:
           type: string
-          maxLength: 63
+          maxLength: 253
           description: >-
             Raw exact target name typed back by the administrator as a second
-            confirmation: the value is compared to the target Profile name
+            confirmation: the value is compared to the target object name
             exactly, without trimming or case folding. Required for
-            profile.delete, which also requires a nonempty reason; ignored by
+            profile.delete, pv.delete and pvc.delete, which also require a nonempty reason; ignored by
             every other kind.
         baseConfigDigest:
           type: string
@@ -435,6 +484,24 @@ components:
             contract; owner transfer, owner migration and custom owner
             controllers are a separate future workflow.
         quota: {type: object, additionalProperties: {type: string}}
+        targetUID:
+          type: string
+          description: Required current UID from storage-document for pv.edit, pvc.edit, pv.delete and pvc.delete
+        targetResourceVersion:
+          type: string
+          description: Required current resourceVersion from storage-document; stale edits/deletes must be reviewed again
+        storageYAML:
+          type: string
+          maxLength: 32768
+          description: >-
+            Restricted single-document YAML for pv.edit or pvc.edit only. The
+            identity must match the reviewed object exactly. Approved changes
+            are metadata.labels under kubeflow-admin.io/, a PV reclaim policy
+            of Retain or Delete, and a PVC storage request increase. Other fields
+            are hidden, uneditable and preserved. PVC growth additionally needs
+            the existing expansion feature and driver/class checks. Unknown
+            fields, duplicate keys, aliases, identity/status/finalizer edits,
+            shrinkage and no-op edits are refused. This is not a full manifest editor.
         storageClass: {type: string}
         size: {type: string, description: Kubernetes storage quantity}
         accessMode: {type: string}

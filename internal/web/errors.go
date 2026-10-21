@@ -68,6 +68,10 @@ func backendFailure(w http.ResponseWriter, err error, validation bool) {
 		failure(w, 422, "cluster_validation_failed", "Kubernetes rejected the Profile deletion. Check admission policy and controller compatibility, then refresh and prepare again.", false)
 	case "Kubernetes API rejected validation or conditional patch":
 		failure(w, 422, "cluster_validation_failed", "Kubernetes rejected validation or the conditional patch. Check quantities, admission policy and installed API compatibility, then refresh and prepare again.", false)
+	case "Kubernetes API denied the storage request":
+		failure(w, 503, "cluster_access_denied", "Kubernetes denied the storage request. Ask the operator to check the application's RBAC and storage admission policy.", false)
+	case "Kubernetes API rejected the storage request":
+		failure(w, 422, "cluster_validation_failed", "Kubernetes rejected the storage request. Check the approved fields, labels, admission policy and installed storage API compatibility, then refresh and prepare again.", false)
 	case "plan belongs to a different actor":
 		failure(w, 403, "plan_actor_mismatch", "This plan belongs to another administrator. Prepare a plan in your own session.", false)
 	case "plan expired; preview again":
@@ -209,6 +213,57 @@ CSI template driver does not match class
 backing storage is already represented by a PV
 PV backing source is not in an approved template
 PVC/PV binding identity mismatch
+storage YAML is invalid; use the server-provided projection and approved fields only
+PersistentVolume is cluster scoped; namespace must be empty
+PersistentVolumeClaim has no stable UID/resourceVersion
+PersistentVolumeClaim is terminating
+an existing kubeflow-admin.io/ label is invalid; an operator must correct it before editing
+only valid labels under the kubeflow-admin.io/ prefix are editable
+too many kubeflow-admin.io/ labels
+kubeflow-admin.io/ labels exceed the allowed size
+storage projection exceeds the allowed size
+unsupported storage kind
+unsupported storage action kind
+storage action accepts no other fields
+storage editing does not accept force or a delete confirmation
+storage editing requires the exact observed targetUID and targetResourceVersion
+a bounded storage projection is required
+storage deletion does not accept force or an edit document
+storage deletion requires the exact observed targetUID and targetResourceVersion
+a nonempty reason of at most 500 characters is required for storage deletion
+typed confirmation must exactly match the storage object name
+storage projection does not match the action target
+PersistentVolume projection must not carry a namespace
+PersistentVolume editing accepts only the reclaim policy and console-owned labels
+PersistentVolume reclaim policy must be Retain or Delete
+no approved PersistentVolume change was requested
+PersistentVolumeClaim projection namespace does not match the action
+PersistentVolumeClaim editing does not accept a reclaim policy
+spec.resources.requests.storage must be a positive quantity when present
+PersistentVolumeClaim has no observed storage request to compare
+PersistentVolumeClaim storage cannot be decreased
+storage increase requires a bound nonterminating PVC with explicit class and volume
+storage increase requires a verified CSI binding and matching driver
+no approved PersistentVolumeClaim change was requested
+PersistentVolume has no stable UID/resourceVersion
+PersistentVolume is terminating
+PersistentVolume must be Available; bound, released, pending or failed volumes are refused
+PersistentVolume is reserved or bound by a claimRef
+PersistentVolume is referenced by a PersistentVolumeClaim
+controller-owned PersistentVolumeClaims are refused to prevent automatic recreation
+bound PersistentVolumeClaim has no volumeName
+a pending PersistentVolumeClaim with a volumeName is binding and cannot be deleted here
+PersistentVolumeClaim must be Bound or Pending; lost or unknown claims are refused
+bound PersistentVolume is not a stable Bound volume
+bound PersistentVolume does not name this exact claim
+bound PersistentVolume StorageClass is not approved
+bound PersistentVolume reclaim policy is unknown
+PersistentVolumeClaim is reserved by a PersistentVolume
+bound PersistentVolumeClaim does not have exactly one matching PersistentVolume reservation
+PersistentVolumeClaim is referenced by an observed Pod
+PersistentVolumeClaim collides with an observed inline ephemeral claim
+PersistentVolumeClaim is referenced by an observed Notebook
+storage deletion requires UID and resourceVersion preconditions
 unsupported container shape
 select an existing container by name
 unsupported Notebook Pod template

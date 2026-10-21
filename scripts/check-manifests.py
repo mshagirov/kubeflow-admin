@@ -26,8 +26,8 @@ ALLOWED = {
     **{key: {"get", "list"} for key in READ_RESOURCES},
     ("kubeflow.org", "profiles"): {"get", "list", "create", "patch", "delete"},
     ("kubeflow.org", "notebooks"): {"get", "list", "patch"},
-    ("", "persistentvolumes"): {"get", "list", "create", "patch"},
-    ("", "persistentvolumeclaims"): {"get", "list", "create", "patch"},
+    ("", "persistentvolumes"): {"get", "list", "create", "patch", "delete"},
+    ("", "persistentvolumeclaims"): {"get", "list", "create", "patch", "delete"},
     # GPU notebook planning must read the referenced RuntimeClass; get only.
     ("node.k8s.io", "runtimeclasses"): {"get"},
     # Explicit optional pod-restart workflow uses PDB-aware eviction only.
@@ -50,11 +50,22 @@ EXPECTED_ROLES = {
     # Explicit optional Profile deletion workflow: the single delete verb on
     # the cluster-scoped Profile resource, and nothing else.
     "kubeflow-admin-profile-deletion": {("kubeflow.org", "profiles"): {"delete"}},
+    "kubeflow-admin-storage-editing": {
+        ("", "persistentvolumes"): {"patch"},
+        ("", "persistentvolumeclaims"): {"patch"},
+    },
+    "kubeflow-admin-storage-deletion": {
+        ("", "persistentvolumes"): {"delete"},
+        ("", "persistentvolumeclaims"): {"delete"},
+    },
 }
-# The only delete grant any shipped overlay may contain is the separately
-# opt-in Profile deletion workflow, and only from its own overlay path. Every
-# other overlay must stay free of the delete verb.
-DELETE_ALLOWED = {("kubeflow.org", "profiles")}
+# Destructive grants remain separately opt-in and resource-specific; they
+# must not enter base, writes or the all-features overlay implicitly.
+DELETE_PATHS = {
+    ("kubeflow.org", "profiles"): "profile-deletion",
+    ("", "persistentvolumes"): "storage-deletion",
+    ("", "persistentvolumeclaims"): "storage-deletion",
+}
 DELETE_OPT_IN_PATH = "profile-deletion"
 # Every overlay variant that must render, exactly once, for the release.
 EXPECTED_VARIANTS = {
@@ -66,6 +77,8 @@ EXPECTED_VARIANTS = {
     "pvc-expansion",
     "profile-deletion",
     "static-storage",
+    "storage-editing",
+    "storage-deletion",
     "writes",
 }
 
@@ -90,8 +103,8 @@ def check(path):
                             assert not ({"patch", "update", "delete"} & set(rule["verbs"])), rule
                         for verb in rule["verbs"]:
                             if verb == "delete":
-                                assert (group, resource) in DELETE_ALLOWED, rule
-                                assert path.name == DELETE_OPT_IN_PATH, "profile deletion grant must stay separately opt-in"
+                                assert (group, resource) in DELETE_PATHS, rule
+                                assert path.name == DELETE_PATHS[(group, resource)], "deletion grants must stay separately opt-in"
                         actual.setdefault((group, resource), set()).update(rule["verbs"])
                         assert set(rule["verbs"]) <= ALLOWED.get((group, resource), set()), rule
                         if path.name in ("base", "local-storage"):
@@ -99,6 +112,10 @@ def check(path):
             assert actual == EXPECTED_ROLES[d["metadata"]["name"]], (path, actual)
             if d["metadata"]["name"] == "kubeflow-admin-profile-deletion":
                 assert path.name == DELETE_OPT_IN_PATH, "profile deletion grant must stay separately opt-in"
+            for role, overlay in (("kubeflow-admin-storage-editing", "storage-editing"),
+                                  ("kubeflow-admin-storage-deletion", "storage-deletion")):
+                if d["metadata"]["name"] == role:
+                    assert path.name == overlay, "storage management grants must stay separately opt-in"
         if d["kind"] == "Deployment":
             assert d["spec"]["replicas"] == 1
             assert d["spec"]["strategy"]["type"] == "Recreate"

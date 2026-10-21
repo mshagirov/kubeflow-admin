@@ -29,6 +29,22 @@ type fakeKube struct {
 func (k *fakeKube) Inventory(context.Context) (model.Inventory, error) { return k.result, k.err }
 func (k *fakeKube) Check(context.Context) error                        { return k.err }
 
+type fakeStorageKube struct {
+	*fakeKube
+	document          model.StorageDocument
+	documentErr       error
+	documentCalls     int
+	documentKind      string
+	documentNamespace string
+	documentName      string
+}
+
+func (k *fakeStorageKube) StorageDocument(_ context.Context, kind, namespace, name string) (model.StorageDocument, error) {
+	k.documentCalls++
+	k.documentKind, k.documentNamespace, k.documentName = kind, namespace, name
+	return k.document, k.documentErr
+}
+
 type fakeOps struct {
 	action         model.Action
 	plans, submits int
@@ -82,7 +98,7 @@ func TestRouteProtectionAndPublicRoutes(t *testing.T) {
 	}
 	noop := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }
 	h := s.routes(blocked, noop, noop, noop)
-	for _, path := range []string{"/", "/profiles", "/storage", "/notebooks", "/operations", "/audit", "/api/v1/me", "/api/v1/inventory", "/api/v1/plans", "/api/v1/operations", "/api/v1/audit", "/unknown", "/logout", "/auth/logout"} {
+	for _, path := range []string{"/", "/profiles", "/storage", "/notebooks", "/operations", "/audit", "/api/v1/me", "/api/v1/inventory", "/api/v1/storage-document?kind=PersistentVolume&name=data", "/api/v1/plans", "/api/v1/operations", "/api/v1/audit", "/unknown", "/logout", "/auth/logout"} {
 		method := "GET"
 		if path == "/api/v1/plans" || path == "/logout" || path == "/auth/logout" {
 			method = "POST"
@@ -97,6 +113,151 @@ func TestRouteProtectionAndPublicRoutes(t *testing.T) {
 		}
 	}
 }
+func TestStorageDocumentReadIsNarrowAndValidated(t *testing.T) {
+	k := &fakeStorageKube{fakeKube: &fakeKube{result: model.Inventory{ObservedAt: time.Now()}},
+		document: model.StorageDocument{
+			Kind: "PersistentVolumeClaim", Namespace: "team", Name: "data", UID: "uid-pvc-data", ResourceVersion: "42",
+			YAML:     "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: data\n  namespace: team\n  uid: uid-pvc-data\n  resourceVersion: \"42\"\nspec:\n  resources:\n    requests:\n      storage: 10Gi\n",
+			Warnings: []string{"Restricted projection only."},
+		}}
+	s := &server{cfg: config.Config{Features: config.Features{WritesEnabled: true, StorageEditing: true, StorageDeletion: true}}, kube: k,
+		ops: &fakeOps{}, ping: func(context.Context) error { return nil }, identity: func(context.Context) (model.Identity, bool) {
+			return model.Identity{Email: "admin@example.org", CSRF: "csrf-test"}, true
+		}}
+	h := handler(s)
+	w := request(h, "GET", "/api/v1/storage-document?kind=PersistentVolumeClaim&namespace=team&name=data", "")
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("storage document must never be cached")
+	}
+	if k.documentCalls != 1 || k.documentKind != "PersistentVolumeClaim" || k.documentNamespace != "team" || k.documentName != "data" {
+		t.Fatalf("typed document request not preserved: %+v", k)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{"kind": true, "namespace": true, "name": true, "uid": true, "resourceVersion": true, "yaml": true, "warnings": true}
+	for key := range raw {
+		if !allowed[key] {
+			t.Fatalf("unexpected document field %q", key)
+		}
+	}
+	body := w.Body.String()
+	for _, hidden := range []string{"managedFields", "ownerReferences", "claimRef", "volumeName", "finalizers", "annotations", "status:", "backendSecret"} {
+		if strings.Contains(body, hidden) {
+			t.Fatalf("document leaked %q: %s", hidden, body)
+		}
+	}
+	var doc model.StorageDocument
+	if err := json.Unmarshal(w.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.UID != "uid-pvc-data" || doc.ResourceVersion != "42" || !strings.Contains(doc.YAML, "storage: 10Gi") || len(doc.Warnings) != 1 {
+		t.Fatalf("document projection changed: %+v", doc)
+	}
+
+	// The kind, namespace and name are validated before the backend is asked.
+	k.documentCalls = 0
+	for _, path := range []string{
+		"/api/v1/storage-document?kind=StorageClass&name=data",
+		"/api/v1/storage-document?kind=PersistentVolume&name=",
+		"/api/v1/storage-document?kind=PersistentVolume&name=" + strings.Repeat("a", 300),
+		"/api/v1/storage-document?kind=PersistentVolume&namespace=team&name=data",
+		"/api/v1/storage-document?kind=PersistentVolumeClaim&name=data",
+		"/api/v1/storage-document?kind=PersistentVolumeClaim&namespace=Invalid_NS&name=data",
+		"/api/v1/storage-document?kind=PersistentVolumeClaim&namespace=team.example&name=data",
+		"/api/v1/storage-document?kind=PersistentVolumeClaim&namespace=team&name=UPPER",
+	} {
+		if got := request(h, "GET", path, "").Code; got != 400 {
+			t.Errorf("%s: got %d", path, got)
+		}
+	}
+	if k.documentCalls != 0 {
+		t.Fatalf("an invalid request reached the backend %d times", k.documentCalls)
+	}
+
+	// A backend failure is generic and never echoes source or a manifest.
+	k.documentErr = errors.New("raw manifest kind: Secret data: backendSecret Bearer token")
+	w = request(h, "GET", "/api/v1/storage-document?kind=PersistentVolume&name=data", "")
+	if w.Code != 503 || strings.Contains(w.Body.String(), "backendSecret") || strings.Contains(w.Body.String(), "raw manifest") || strings.Contains(w.Body.String(), "Bearer") {
+		t.Fatalf("unsafe document error: %d %s", w.Code, w.Body.String())
+	}
+
+	// Without the optional service the protected read is unavailable, never a
+	// silent fallback to a raw manifest read.
+	plain := &server{cfg: s.cfg, kube: &fakeKube{}, ops: &fakeOps{}, ping: func(context.Context) error { return nil }, identity: s.identity}
+	if got := request(handler(plain), "GET", "/api/v1/storage-document?kind=PersistentVolume&name=data", ""); got.Code != 503 {
+		t.Fatalf("missing storage document service: %d", got.Code)
+	}
+}
+
+func TestStorageFeatureProjectionRequiresWrites(t *testing.T) {
+	s, _, _ := fixture()
+	s.identity = func(context.Context) (model.Identity, bool) { return model.Identity{CSRF: "csrf-test"}, true }
+	for _, test := range []struct {
+		name              string
+		writes, editing   bool
+		deletion          bool
+		wantEdit, wantDel bool
+	}{
+		{"defaults stay disabled", true, false, false, false, false},
+		{"opt-in alone is not enough", false, true, true, false, false},
+		{"both opt-ins with writes", true, true, true, true, true},
+	} {
+		s.cfg.Features.WritesEnabled = test.writes
+		s.cfg.Features.StorageEditing = test.editing
+		s.cfg.Features.StorageDeletion = test.deletion
+		body := request(handler(s), "GET", "/storage", "").Body.String()
+		if got := strings.Contains(body, `name="storage-editing" content="true"`); got != test.wantEdit {
+			t.Fatalf("%s: editing meta=%v", test.name, got)
+		}
+		if got := strings.Contains(body, `name="storage-deletion" content="true"`); got != test.wantDel {
+			t.Fatalf("%s: deletion meta=%v", test.name, got)
+		}
+	}
+	// The plan boundary repeats the opt-in even though the UI disables it.
+	s.cfg.Features.WritesEnabled = true
+	s.cfg.Features.StorageEditing = false
+	s.cfg.Features.StorageDeletion = false
+	o := s.ops.(*fakeOps)
+	for _, body := range []string{
+		`{"kind":"pv.edit","name":"data","targetUID":"uid","targetResourceVersion":"1","storageYAML":"apiVersion: v1","reason":"edit"}`,
+		`{"kind":"pvc.delete","namespace":"team","name":"data","targetUID":"uid","targetResourceVersion":"1","confirmName":"data","reason":"delete"}`,
+	} {
+		if w := request(handler(s), "POST", "/api/v1/plans", body); w.Code != 403 {
+			t.Fatalf("disabled storage action reached the plan manager: %d", w.Code)
+		}
+	}
+	if o.plans != 0 {
+		t.Fatalf("disabled storage actions were planned %d times", o.plans)
+	}
+	// The protected read is also refused while both storage opt-ins are off.
+	if w := request(handler(s), "GET", "/api/v1/storage-document?kind=PersistentVolume&name=data", ""); w.Code != 403 {
+		t.Fatalf("disabled storage document read: %d", w.Code)
+	}
+	// With both opt-ins and writes enabled the typed storage fields reach the
+	// plan manager unchanged.
+	s.cfg.Features.StorageEditing = true
+	s.cfg.Features.StorageDeletion = true
+	edit := `{"kind":"pvc.edit","namespace":"team","name":"data","targetUID":"uid-pvc-data","targetResourceVersion":"42","storageYAML":"apiVersion: v1\nkind: PersistentVolumeClaim\n","reason":"grow"}`
+	if w := request(handler(s), "POST", "/api/v1/plans", edit); w.Code != 201 {
+		t.Fatalf("enabled storage edit was refused: %d %s", w.Code, w.Body.String())
+	}
+	if o.plans != 1 || o.action.Kind != "pvc.edit" || o.action.StorageYAML == "" || o.action.TargetUID != "uid-pvc-data" || o.action.TargetResourceVersion != "42" {
+		t.Fatalf("typed storage edit did not reach the manager: %+v", o.action)
+	}
+	remove := `{"kind":"pv.delete","name":"spare","targetUID":"uid-pv-spare","targetResourceVersion":"7","confirmName":"spare","reason":"unused"}`
+	if w := request(handler(s), "POST", "/api/v1/plans", remove); w.Code != 201 {
+		t.Fatalf("enabled storage deletion was refused: %d %s", w.Code, w.Body.String())
+	}
+	if o.plans != 2 || o.action.Kind != "pv.delete" || o.action.ConfirmName != "spare" || o.action.TargetResourceVersion != "7" {
+		t.Fatalf("typed storage deletion did not reach the manager: %+v", o.action)
+	}
+}
+
 func TestStrictPlanDecodeAndNoWrites(t *testing.T) {
 	s, _, o := fixture()
 	h := handler(s)

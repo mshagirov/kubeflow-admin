@@ -86,6 +86,18 @@ type Action struct {
 	Mounts           *[]Mount          `json:"mounts,omitempty"`
 	Restart          bool              `json:"restart,omitempty"`
 	Force            bool              `json:"force,omitempty"`
+	// StorageYAML is the restricted, server-normalized projection of one
+	// PersistentVolume or PersistentVolumeClaim for pv.edit and pvc.edit. It
+	// never carries a full manifest or backend volume source. The projection
+	// must include metadata.uid and metadata.resourceVersion, and both must
+	// equal TargetUID and TargetResourceVersion, so a stale browser snapshot
+	// can never overwrite a concurrent change.
+	StorageYAML string `json:"storageYAML,omitempty"`
+	// TargetUID and TargetResourceVersion are the exact observed identity of
+	// the storage object a delete or edit action was built from. They are
+	// required for the new storage actions and are never inferred from a name.
+	TargetUID             string `json:"targetUID,omitempty"`
+	TargetResourceVersion string `json:"targetResourceVersion,omitempty"`
 }
 type Mount struct {
 	Name     string `json:"name"`
@@ -163,6 +175,21 @@ type Resource struct {
 	State     string            `json:"state,omitempty"`
 	Desired   string            `json:"desired,omitempty"`
 	Details   map[string]string `json:"details,omitempty"`
+}
+
+// StorageDocument is the safe, server-produced projection of one
+// PersistentVolume or PersistentVolumeClaim. It never contains a volume source,
+// backend path/handle/attribute, Secret reference, annotation, finalizer,
+// owner reference, StorageClass or status. YAML is the strict editable form;
+// UID and ResourceVersion must be echoed back in the edit action.
+type StorageDocument struct {
+	Kind            string   `json:"kind"`
+	Namespace       string   `json:"namespace,omitempty"`
+	Name            string   `json:"name"`
+	UID             string   `json:"uid"`
+	ResourceVersion string   `json:"resourceVersion"`
+	YAML            string   `json:"yaml"`
+	Warnings        []string `json:"warnings,omitempty"`
 }
 type Inventory struct {
 	ObservedAt time.Time  `json:"observedAt"`

@@ -2,6 +2,61 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
+## Planned 0.4.1 — storage, Notebook gates and Node scope (unpublished)
+
+This work is not in the published `0.4.0` digest below. It adds name-only storage
+details controls, separately gated restricted PV/PVC YAML editing and unused-only
+deletion, plus explicit Notebook management gate explanations. The Node scoped
+Running-Pods view was implemented after the scheduled wake at 05:21 Singapore
+time on 22 October. It links the exact count across namespaces to URL-backed
+Node/Running filters on the Pods page, with visible chips and filter reset.
+The operator chose
+restricted YAML rather than full manifests, and refused in-use storage deletion.
+Storage implementation/review agents used OpenCode Go DeepSeek V4.1 Flash with
+high thinking; the scheduled Node agent used max thinking as requested. The lead
+personally reviewed the combined changes. No deployment, feature enablement
+or cluster mutation is authorized by the local implementation work.
+
+The new editing and deletion overlays retain false-by-default feature flags,
+separate patch/delete grants and no finalizer, namespace-delete or cluster-admin
+permissions. Eleven manifest variants render and pass the offline grant checks.
+Focused integration evidence before the scheduled Node work:
+
+- The lead personally reviewed backend, lock/fence, HTTP and UI changes, then
+  corrected malformed reference checks, digested bound-volume/scope evidence,
+  strict YAML/label handling, stale async plan responses and typed safe errors.
+- An independent read-only storage safety review found no remaining P1 issue.
+  Its P2 recovery-guidance finding was corrected: uncertain storage edits now
+  warn about an applied Delete reclaim policy or pending CSI/filesystem resize,
+  retain locks and explicitly forbid replay, shrinking or forced cleanup.
+- Lead-run focused race tests passed for Kubernetes, store, operations, config,
+  model and web packages; both Node regression scripts passed. API parity,
+  five Python tests, OpenAPI validation and eleven manifest variants passed.
+- Configured real-Chrome synthetic acceptance passed **31/31** checks through
+  the storage frontend agent and **32/32** after the Node feature through the
+  scheduled agent. Final lead-run combined verification is recorded below;
+  no synthetic fixture result proves live storage behavior.
+
+### Final local verification
+
+- Lead-run `GOTOOLCHAIN=go1.27.3 GOMAXPROCS=2 go test -mod=readonly -race -p 1 -count=1 ./...`
+  passed all ten packages. Both Node scripts, Go vet, module verification and a
+  clean non-CGO production build passed; no production timeout was increased.
+- Lead-run configured real-Chrome acceptance passed **32/32**, with no skips,
+  JavaScript errors or horizontal overflow at 390px/1280px across all seven
+  resource pages. This includes exact Node Running-Pod scope and restricted
+  storage edit/delete orchestration, not live Kubernetes/storage behavior.
+- API parity (22 routes), all five Python tests, OpenAPI validation, shell syntax,
+  eleven manifest variants and strict Kubernetes 1.32 schema validation passed.
+- `govulncheck v1.9.0` reported no vulnerabilities. Digest-pinned Trivy 0.76.0
+  found no HIGH/CRITICAL dependency vulnerabilities, detected secrets or manifest
+  misconfigurations in the staged release-source snapshot.
+
+GitHub CI and runtime image publication/verification remain pending.
+The next publication must use `0.4.1`, leaving the published `0.4.0` tag intact.
+Commit/push, GitHub CI and image publication follow final verification;
+nothing in this unpublished section is deployment evidence.
+
 ## UI and deployed-quota follow-up — 22 October 2026
 
 This follow-up is published in the refreshed `0.4.0` image identified below.

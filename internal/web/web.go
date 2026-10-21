@@ -13,6 +13,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -65,6 +66,12 @@ type pageFeatures struct {
 	// are both enabled, so the browser never offers a capability the API
 	// would refuse. It carries no permission and no secret.
 	ProfileDeletion bool
+	// StorageEditing and StorageDeletion are separate reviewed opt-ins for
+	// the narrow PersistentVolume/PersistentVolumeClaim YAML projection and
+	// deletion workflows. They are never implied by WritesEnabled: both the
+	// opt-in and writes must be true before the browser offers the action.
+	StorageEditing  bool
+	StorageDeletion bool
 }
 type pageNotebooks struct {
 	ControllerContractConfirmed bool
@@ -113,6 +120,8 @@ func buildPageView(identity model.Identity, cfg config.Config) pageView {
 				// The deletion capability is never offered while writes are
 				// disabled, even if the separate opt-in is set.
 				ProfileDeletion: cfg.Features.ProfileDeletion && cfg.Features.WritesEnabled,
+				StorageEditing:  cfg.Features.StorageEditing && cfg.Features.WritesEnabled,
+				StorageDeletion: cfg.Features.StorageDeletion && cfg.Features.WritesEnabled,
 			},
 			Notebooks: pageNotebooks{
 				ControllerContractConfirmed: cfg.Notebooks.ControllerContractConfirmed,
@@ -149,6 +158,16 @@ type operationService interface {
 	List(context.Context) ([]model.Operation, error)
 	Audit(context.Context) ([]model.Audit, error)
 }
+
+// storageDocumentService is the optional, protected read used by the storage
+// editor and deletion confirmation. It is asserted at request time so an
+// inventory service that predates the storage workflow (including every
+// existing fake) keeps compiling and simply reports the read as unavailable.
+// The document is built by the backend from its own authoritative object; the
+// browser never receives a full manifest and never supplies one for reading.
+type storageDocumentService interface {
+	StorageDocument(context.Context, string, string, string) (model.StorageDocument, error)
+}
 type server struct {
 	rate     writeLimiter
 	cfg      config.Config
@@ -180,6 +199,7 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 	}
 	private.HandleFunc("POST /api/v1/plans", s.plan)
 	private.HandleFunc("POST /api/v1/operations", s.submit)
+	private.HandleFunc("GET /api/v1/storage-document", s.storageDocument)
 	private.HandleFunc("GET /api/v1/operations", func(w http.ResponseWriter, r *http.Request) {
 		v, e := s.ops.List(r.Context())
 		if e != nil {
@@ -413,6 +433,96 @@ func resourceList(kind string) string {
 	}
 	return ""
 }
+
+// storageDocument reads one server-projected PersistentVolume or
+// PersistentVolumeClaim document for review. The read is protected by the same
+// session/CSRF boundary as the rest of the console. The server validates the
+// kind, name and namespace from a closed grammar before asking the backend; the
+// backend remains authoritative about existence, identity and scope.
+//
+// The response is deliberately narrow: kind, optional namespace, name, UID,
+// resourceVersion, a restricted YAML projection and optional warnings. A full
+// manifest is never read or echoed, and an error never carries backend source.
+func (s *server) storageDocument(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.Features.WritesEnabled || (!s.cfg.Features.StorageEditing && !s.cfg.Features.StorageDeletion) {
+		fail(w, 403, "Storage document access is disabled by server policy.")
+		return
+	}
+	q := r.URL.Query()
+	kind, namespace, name := strings.TrimSpace(q.Get("kind")), strings.TrimSpace(q.Get("namespace")), strings.TrimSpace(q.Get("name"))
+	canonical, ok := canonicalStorageKind(kind)
+	if !ok {
+		fail(w, 400, "Unsupported storage kind.")
+		return
+	}
+	if !boundedKubeName(name, 253) {
+		fail(w, 400, "A valid storage resource name is required.")
+		return
+	}
+	switch canonical {
+	case "PersistentVolume":
+		if namespace != "" {
+			fail(w, 400, "A PersistentVolume is cluster scoped and takes no namespace.")
+			return
+		}
+	case "PersistentVolumeClaim":
+		if !boundedKubeLabel(namespace, 63) {
+			fail(w, 400, "A valid namespace is required for a PersistentVolumeClaim.")
+			return
+		}
+	}
+	docs, ok := s.kube.(storageDocumentService)
+	if !ok || docs == nil {
+		fail(w, 503, "Storage document access is unavailable.")
+		return
+	}
+	doc, err := docs.StorageDocument(r.Context(), canonical, namespace, name)
+	if err != nil {
+		// The document read is a controlled, strict server-authored
+		// projection. Only exact reviewed storage policy messages may surface
+		// as validation errors; every other backend or transport failure stays
+		// generic and redacted.
+		backendFailure(w, err, true)
+		return
+	}
+	respond(w, 200, doc)
+}
+
+// canonicalStorageKind maps the two supported spellings to the canonical kind
+// the backend expects. StorageClass and every other kind are deliberately not
+// accepted: they have no storage document workflow.
+func canonicalStorageKind(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "persistentvolume", "pv":
+		return "PersistentVolume", true
+	case "persistentvolumeclaim", "pvc":
+		return "PersistentVolumeClaim", true
+	}
+	return "", false
+}
+
+// boundedKubeName accepts a DNS-1123 subdomain of a bounded length. The upper
+// bound is checked before the grammar so an oversized query is refused early.
+func boundedKubeName(value string, max int) bool {
+	if value == "" || len(value) > max {
+		return false
+	}
+	return dnsSubdomainPattern.MatchString(value)
+}
+
+// boundedKubeLabel accepts one DNS-1123 label, the grammar of a namespace.
+func boundedKubeLabel(value string, max int) bool {
+	if value == "" || len(value) > max {
+		return false
+	}
+	return dnsLabelPattern.MatchString(value)
+}
+
+var (
+	dnsSubdomainPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+	dnsLabelPattern     = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+)
+
 func (s *server) plan(w http.ResponseWriter, r *http.Request) {
 	i, ok := s.identity(r.Context())
 	if !ok {
@@ -437,6 +547,21 @@ func (s *server) plan(w http.ResponseWriter, r *http.Request) {
 	if a.Kind == "profile.delete" && !s.cfg.Features.ProfileDeletion {
 		fail(w, 403, "Profile deletion is disabled by server policy.")
 		return
+	}
+	// Storage document editing and deletion are separate reviewed opt-ins.
+	// A refused request never reaches the plan manager; the backend repeats
+	// every identity, scope and eligibility check.
+	switch a.Kind {
+	case "pv.edit", "pvc.edit":
+		if !s.cfg.Features.StorageEditing {
+			fail(w, 403, "Storage editing is disabled by server policy.")
+			return
+		}
+	case "pv.delete", "pvc.delete":
+		if !s.cfg.Features.StorageDeletion {
+			fail(w, 403, "Storage deletion is disabled by server policy.")
+			return
+		}
 	}
 	v, e := s.ops.Plan(r.Context(), i, a)
 	if e != nil {

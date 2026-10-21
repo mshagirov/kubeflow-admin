@@ -559,10 +559,21 @@ func (s *Store) cleanupRecords(ctx context.Context, buckets []string, deletes ..
 }
 
 // profileDeleteKind is the typed destructive Profile action. It is the only
-// delete action in the system: there is no namespace delete action. Deleting a
-// Profile cascades into the namespace the Profile controller owns, so the
+// action that cascades into a namespace: there is no namespace delete action.
+// Deleting a Profile removes the namespace the Profile controller owns, so the
 // whole namespace is fenced while the deletion is unresolved.
 const profileDeleteKind = "profile.delete"
+
+// pvcDeleteKind is the unused-only PersistentVolumeClaim deletion. It is not a
+// namespace cascade, but it acquires the same exclusive namespace fence so it
+// cannot race a Notebook mount edit, a claim expansion or a PV reservation that
+// would add a reference to the same claim while the deletion is unresolved.
+const pvcDeleteKind = "pvc.delete"
+
+// storageYAMLMaxBytes is the server-side bound of the restricted storage
+// projection. The HTTP request limit is separate and must also be enforced at
+// the API boundary; the backend never parses an unbounded document.
+const storageYAMLMaxBytes = 32 << 10
 
 // PrimaryTarget is the canonical lock name derived from the server-owned action.
 // It is the only primary target a caller may claim; accepting an arbitrary
@@ -581,6 +592,10 @@ func PrimaryTarget(a model.Action) string {
 		return "notebook:" + a.Namespace + "/" + a.Name
 	case strings.HasPrefix(a.Kind, "profile."):
 		return "profile:" + a.Name
+	case a.Kind == "pv.edit" || a.Kind == "pv.delete":
+		// PersistentVolumes are cluster scoped: the canonical target never
+		// carries a namespace, even when another field does.
+		return "pv:" + a.Name
 	default:
 		return "pvc:" + a.Namespace + "/" + a.Name
 	}
@@ -660,6 +675,21 @@ func profileNamespaceFromTarget(target string) (string, bool) {
 	return name, true
 }
 
+// pvcNamespaceFromTarget returns the namespace of a canonical namespaced PVC
+// target ("pvc:<namespace>/<name>"). A malformed namespace or name never
+// identifies a fence.
+func pvcNamespaceFromTarget(target string) (string, bool) {
+	rest, ok := strings.CutPrefix(target, "pvc:")
+	if !ok {
+		return "", false
+	}
+	namespace, claimName, ok := strings.Cut(rest, "/")
+	if !ok || !validDNS1123Label(namespace) || !validTargetName(claimName) {
+		return "", false
+	}
+	return namespace, true
+}
+
 // validateProfileDelete enforces the typed contract of the destructive Profile
 // action: the exact Profile name, the exact typed confirmation, no foreign
 // namespace and a recorded reason. A deletion whose target cannot be fenced is
@@ -686,6 +716,62 @@ func validateProfileDelete(a model.Action) error {
 	return nil
 }
 
+// validateStorageTarget validates the target scope shared by the new storage
+// edit/delete actions. A PV is cluster scoped and must never carry a namespace;
+// a PVC is namespaced and must carry exactly one usable namespace label. A
+// force flag is never accepted: this adapter does not implement forced deletion.
+func validateStorageTarget(a model.Action) error {
+	if !validTargetName(a.Name) || a.Force || a.TargetUID == "" || a.TargetResourceVersion == "" {
+		return ErrInvalidTarget
+	}
+	switch a.Kind {
+	case "pv.edit", "pv.delete":
+		if a.Namespace != "" {
+			return ErrInvalidTarget
+		}
+		return nil
+	case "pvc.edit", "pvc.delete":
+		if !validDNS1123Label(a.Namespace) {
+			return ErrInvalidTarget
+		}
+		return nil
+	default:
+		return ErrInvalidTarget
+	}
+}
+
+// validateStorageEdit enforces the typed contract of pv.edit and pvc.edit. The
+// action carries the exact observed UID/resourceVersion and a bounded,
+// restricted projection; it never carries a typed delete confirmation.
+func validateStorageEdit(a model.Action) error {
+	if err := validateStorageTarget(a); err != nil {
+		return err
+	}
+	if a.ConfirmName != "" || strings.TrimSpace(a.StorageYAML) == "" || len(a.StorageYAML) > storageYAMLMaxBytes {
+		return ErrInvalidTarget
+	}
+	if a.Reason != "" && utf8.RuneCountInString(a.Reason) > 500 {
+		return ErrInvalidTarget
+	}
+	return nil
+}
+
+// validateStorageDelete enforces the typed contract of pv.delete and pvc.delete:
+// exact target identity, an authored reason, the exact typed confirmation, and
+// no edit document or force flag.
+func validateStorageDelete(a model.Action) error {
+	if err := validateStorageTarget(a); err != nil {
+		return err
+	}
+	if a.StorageYAML != "" || a.ConfirmName != a.Name {
+		return ErrInvalidTarget
+	}
+	if strings.TrimSpace(a.Reason) == "" || utf8.RuneCountInString(a.Reason) > 500 {
+		return ErrInvalidTarget
+	}
+	return nil
+}
+
 // Targets locks the canonical primary plus its selected PV; using only PVName
 // would allow two queued operations to mutate the same PVC using different PV
 // reservations. A restart also locks its validated parent Notebook so it cannot
@@ -695,6 +781,15 @@ func validateProfileDelete(a model.Action) error {
 // cascade removes every object in that namespace, so the whole namespace is
 // fenced for as long as the deletion is unresolved. The fence is derived only
 // from the validated Profile name: no other field can add a lock target.
+//
+// An unused-only PVC deletion also acquires the same exclusive namespace fence.
+// A Notebook edit that adds a PVC mount currently carries only a Notebook
+// target, and widening every historical Notebook plan with new PVC locks would
+// invalidate active legacy operations. The namespace fence is the conservative
+// compatible alternative: it serializes the PVC delete against every ordinary
+// namespace-scoped operation (including Notebook edits that add the same claim)
+// without changing the persisted lock shape of existing actions. A PV deletion
+// is already serialized by the existing pv:<name> lock used by reservations.
 func Targets(p model.Plan) []string {
 	a := p.Prepared.Action
 	out := []string{PrimaryTarget(a)}
@@ -715,7 +810,7 @@ func Targets(p model.Plan) []string {
 	if a.Kind == "pod.restart" && validTargetName(a.Namespace) && validTargetName(p.Prepared.ParentNotebook) {
 		add("notebook:" + a.Namespace + "/" + p.Prepared.ParentNotebook)
 	}
-	if a.Kind == profileDeleteKind {
+	if a.Kind == profileDeleteKind || a.Kind == pvcDeleteKind {
 		if ns := fenceNamespace(a); ns != "" {
 			add("namespace:" + ns)
 		}
@@ -729,10 +824,11 @@ func Targets(p model.Plan) []string {
 // Direction one: an active namespace:<ns> deletion lock blocks every other
 // mutation that touches that namespace, whatever its own target is.
 //
-// Direction two: a Profile deletion is refused while any other active
-// mutation still targets the same namespace. The compared targets are exactly
-// the ordinary namespace-scoped primary targets (notebook:<ns>/..., pod:<ns>/...
-// and pvc:<ns>/...), the Profile target (profile:<ns>) and the namespace fence
+// Direction two: an exclusive namespace action (a Profile deletion or an
+// unused-only PVC deletion) is refused while any other active mutation still
+// targets the same namespace. The compared targets are exactly the ordinary
+// namespace-scoped primary targets (notebook:<ns>/..., pod:<ns>/... and
+// pvc:<ns>/...), the Profile target (profile:<ns>) and the namespace fence
 // target itself (namespace:<ns>). Cluster-scoped targets such as pv:<name>
 // and node:<name> are deliberately not compared: they are not namespace
 // scoped.
@@ -742,7 +838,7 @@ func Targets(p model.Plan) []string {
 // while the namespace stays fenced.
 func checkNamespaceFence(ctx context.Context, tx *sql.Tx, a model.Action, ns, operationID string) error {
 	var found int
-	// Direction one: a pending Profile deletion owns the namespace.
+	// Direction one: a pending exclusive namespace deletion owns the namespace.
 	err := tx.QueryRowContext(ctx, `SELECT 1 FROM operation_targets WHERE target=? AND active=1 LIMIT 1`, "namespace:"+ns).Scan(&found)
 	if err == nil {
 		return ErrConflict
@@ -750,12 +846,12 @@ func checkNamespaceFence(ctx context.Context, tx *sql.Tx, a model.Action, ns, op
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if a.Kind != profileDeleteKind {
+	if a.Kind != profileDeleteKind && a.Kind != pvcDeleteKind {
 		return nil
 	}
-	// Direction two: a Profile deletion may not start while the namespace is
-	// still busy. The prefixes are compared with substr, never with LIKE, so a
-	// namespace can never act as a wildcard.
+	// Direction two: an exclusive namespace deletion may not start while the
+	// namespace is still busy. The prefixes are compared with substr, never
+	// with LIKE, so a namespace can never act as a wildcard.
 	notebookPrefix := "notebook:" + ns + "/"
 	podPrefix := "pod:" + ns + "/"
 	pvcPrefix := "pvc:" + ns + "/"
@@ -816,6 +912,19 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 	// under that name.
 	if plan.Prepared.Action.Kind == profileDeleteKind {
 		if err := validateProfileDelete(plan.Prepared.Action); err != nil {
+			return model.Operation{}, false, err
+		}
+	}
+	// The restricted storage edit and unused-only storage delete are typed
+	// destructive/privileged actions. Validate their target scope and exact
+	// identity before any claim or lock is written.
+	switch plan.Prepared.Action.Kind {
+	case "pv.edit", "pvc.edit":
+		if err := validateStorageEdit(plan.Prepared.Action); err != nil {
+			return model.Operation{}, false, err
+		}
+	case "pv.delete", "pvc.delete":
+		if err := validateStorageDelete(plan.Prepared.Action); err != nil {
 			return model.Operation{}, false, err
 		}
 	}
@@ -1168,45 +1277,59 @@ func (s *Store) IncompleteOperations(ctx context.Context) ([]model.Operation, er
 	return out, rows.Err()
 }
 
-// validateNamespaceFenceLocks verifies that every active Profile deletion still
-// holds the namespace fence lock that protects its namespace. The fence is the
-// only thing that keeps a concurrent mutation out of a namespace whose
-// deletion is unresolved, so a missing fence is an integrity error: the store
-// fails closed instead of accepting a mutation into that namespace.
+// validateNamespaceFenceLocks verifies that every active exclusive namespace
+// deletion (Profile deletion or unused-only PVC deletion) still holds the
+// namespace fence lock that protects its namespace, and that no other active
+// action holds a namespace fence. The fence is the only thing that keeps a
+// concurrent mutation out of a namespace whose deletion is unresolved, so a
+// missing or forged fence is an integrity error: the store fails closed instead
+// of accepting a mutation into that namespace.
 //
 // The evidence is the immutable acceptance ledger, which records the accepted
 // action and its canonical target for every active claim. A claim without
 // ledger evidence is reported by the acceptance evidence check instead.
 //
-// The check is one statement. The store keeps a single SQLite connection, so a
-// second query started while a result set was still open would wait for that
-// connection instead of running: the fence presence is therefore computed by
-// the join itself, and no statement is ever started inside an open result set.
+// The check is deliberately split into bounded queries over a slice: no
+// statement is started inside an open result set on the store's single
+// connection.
 func validateNamespaceFenceLocks(ctx context.Context, q sqlQueryer) error {
-	rows, err := q.QueryContext(ctx, `SELECT c.id,a.target,(f.operation_id IS NOT NULL) AS fenced
-		FROM operation_claims c
+	rows, err := q.QueryContext(ctx, `SELECT c.id,a.action,a.target FROM operation_claims c
 		JOIN operation_acceptance a ON a.operation_id=c.id
-		LEFT JOIN operation_targets f
-			ON f.operation_id=c.id AND f.active=1 AND f.target='namespace:'||substr(a.target,9)
-		WHERE c.active=1 AND a.action=?`, profileDeleteKind)
+		WHERE c.active=1`)
 	if err != nil {
 		return err
 	}
-	type deletion struct {
+	type exclusive struct {
 		operationID string
+		action      string
 		target      string
-		fenced      bool
+		namespace   string
 	}
-	var deletions []deletion
+	var deletions []exclusive
 	for rows.Next() {
-		var d deletion
-		var fenced int
-		if err := rows.Scan(&d.operationID, &d.target, &fenced); err != nil {
+		var d exclusive
+		if err := rows.Scan(&d.operationID, &d.action, &d.target); err != nil {
 			rows.Close()
 			return err
 		}
-		d.fenced = fenced == 1
-		deletions = append(deletions, d)
+		switch d.action {
+		case profileDeleteKind:
+			ns, ok := profileNamespaceFromTarget(d.target)
+			if !ok {
+				rows.Close()
+				return integrity("an active Profile deletion does not have a canonical Profile target")
+			}
+			d.namespace = ns
+			deletions = append(deletions, d)
+		case pvcDeleteKind:
+			ns, ok := pvcNamespaceFromTarget(d.target)
+			if !ok {
+				rows.Close()
+				return integrity("an active PVC deletion does not have a canonical namespaced claim target")
+			}
+			d.namespace = ns
+			deletions = append(deletions, d)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -1214,14 +1337,47 @@ func validateNamespaceFenceLocks(ctx context.Context, q sqlQueryer) error {
 	}
 	rows.Close()
 	for _, d := range deletions {
-		if _, ok := profileNamespaceFromTarget(d.target); !ok {
-			return integrity("an active Profile deletion does not have a canonical Profile target")
+		var n int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_targets WHERE operation_id=? AND target=? AND active=1`, d.operationID, "namespace:"+d.namespace).Scan(&n); err != nil {
+			return err
 		}
-		if !d.fenced {
-			return integrity("an active Profile deletion is missing its namespace fence lock")
+		if n == 0 {
+			return integrity("an active exclusive namespace deletion is missing its namespace fence lock")
 		}
 	}
-	return nil
+	// A namespace fence must never be an incidental lock of any other action,
+	// and a reviewed deletion may not fence a namespace other than its own.
+	// Accepting either would invent an exclusive namespace capability outside
+	// the two reviewed deletion kinds.
+	rows, err = q.QueryContext(ctx, `SELECT a.action,a.target,t.target FROM operation_targets t
+		JOIN operation_claims c ON c.id=t.operation_id AND c.active=1
+		JOIN operation_acceptance a ON a.operation_id=c.id
+		WHERE t.active=1 AND substr(t.target,1,10)='namespace:'`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var action, actionTarget, fence string
+		if err := rows.Scan(&action, &actionTarget, &fence); err != nil {
+			return err
+		}
+		expected := ""
+		switch action {
+		case profileDeleteKind:
+			if ns, ok := profileNamespaceFromTarget(actionTarget); ok {
+				expected = "namespace:" + ns
+			}
+		case pvcDeleteKind:
+			if ns, ok := pvcNamespaceFromTarget(actionTarget); ok {
+				expected = "namespace:" + ns
+			}
+		}
+		if expected == "" || fence != expected {
+			return integrity("an active action holds a namespace fence that is reserved for its own exclusive deletion")
+		}
+	}
+	return rows.Err()
 }
 
 // CheckIntegrity fails closed when durable operation state is internally

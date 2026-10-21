@@ -1,9 +1,7 @@
 package kube
 
-// profile_delete.go implements the single typed destructive action this
-// console exposes: deleting one Profile and, through the installed Profile
-// controller and normal Kubernetes garbage collection, the namespace that
-// Profile owns.
+// profile_delete.go implements the typed Profile deletion action this console
+// exposes.
 //
 // The path is deliberately narrow. It deletes exactly one Profile object with
 // UID and resourceVersion preconditions and Background propagation (the
@@ -586,7 +584,7 @@ func profileDeleteWarnings(obs profileDeleteObservation) []string {
 		"Removing PersistentVolumeClaims removes the claims to their storage. A Delete reclaim policy allows storage controllers or provisioners to delete the backing volume and its data irreversibly in the storage stack, not directly in this console. Data destruction is not guaranteed by deleting a claim: Retain-policy volumes and external data may remain. Never treat this operation as a verified data wipe.",
 		"A volume with the Retain reclaim policy usually keeps its data: the PersistentVolume object and the backend data - an NFS export directory, CSI volume content, snapshots or other copies - may remain after the deletion. Remaining is not protection: the backend's own snapshot and retention lifecycle, a later operator delete, or a subsequent claim can still destroy that data.",
 		"VolumeSnapshot objects live in the namespace and disappear with it. Their VolumeSnapshotContent objects and the backend snapshots they point at are cluster scoped and follow their own deletion and retention policy, so a backend snapshot may outlive this deletion.",
-		"This console never deletes a namespace, never deletes or edits a PersistentVolume, never removes a finalizer and never force-deletes a terminating object. A namespace that stays Terminating needs an operator plan.",
+		"This Profile deletion never deletes a namespace directly, never deletes or edits a PersistentVolume, never removes a finalizer and never force-deletes a terminating object. A namespace that stays Terminating needs an operator plan.",
 		"The deletion is complete only when both this Profile and its namespace are gone. A namespace that remains, an object that reappears under the same name, or a cleanup that does not finish leaves the operation for review instead of reporting success.",
 		"This console never retries or replays a deletion automatically. An unfinished or ambiguous deletion stays unresolved for review and needs an operator plan; it is never resolved by deleting something else.",
 		"Take a backup of the workspace data you need before confirming. This console never creates one.",

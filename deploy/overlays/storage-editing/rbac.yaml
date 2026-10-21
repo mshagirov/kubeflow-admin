@@ -1,0 +1,24 @@
+# Optional restricted PV/PVC YAML editing. The application enforces the field
+# allowlist; Kubernetes RBAC cannot restrict patchable fields. Use admission
+# policy as an additional cluster-side boundary. No finalizer subresource grant.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflow-admin-storage-editing
+rules:
+  - apiGroups: ['']
+    resources: [persistentvolumes, persistentvolumeclaims]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeflow-admin-storage-editing
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeflow-admin-storage-editing
+subjects:
+  - kind: ServiceAccount
+    name: kubeflow-admin
+    namespace: kubeflow-admin

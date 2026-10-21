@@ -84,7 +84,7 @@ func newManager(ctx context.Context, cfg config.Config, s *store.Store, k Backen
 			continue
 		}
 		op.State = "needs-review"
-		op.Error = "Application restarted before a durable outcome. Inspect actual cluster state; no action was replayed."
+		op.Error = recoveryGuidance(op.Action)
 		op.UpdatedAt = time.Now().UTC()
 		if err := m.finish(recoveryCtx, op); err != nil {
 			return fail(storageError(err))
@@ -496,12 +496,48 @@ const genericReviewGuidance = "Inspect actual cluster state; a notebook may be s
 // check and must not do.
 const profileDeleteReviewGuidance = "The Profile deletion may already have been accepted. Inspect the Profile, the namespace it owns and any finalizers that remain, and check whether its PersistentVolumeClaims and other storage were deleted or retained. Do not retry the deletion and do not force namespace or resource cleanup. The Profile and its namespace remain locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
 
+// Restricted storage actions need guidance naming the reviewed storage
+// object and possible edit/deletion effects, separate from Profile cascades.
+const (
+	pvDeleteKind  = "pv.delete"
+	pvcDeleteKind = "pvc.delete"
+	pvEditKind    = "pv.edit"
+	pvcEditKind   = "pvc.edit"
+)
+
+// storageDeleteReviewGuidance is the uncertain-outcome guidance for the typed
+// storage deletions. It never claims the object is gone and never suggests a
+// retry, a force delete or a finalizer removal.
+const storageDeleteReviewGuidance = "The storage deletion may already have been accepted. Inspect the exact PersistentVolume or PersistentVolumeClaim UID named by this operation, any replacement object under the same name, current Pod and Notebook references, binding claim references and remaining finalizers. Do not retry the deletion, do not delete a replacement object and do not remove finalizers or force cleanup. The storage target remains locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
+
+// An uncertain edit may have changed future data reclamation or started a
+// resize, even though the operation did not observe a durable outcome.
+const storageEditReviewGuidance = "The storage edit may already have been applied. Inspect the reviewed PersistentVolume or PersistentVolumeClaim UID and the accepted before/after changes, not a replacement object under the same name. A PersistentVolume reclaim policy may now be Delete, allowing backing data to be destroyed on a later claim release or volume deletion. A PersistentVolumeClaim resize may still be pending in the CSI controller or filesystem. Do not retry, force cleanup, shrink storage, remove finalizers or delete a replacement object. The storage target remains locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
+
+// recoveryGuidance is the startup guidance for an operation whose durable
+// outcome is unknown. A restart never resumes or replays any action. The typed
+// storage actions get guidance that names the object and possible effects.
+func recoveryGuidance(action string) string {
+	if action == pvDeleteKind || action == pvcDeleteKind {
+		return "Application restarted before a durable outcome. A storage deletion may already have been accepted. Inspect the exact PersistentVolume or PersistentVolumeClaim UID, any replacement object, its references and finalizers; no action was replayed and nothing will be resumed automatically."
+	}
+	if action == pvEditKind || action == pvcEditKind {
+		return "Application restarted before a durable outcome; no action was replayed and nothing will be resumed automatically. " + storageEditReviewGuidance
+	}
+	return "Application restarted before a durable outcome. Inspect actual cluster state; no action was replayed."
+}
+
 // reviewGuidance returns the uncertain-outcome guidance for an action kind.
-// Every action except the destructive Profile deletion keeps the generic
-// wording unchanged.
+// Profile deletion and the restricted storage actions have typed guidance;
+// existing unrelated actions keep the generic wording unchanged.
 func reviewGuidance(action string) string {
-	if action == profileDeleteKind {
+	switch action {
+	case profileDeleteKind:
 		return profileDeleteReviewGuidance
+	case pvDeleteKind, pvcDeleteKind:
+		return storageDeleteReviewGuidance
+	case pvEditKind, pvcEditKind:
+		return storageEditReviewGuidance
 	}
 	return genericReviewGuidance
 }

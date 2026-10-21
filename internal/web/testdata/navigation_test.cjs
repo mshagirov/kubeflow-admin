@@ -73,6 +73,10 @@ assert.ok(html.includes('<meta name="node-cordon" content="{{.Config.Features.No
 assert.ok(app.includes("nodeCordonFeature") && app.includes('meta("node-cordon")'));
 assert.ok(html.includes('<meta name="csrf-token" content="{{.Identity.CSRF}}">'));
 assert.ok(html.includes('<meta name="profile-deletion" content="{{.Config.Features.ProfileDeletion}}">'), "the profile deletion capability is projected to the browser as a feature meta");
+assert.ok(html.includes('<meta name="storage-editing" content="{{.Config.Features.StorageEditing}}">'), "the storage editing capability is projected to the browser");
+assert.ok(html.includes('<meta name="storage-deletion" content="{{.Config.Features.StorageDeletion}}">'), "the storage deletion capability is projected to the browser");
+assert.ok(html.includes('id="notebook-page-manage"') && html.includes('id="notebook-page-policy"'), "the Notebook page action and its visible policy hint exist");
+assert.ok(app.includes("notebookManagementReason") && app.includes("notebooks.controllerContractConfirmed is false") && app.includes("features.writesEnabled is false"), "the Notebook policy reason names the exact configuration gates");
 assert.ok(html.includes("{{if .Identity.DisplayName}}"));
 assert.ok(html.includes('action="/auth/logout" method="post"'));
 assert.ok(html.includes('name="csrf"'));
@@ -110,12 +114,15 @@ assert.ok(app.includes("historyCache[tab].rows") && app.includes("logic.parseTar
 
 // Accessible management drawers for Profile, Storage, Notebook and Pod restart,
 // including the scoped Profile summary modal.
-for (const drawer of ["profile-drawer", "storage-drawer", "notebook-drawer", "profile-summary-drawer", "pod-restart-drawer", "namespace-summary-drawer", "node-cordon-drawer", "resource-details-drawer"]) {
+for (const drawer of ["profile-drawer", "storage-drawer", "notebook-drawer", "profile-summary-drawer", "pod-restart-drawer", "namespace-summary-drawer", "node-cordon-drawer", "resource-details-drawer", "storage-edit-drawer", "storage-delete-drawer"]) {
   assert.ok(html.includes(`id="${drawer}"`), `missing ${drawer}`);
 }
-assert.equal((html.match(/aria-modal="true"/g) || []).length >= 8, true);
+assert.equal((html.match(/aria-modal="true"/g) || []).length >= 10, true);
 assert.ok(html.includes('id="resource-details-body"') && html.includes('aria-labelledby="resource-details-title"'), "the observed resource details drawer is a labelled modal dialog");
 assert.ok(app.includes("openResourceDetails") && app.includes("detailEntries"), "observed resource details open the right-side drawer");
+assert.ok(app.includes("nodePodScopedView") && app.includes("logic.runningPodsOnNode") && app.includes("logic.podNodeHref"), "Node details derive their scoped Running Pod count and exact Pods link from the shared helpers");
+assert.ok(app.includes('el("h3", "Scoped view")') && app.includes('el("h3", "Observed details")'), "the Node scoped view is a distinct section above the raw observed details");
+assert.ok(app.includes("syncPodFilterChips") && app.includes("data-pod-filters") && app.includes("podNodeLink"), "the Pods page exposes URL-backed node filters and a visible chip");
 assert.ok(app.includes('(resource?.kind || "") === "Profile"') && app.includes('openProfileSummary(resource.name || "", opener)'), "generic Profile details always hand over to the consolidated summary");
 assert.ok(app.includes("logic.notebookResources(scoped)") && app.includes("nameDetailsKinds"), "Notebook rows are Notebook CRs only and names open resource details");
 assert.equal(app.includes("detailsNode"), false, "resource details never use an inline disclosure");
@@ -144,6 +151,16 @@ assert.ok(app.includes("profileNameValidation") && app.includes("profileFormValu
 assert.ok(app.includes("profile-use-suggestion") && app.includes("aria-describedby"), "the name suggestion is explicit and accessible");
 for (const kind of ["profile", "storage", "notebook"]) assert.ok(html.includes(`data-open-drawer="${kind}"`));
 assert.ok(html.includes('id="profile-form"') && html.includes('id="storage-form"') && html.includes('id="notebook-form"') && html.includes('id="pod-restart-form"') && html.includes('id="node-cordon-form"'));
+assert.ok(html.includes('id="storage-edit-form"') && html.includes('id="storage-delete-form"'), "storage edit and deletion have their own plan forms");
+assert.ok(html.includes('name="storageYAML"') && html.includes('maxlength="32768"') && html.includes('id="storage-edit-target-uid"') && html.includes('id="storage-edit-target-rv"'), "the storage editor is bounded and carries read-only target identity");
+assert.ok(html.includes("restricted server projection, not the full manifest") && html.includes("metadata.uid and metadata.resourceVersion are read-only targets"), "the storage editor explains the partial projection and read-only identity");
+assert.ok(html.includes("The API treats an edit reason as optional"), "the editor requires a reason for audit without claiming the API does");
+assert.ok(html.includes("The server-provided warnings above are authoritative for metadata.labels"), "label semantics are delegated to the server projection warnings");
+assert.ok(html.includes('id="storage-delete-ack"') && html.includes("never a security gate"), "deletion has a client-only acknowledgement that is not a security gate");
+assert.equal(html.includes("finalizer cleanup") || html.includes("Force finalizer"), false, "storage deletion offers no forced finalizer cleanup");
+assert.ok(app.includes("storageEditingFeature") && app.includes("storageDeletionFeature") && app.includes('meta("storage-editing")') && app.includes('meta("storage-deletion")'), "the browser gates storage actions on the two server capabilities");
+assert.ok(app.includes("storageDocumentQuery") && app.includes("storage-document?kind="), "the browser reads the protected server projection");
+assert.ok(app.includes("loadStorageDocument") && app.includes("storageDocumentFailure") && app.includes("storageEpoch"), "storage document reads are epoch guarded");
 assert.ok(html.includes("notebook-preserve-hint") && html.includes("Blank resource and image fields preserve") && html.includes("PVC mounts are kept unless Replace is selected") && html.includes("validated plan’s before/after changes"), "Notebook management states that blanks preserve current configuration and mounts stay unless replaced");
 assert.ok(html.includes('name="kind" value="pod.restart"'));
 assert.ok(html.includes('name="kind" value="node.cordon"'));
@@ -352,15 +369,16 @@ async function bootHarness(options = {}) {
   });
   const sections = ["overview", "profiles", "namespaces", "storage", "notebooks", "pods", "nodes", "history"].map(id => { const section = new Element("section"); section.id = id; return section; });
   const tabs = ["operations", "audit"].map(tab => { const button = new Element("button"); button.dataset.historyTab = tab; return button; });
-  const drawers = ["profile", "storage", "notebook", "profile-summary", "pod-restart", "namespace-summary", "node-cordon", "resource-details", "profile-delete"].map(kind => { const drawer = get("#" + kind + "-drawer"); drawer.id = kind + "-drawer"; drawer.hidden = true; return drawer; });
+  const drawers = ["profile", "storage", "notebook", "profile-summary", "pod-restart", "namespace-summary", "node-cordon", "resource-details", "profile-delete", "storage-edit", "storage-delete"].map(kind => { const drawer = get("#" + kind + "-drawer"); drawer.id = kind + "-drawer"; drawer.hidden = true; return drawer; });
   // The body of a summary drawer lives inside its drawer, exactly as in the
   // document. A closed drawer therefore hides its controls with it.
   for (const kind of ["profile-summary", "namespace-summary", "resource-details"]) get("#" + kind + "-drawer").append(get("#" + kind + "-body"));
   const sharedError = new Element("p"); sharedError.className = "form-error"; sharedError.hidden = true;
   const sharedSubmit = new Element("button"); sharedSubmit.type = "submit"; sharedSubmit.textContent = "Prepare plan";
-  const forms = ["profile-form", "storage-form", "notebook-form", "pod-restart-form", "profile-delete-form"].map(id => {
+  const forms = ["profile-form", "storage-form", "notebook-form", "pod-restart-form", "profile-delete-form", "storage-edit-form", "storage-delete-form"].map(id => {
     const form = new Element("form"); form.id = id; form.append(sharedError, sharedSubmit); return form;
   });
+  for (const form of forms) nodes.set("#" + form.id, form);
   // The forms carry the controls a real browser would submit, so a payload can
   // be asserted end to end.
   const control = (name, value = "", type = "text") => { const input = new Element(type === "select" ? "select" : "input"); input.name = name; input.value = value; input.type = type; return input; };
@@ -436,6 +454,41 @@ async function bootHarness(options = {}) {
   forms[3].controls = [control("kind", "pod.restart"), control("namespace", "team-a"), control("name", "work-0"), control("reason", "Synthetic retry reason")];
   const nodeCordonForm = get("#node-cordon-form");
   nodeCordonForm.elements = { kind: new Element("input"), name: new Element("input"), reason: new Element("input"), force: new Element("input") };
+  // Storage YAML edit and deletion forms. The independent data-loss
+  // acknowledgement has no name, exactly like the real browser form: it is
+  // never submitted as an action field.
+  const storageEditSubmit = new Element("button"); storageEditSubmit.type = "submit"; storageEditSubmit.textContent = "Prepare edit plan";
+  const storageDeleteSubmit = new Element("button"); storageDeleteSubmit.type = "submit"; storageDeleteSubmit.textContent = "Prepare deletion plan";
+  nodes.set("#storage-edit-submit", storageEditSubmit);
+  nodes.set("#storage-delete-submit", storageDeleteSubmit);
+  for (const form of [forms[5], forms[6]]) form.children = form.children.filter(node => node !== sharedSubmit);
+  forms[5].append(storageEditSubmit); forms[6].append(storageDeleteSubmit);
+  const storageEditControls = {
+    kind: get("#storage-edit-kind"), name: get("#storage-edit-name"), namespace: get("#storage-edit-namespace"),
+    targetUID: get("#storage-edit-target-uid"), targetResourceVersion: get("#storage-edit-target-rv"),
+    storageYAML: get("#storage-edit-yaml"), reason: get("#storage-edit-reason")
+  };
+  for (const [name, controlNode] of Object.entries(storageEditControls)) {
+    controlNode.name = name;
+    if (name === "storageYAML") controlNode.tagName = "TEXTAREA";
+    if (name.startsWith("target") || name === "kind" || name === "name" || name === "namespace") controlNode.type = "hidden";
+    if (!controlNode.value) controlNode.value = "";
+  }
+  forms[5].controls = Object.values(storageEditControls);
+  const storageDeleteControls = {
+    kind: get("#storage-delete-kind"), name: get("#storage-delete-name"), namespace: get("#storage-delete-namespace"),
+    targetUID: get("#storage-delete-target-uid"), targetResourceVersion: get("#storage-delete-target-rv"),
+    reason: get("#storage-delete-reason"), confirmName: get("#storage-delete-confirm")
+  };
+  for (const [name, controlNode] of Object.entries(storageDeleteControls)) {
+    controlNode.name = name;
+    if (name.startsWith("target") || name === "kind" || name === "name" || name === "namespace") controlNode.type = "hidden";
+    if (!controlNode.value) controlNode.value = "";
+  }
+  const storageDeleteAck = get("#storage-delete-ack"); storageDeleteAck.type = "checkbox"; storageDeleteAck.checked = false;
+  forms[6].controls = [...Object.values(storageDeleteControls), storageDeleteAck];
+  get("#storage-edit-drawer").append(forms[5]);
+  get("#storage-delete-drawer").append(forms[6]);
   const openers = ["profile", "storage", "notebook"].map(kind => { const button = new Element("button"); button.dataset.openDrawer = kind; return button; });
   const closers = [new Element("button")];
   const labels = ["pvc.create pvc.expand pv.nfs.create pv.reserve", "pvc.create pv.nfs.create pv.reserve", "pv.reserve", "pv.nfs.create", "pv.nfs.create"].map(value => { const label = new Element("label"); label.dataset.storage = value; return label; });
@@ -480,12 +533,15 @@ async function bootHarness(options = {}) {
   };
   const notebookWrites = options.notebookWrites !== false, podRestarts = options.podRestarts !== false, nodeCordon = options.nodeCordon !== false;
   const profileDeletion = options.profileDeletion !== false;
-  for (const name of ["csrf-token", "notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "node-cordon", "profile-deletion", "notification-scope"]) {
+  const storageEditing = options.storageEditing !== false, storageDeletion = options.storageDeletion !== false;
+  for (const name of ["csrf-token", "notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "node-cordon", "profile-deletion", "storage-editing", "storage-deletion", "notification-scope"]) {
     get(`meta[name="${name}"]`).content = name === "csrf-token" ? "test-csrf"
       : name === "notebook-writes" ? String(notebookWrites)
       : name === "pod-restarts" ? String(podRestarts)
       : name === "node-cordon" ? String(nodeCordon)
       : name === "profile-deletion" ? String(profileDeletion)
+      : name === "storage-editing" ? String(storageEditing)
+      : name === "storage-deletion" ? String(storageDeletion)
       : name === "notification-scope" ? "random-test-scope" : "false";
   }
   get("#storage-kind").value = "pvc.create"; get("#notebook-kind").value = "notebook.start"; get("#profile-kind").value = "profile.create";
@@ -523,9 +579,9 @@ async function bootHarness(options = {}) {
       { kind: "Pod", name: "legacy-0", namespace: "team", uid: "uid-pod-team-legacy-0", state: "Running", owner: "Deployment/legacy", details: { node: "node-1", ready: "true", containers: "1/1 ready", restarts: "0" } },
       // The same Pod name in another namespace is a different Pod.
       { kind: "Pod", name: "work-0", namespace: "other", uid: "uid-pod-other-work-0", state: "Running", owner: "StatefulSet/work", details: { node: "node-2", ready: "true", containers: "1/1 ready", restarts: "0" } },
-      { kind: "PersistentVolumeClaim", name: "data", namespace: "team", uid: "uid-pvc-team-data", state: "Bound", details: { requested: "10Gi", capacity: "10Gi", storageClass: "team-class" } },
+      { kind: "PersistentVolumeClaim", name: "data", namespace: "team", uid: "uid-pvc-team-data", state: "Bound", details: { requested: "10Gi", capacity: "10Gi", storageClass: "team-class", volume: "data" } },
       // A volume and a storage class that share the name of the claim.
-      { kind: "PersistentVolume", name: "data", uid: "uid-pv-data", state: "Bound", details: { requested: "10Gi", capacity: "10Gi", storageClass: "team-class", claim: "team/data" } },
+      { kind: "PersistentVolume", name: "data", uid: "uid-pv-data", state: "Bound", details: { requested: "10Gi", capacity: "10Gi", storageClass: "team-class", claim: "team/data", reclaimPolicy: "Retain" } },
       { kind: "StorageClass", name: "data", uid: "uid-sc-data", details: { provisioner: "example.test/nfs" } },
       { kind: "StorageClass", name: "team-class", uid: "uid-sc-team-class" },
       { kind: "Event", name: "scheduled", namespace: "team", uid: "uid-event-scheduled", state: "Warning" },
@@ -539,6 +595,8 @@ async function bootHarness(options = {}) {
   };
   let plansFailures = options.plansFailures || 0;
   let resolveInventory = null;
+  const pendingStorageDocuments = [];
+  const pendingPlans = [];
   const operationsRows = options.operations || [{ id: "operation-race", actor: "https://issuer.example|subject", actorDisplay: "Test Admin", target: "notebook:team/work", action: "notebook.stop", state: "succeeded", step: "observed", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }];
   const auditRows = options.audit || [
     { id: "audit-q", operationID: "operation-race", actor: "https://issuer.example|subject", actorDisplay: "Test Admin", target: "notebook:team/work", action: "notebook.stop", result: "queued", reason: "Synthetic reason text", time: "2026-01-01T00:00:00Z" },
@@ -560,7 +618,34 @@ async function bootHarness(options = {}) {
       if (options.deferInventory) await new Promise(resolve => { resolveInventory = resolve; });
       return response(inventory);
     }
+    if (url.includes("/storage-document")) {
+      const parsed = new URL(url, "https://admin.example.invalid");
+      const kind = parsed.searchParams.get("kind") || "";
+      const namespace = parsed.searchParams.get("namespace") || "";
+      const name = parsed.searchParams.get("name") || "";
+      if (options.deferStorageDocument) await new Promise(resolve => pendingStorageDocuments.push(resolve));
+      if (options.storageDocumentError) return response({ error: { code: "service_unavailable", message: "Synthetic storage document unavailable." } }, false, 503);
+      const resource = inventory.resources.find(candidate =>
+        (candidate.kind || "") === kind && (candidate.namespace || "") === namespace && (candidate.name || "") === name);
+      if (!resource) return response({ error: { code: "not_found", message: "Synthetic storage resource not observed." } }, false, 404);
+      const synthetic = (() => {
+        const namespaceLine = namespace ? `  namespace: ${namespace}\n` : "";
+        const spec = kind === "PersistentVolume"
+          ? `spec:\n  persistentVolumeReclaimPolicy: ${resource.details?.reclaimPolicy || "Retain"}\n`
+          : `spec:\n  resources:\n    requests:\n      storage: ${resource.details?.requested || resource.details?.capacity || "1Gi"}\n`;
+        return {
+          kind, namespace: namespace || undefined, name, uid: resource.uid, resourceVersion: "41",
+          yaml: `apiVersion: v1\nkind: ${kind}\nmetadata:\n  name: ${name}\n${namespaceLine}  uid: ${resource.uid}\n  resourceVersion: "41"\n${spec}`,
+          warnings: ["Synthetic restricted projection; no full manifest is exposed.", "metadata.labels follows the server projection and these warnings are authoritative."]
+        };
+      })();
+      return response(typeof options.storageDocument === "function" ? options.storageDocument({ kind, namespace, name, resource, synthetic, resources: inventory.resources }) : synthetic);
+    }
     if (url.endsWith("/plans")) {
+      if (options.deferPlans) {
+        const outcome = await new Promise(resolve => pendingPlans.push(resolve));
+        if (outcome?.fail) return response({ error: { code: "validation_failed", message: "Synthetic stale plan rejected for test.", retryable: false } }, false, 422);
+      }
       if (plansFailures > 0) {
         plansFailures--;
         return response({ error: { code: "validation_failed", message: "Synthetic plan rejected for test.", retryable: false } }, false, 422);
@@ -620,7 +705,17 @@ async function bootHarness(options = {}) {
       for (const handler of forms[index].listeners.submit || []) await handler({ preventDefault() {} });
       await settle();
     },
+    beginSubmitForm(index) {
+      for (const handler of forms[index].listeners.submit || []) {
+        const pending = handler({ preventDefault() {} });
+        if (pending && typeof pending.catch === "function") pending.catch(() => {});
+      }
+    },
     resolveInventory() { if (resolveInventory) { const resolve = resolveInventory; resolveInventory = null; resolve(); } },
+    resolveStorageDocument() { const resolve = pendingStorageDocuments.shift(); if (resolve) resolve(); },
+    pendingStorageDocuments,
+    resolvePlan(fail = false) { const resolve = pendingPlans.shift(); if (resolve) resolve({ fail }); },
+    pendingPlans,
     setHidden(hidden) {
       document.hidden = hidden;
       if (!hidden) for (const handler of handlers.visibilitychange || []) handler();
@@ -930,17 +1025,26 @@ async function bootHarness(options = {}) {
 
   // ---- Observed resource details drawer -------------------------------------
   // Names open the right-side modal drawer with the same inert, focus and
-  // Escape behaviour. Profiles, Notebooks, Pods and Nodes no longer carry a
+  // Escape behaviour. Profiles, Notebooks, Pods, Nodes and Storage do not carry a
   // separate inline Details column or button.
   const detailsTest = await bootHarness({});
-  for (const table of ["profiles", "pods", "nodes", "notebooks"]) {
+  for (const table of ["profiles", "pods", "nodes", "notebooks", "storage"]) {
     await detailsTest.click(table);
     const container = detailsTest.get(`[data-table="${table}"]`);
     assert.equal(detailsTest.walk(container, node => node.tagName === "DETAILS").length, 0, `${table} no longer uses an inline details disclosure`);
     assert.equal(detailsTest.walk(container, node => node.tagName === "BUTTON" && node.textContent === "Details").length, 0, `${table} removes the separate Details control`);
   }
   await detailsTest.click("storage");
-  assert.ok(detailsTest.walk(detailsTest.get('[data-table="storage"]'), node => node.tagName === "BUTTON" && node.textContent === "Details").length > 0, "storage keeps its existing details control");
+  for (const kind of ["PersistentVolume", "PersistentVolumeClaim"]) {
+    const name = detailsTest.walk(detailsTest.get('[data-table="storage"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === `Details for ${kind} data`)[0];
+    assert.ok(name && name.textContent === "data", `${kind} name is the details handle`);
+    name.click();
+    assert.equal(detailsTest.get("#resource-details-drawer").hidden, false, `${kind} name opens the resource details`);
+    assert.equal(name.dataset.resourceKey, [kind, kind === "PersistentVolumeClaim" ? "team" : "", "data"].join("|"), `${kind} name keeps the exact resource identity`);
+    assert.ok(detailsTest.textOf(detailsTest.get("#resource-details-body")).includes(kind), `${kind} details identify the selected kind`);
+    detailsTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+    assert.equal(detailsTest.activeElement, name, `${kind} drawer returns focus to its name`);
+  }
   await detailsTest.click("nodes");
   const nodeName = detailsTest.walk(detailsTest.get('[data-table="nodes"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Node node-1")[0];
   assert.ok(nodeName && nodeName.textContent === "node-1", "the Node name opens its resource details");
@@ -1012,6 +1116,126 @@ async function bootHarness(options = {}) {
   assert.equal(goneText.includes("latest inventory observation"), false, "a stale body never claims to be the latest observation");
   assert.ok(goneTest.textOf(goneTest.get("#notifications")).includes("no longer present"), "the missing resource is also reported as a notice");
 
+  // ---- Node scoped Running Pods ---------------------------------------------
+  // The Node details drawer counts only observed Pod resources on the exact
+  // node in the canonical Running phase, across every namespace. The count and
+  // the destination use the same typed filters.
+  const nodePodsResources = [
+    { kind: "Node", name: "node-a", uid: "uid-node-a", state: "Ready", details: { roles: "worker", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.1", externalIP: "", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd", unschedulable: "false", controlPlane: "false" } },
+    { kind: "Node", name: "node-a-extra", uid: "uid-node-a-extra", state: "Ready", details: { roles: "worker", version: "v1.31.1", internalIP: "10.0.0.2", unschedulable: "false", controlPlane: "false" } },
+    { kind: "Node", name: "node-b", uid: "uid-node-b", state: "Ready", details: { roles: "worker", version: "v1.31.1", internalIP: "10.0.0.3", unschedulable: "false", controlPlane: "false" } },
+    { kind: "Node", name: "node-zero", uid: "uid-node-zero", state: "Ready", details: { roles: "worker", version: "v1.31.1", internalIP: "10.0.0.4", unschedulable: "false", controlPlane: "false" } },
+    { kind: "Node", name: 'node-<img src=x>', uid: "uid-node-malicious", state: "Ready", details: { roles: "worker", version: "v1.31.1", internalIP: "10.0.0.5", unschedulable: "false", controlPlane: "false" } },
+    { kind: "Pod", name: "alpha-running", namespace: "alpha", uid: "uid-pod-alpha-running", state: "Running", owner: "Deployment/alpha", details: { node: "node-a", ready: "true", containers: "1/1 ready", restarts: "0" } },
+    { kind: "Pod", name: "beta-running", namespace: "beta", uid: "uid-pod-beta-running", state: "Running", owner: "StatefulSet/beta", details: { node: "node-a", ready: "true", containers: "1/1 ready", restarts: "0" } },
+    { kind: "Pod", name: "alpha-pending", namespace: "alpha", uid: "uid-pod-alpha-pending", state: "Pending", owner: "Deployment/alpha", details: { node: "node-a", ready: "false", containers: "0/1 ready", restarts: "0" } },
+    { kind: "Pod", name: "b-running", namespace: "alpha", uid: "uid-pod-b-running", state: "Running", owner: "Deployment/b", details: { node: "node-b", ready: "true", containers: "1/1 ready", restarts: "0" } },
+    { kind: "Pod", name: "prefix-running", namespace: "alpha", uid: "uid-pod-prefix-running", state: "Running", owner: "Deployment/prefix", details: { node: "node-a-extra", ready: "true", containers: "1/1 ready", restarts: "0" } },
+    { kind: "Pod", name: "missing-node-running", namespace: "alpha", uid: "uid-pod-missing-node", state: "Running", owner: "Deployment/missing", details: { ready: "true", containers: "1/1 ready", restarts: "0" } },
+    { kind: "Pod", name: "unknown-node-running", namespace: "alpha", uid: "uid-pod-unknown-node", state: "Running", owner: "Deployment/unknown", details: { node: "node-unknown", ready: "true", containers: "1/1 ready", restarts: "0" } },
+    { kind: "Pod", name: "malicious-running", namespace: "alpha", uid: "uid-pod-malicious", state: "Running", owner: "Deployment/malicious", details: { node: 'node-<img src=x>', ready: "true", containers: "1/1 ready", restarts: "0" } },
+    { kind: "Notebook", name: "alpha-running", namespace: "alpha", uid: "uid-notebook-alpha-running", state: "Running", details: { node: "node-a" } },
+    { kind: "StatefulSet", name: "beta-running", namespace: "beta", uid: "uid-sts-beta-running", state: "Running", details: { node: "node-a" } }
+  ];
+  const nodeScopeTest = await bootHarness({ resources: nodePodsResources });
+  await nodeScopeTest.click("nodes");
+  const nodeScopeTable = nodeScopeTest.get('[data-table="nodes"]');
+  const nodeAScopeButton = nodeScopeTest.walk(nodeScopeTable, node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Node node-a")[0];
+  assert.ok(nodeAScopeButton, "the exact Node name opens its resource details");
+  nodeAScopeButton.click();
+  const nodeScopeBody = nodeScopeTest.get("#resource-details-body");
+  const nodeScopeHeadings = nodeScopeTest.walk(nodeScopeBody, node => node.tagName === "H3").map(node => nodeScopeTest.textOf(node).trim());
+  assert.deepEqual(nodeScopeHeadings.slice(0, 2), ["Scoped view", "Observed details"], "the scoped view sits directly above the observed details");
+  const nodeScopeSection = nodeScopeTest.walk(nodeScopeBody, node => node.dataset.nodePodScope === "1")[0];
+  assert.ok(nodeScopeSection, "the Node details expose a scoped view section");
+  const nodeScopeCount = nodeScopeTest.walk(nodeScopeSection, node => node.tagName === "STRONG")[0];
+  assert.equal(nodeScopeTest.textOf(nodeScopeCount).trim(), "2", "only the two exact Running Pods on node-a are counted");
+  const nodeScopeLink = nodeScopeTest.walk(nodeScopeSection, node => node.tagName === "A" && node.dataset.podNodeLink === "1")[0];
+  assert.ok(nodeScopeLink, "the scoped count is an actionable link");
+  assert.equal(nodeScopeLink.href, "/pods?node=node-a&phase=Running", "the link carries exactly the node and canonical Running filters");
+  assert.equal(nodeScopeLink.dataset.scopedLink, "1", "the scoped Node link uses the drawer handoff");
+  assert.ok(nodeScopeTest.textOf(nodeScopeLink).includes("2") && nodeScopeTest.textOf(nodeScopeLink).includes("Running Pods"), "the link displays the observed count and Running semantics");
+  for (const handler of nodeScopeTest.handlers.click || []) handler({ target: nodeScopeLink, defaultPrevented: false, button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, preventDefault() {} });
+  await nodeScopeTest.settle();
+  assert.equal(nodeScopeTest.location.pathname, "/pods", "the Node scoped link opens the Pods page");
+  assert.equal(nodeScopeTest.location.search, "?node=node-a&phase=Running", "the URL persists only the exact node and Running filters");
+  assert.equal(nodeScopeTest.get("#resource-details-drawer").hidden, true, "the Node details drawer is closed by the handoff");
+  assert.equal(nodeScopeTest.activeElement, nodeScopeTest.get("#page-title"), "the handoff focuses the visible Pods page heading, not a control in the closed drawer");
+  const nodeScopePods = nodeScopeTest.get('[data-table="pods"]');
+  assert.equal(nodeScopeTest.walk(nodeScopePods, node => node.tagName === "TR").length, 3, "the Pods page shows exactly the two Running Pods on node-a");
+  const nodeScopePodsText = nodeScopeTest.textOf(nodeScopePods);
+  assert.ok(nodeScopePodsText.includes("alpha-running") && nodeScopePodsText.includes("beta-running"), "both Running Pods on node-a are shown across namespaces");
+  for (const absent of ["alpha-pending", "b-running", "prefix-running", "missing-node-running", "unknown-node-running"]) {
+    assert.equal(nodeScopePodsText.includes(absent), false, absent + " never leaks into the node-scoped Running view");
+  }
+  assert.equal(nodeScopeTest.walk(nodeScopePods, node => node.tagName === "TR").length, 3, "Notebook and StatefulSet resources with colliding names are not duplicate Pod rows");
+  const nodeScopeSearch = nodeScopePods.querySelector("[data-search]");
+  assert.equal(nodeScopeSearch.value, "", "the handoff clears an unrelated Pods search");
+  const nodeScopeChip = nodeScopePods.querySelector("[data-pod-filters]");
+  assert.ok(nodeScopeChip && !nodeScopeChip.hidden, "the active node filter is visible as a chip");
+  assert.ok(nodeScopeTest.textOf(nodeScopeChip).includes("Node") && nodeScopeTest.textOf(nodeScopeChip).includes("node-a") && nodeScopeTest.textOf(nodeScopeChip).includes("Running"), "the visible chip names the node and Running state");
+  const nodeScopeClear = nodeScopePods.querySelector("[data-clear-filters]");
+  assert.equal(nodeScopeClear.disabled, false, "the URL-backed node filter makes Clear filters actionable");
+  nodeScopeClear.listeners.click[0]();
+  await nodeScopeTest.settle();
+  assert.equal(nodeScopeTest.location.search, "", "Clear filters removes the node and state filters from the URL");
+  assert.equal(nodeScopeChip.hidden, true, "Clear filters hides the visible node chip");
+  assert.ok(nodeScopeTest.textOf(nodeScopePods).includes("alpha-pending") && nodeScopeTest.textOf(nodeScopePods).includes("b-running"), "Clear filters restores all Pods");
+  await nodeScopeTest.popstate("/pods?node=node-a&phase=Running");
+  assert.equal(nodeScopeTest.walk(nodeScopePods, node => node.tagName === "TR").length, 3, "browser history restores the filtered rows");
+  assert.equal(nodeScopeChip.hidden, false, "browser history restores the visible node chip");
+  assert.equal(nodeScopeChip.attributes["aria-label"], "Active Pod filters", "the visible node filters have their own accessible group label");
+  await nodeScopeTest.popstate("/pods");
+  assert.equal(nodeScopeChip.hidden, true, "browser history removes the node chip when the URL has no node filter");
+  assert.ok(nodeScopeTest.textOf(nodeScopePods).includes("b-running"), "browser history restores the unfiltered Pods view");
+
+  // A sidebar navigation never inherits a URL-backed node filter.
+  const sidebarNodeFilterTest = await bootHarness({ path: "pods?node=node-a&phase=Running", resources: nodePodsResources });
+  await sidebarNodeFilterTest.settle();
+  assert.equal(sidebarNodeFilterTest.walk(sidebarNodeFilterTest.get('[data-table="pods"]'), node => node.tagName === "TR").length, 3, "the direct URL starts from the filtered view");
+  await sidebarNodeFilterTest.click("nodes");
+  await sidebarNodeFilterTest.click("pods");
+  assert.equal(sidebarNodeFilterTest.location.search, "", "the sidebar Pods link carries no hidden node filter");
+  const sidebarNodePods = sidebarNodeFilterTest.get('[data-table="pods"]');
+  assert.equal(sidebarNodePods.querySelector("[data-pod-filters]").hidden, true, "the sidebar Pods view has no stale node chip");
+  assert.ok(sidebarNodeFilterTest.textOf(sidebarNodePods).includes("b-running"), "the sidebar restores the unfiltered Pods table");
+
+  // A genuine zero count still offers a valid link to an empty filtered view.
+  const zeroNodeTest = await bootHarness({ path: "nodes", resources: nodePodsResources });
+  await zeroNodeTest.settle();
+  const zeroNodeName = zeroNodeTest.walk(zeroNodeTest.get('[data-table="nodes"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Node node-zero")[0];
+  zeroNodeName.click();
+  const zeroLink = zeroNodeTest.walk(zeroNodeTest.get("#resource-details-body"), node => node.tagName === "A" && node.dataset.podNodeLink === "1")[0];
+  assert.ok(zeroLink, "a zero count remains a valid scoped link");
+  assert.ok(zeroNodeTest.textOf(zeroLink).includes("0"), "the zero count is visible and explicit");
+  for (const handler of zeroNodeTest.handlers.click || []) handler({ target: zeroLink, defaultPrevented: false, button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, preventDefault() {} });
+  await zeroNodeTest.settle();
+  assert.equal(zeroNodeTest.location.search, "?node=node-zero&phase=Running", "the zero view keeps the exact node and Running filters");
+  const zeroPods = zeroNodeTest.get('[data-table="pods"]');
+  assert.equal(zeroNodeTest.walk(zeroPods, node => node.tagName === "TR").length, 0, "the zero view has no stale Pod rows");
+  assert.ok(zeroNodeTest.textOf(zeroPods).includes("No observed Pods match node “node-zero” and Running state"), "the zero view explains the exact typed filters");
+  assert.equal(zeroPods.querySelector("[data-pod-filters]").hidden, false, "the zero view still shows its visible node filter chip");
+
+  // A hostile node name is rendered as text and encoded in the URL, never as
+  // markup, and the destination keeps the exact identity.
+  const nodeXssTest = await bootHarness({ path: "nodes", resources: nodePodsResources });
+  await nodeXssTest.settle();
+  const xssNodeButton = nodeXssTest.walk(nodeXssTest.get('[data-table="nodes"]'), node => node.tagName === "BUTTON" && node.attributes["aria-label"] === "Details for Node node-<img src=x>")[0];
+  assert.ok(xssNodeButton, "the unusual node name remains a details handle");
+  xssNodeButton.click();
+  const xssBody = nodeXssTest.get("#resource-details-body");
+  assert.equal(nodeXssTest.walk(xssBody, node => node.tagName === "IMG").length, 0, "the node name is never interpreted as markup");
+  assert.ok(nodeXssTest.textOf(xssBody).includes("node-<img src=x>"), "the hostile node name is shown as literal text");
+  const xssLink = nodeXssTest.walk(xssBody, node => node.tagName === "A" && node.dataset.podNodeLink === "1")[0];
+  assert.ok(xssLink && !xssLink.href.includes("<") && !xssLink.href.includes(">"), "the hostile node name is URL encoded in the destination");
+  assert.ok(xssLink.href.includes("%3Cimg+src%3Dx%3E"), "the encoded node identity is preserved exactly");
+  for (const handler of nodeXssTest.handlers.click || []) handler({ target: xssLink, defaultPrevented: false, button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, preventDefault() {} });
+  await nodeXssTest.settle();
+  const xssPods = nodeXssTest.get('[data-table="pods"]');
+  assert.equal(nodeXssTest.walk(xssPods, node => node.tagName === "TR").length, 2, "only the hostile node's Running Pod is shown");
+  assert.ok(nodeXssTest.textOf(xssPods).includes("malicious-running"), "the exact hostile node identity reaches the Pods filter");
+  assert.equal(nodeXssTest.walk(xssPods, node => node.tagName === "IMG").length, 0, "the Pods filter chip never injects the node name as markup");
+
   // ---- Notebooks are the Notebook custom resource only ----------------------
   const notebookTest = await bootHarness({});
   await notebookTest.click("notebooks");
@@ -1030,6 +1254,8 @@ async function bootHarness(options = {}) {
   const manageNotebook = notebookTest.walk(notebookTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0];
   assert.ok(manageNotebook, "the Notebook resource details offer Manage Notebook");
   assert.equal(manageNotebook.disabled, false, "Manage Notebook is enabled when writes and the controller contract are confirmed");
+  assert.equal(notebookTest.get("#notebook-page-manage").disabled, false, "the page-level Manage notebook control is enabled by the same gates");
+  assert.equal(notebookTest.get("#notebook-page-policy").hidden, true, "no policy hint is shown when both gates are on");
   manageNotebook.click();
   assert.equal(notebookTest.get("#notebook-drawer").hidden, false, "Manage Notebook opens the Notebook management drawer");
   assert.equal(notebookTest.get("#resource-details-drawer").hidden, true, "the resource details drawer hands over to Notebook management");
@@ -1050,6 +1276,13 @@ async function bootHarness(options = {}) {
   const contractManage = noNotebookContract.walk(noNotebookContract.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0];
   assert.ok(contractManage && contractManage.disabled, "Manage Notebook stays disabled without the confirmed controller contract");
   assert.ok(String(contractManage.title).includes("controller contract"), "the disabled action explains the contract gate");
+  const contractReason = noNotebookContract.textOf(noNotebookContract.get("#resource-details-body"));
+  assert.ok(contractReason.includes("notebooks.controllerContractConfirmed is false"), "the details drawer shows the exact missing contract gate");
+  assert.equal(noNotebookContract.get("#notebook-page-manage").disabled, true, "the page-level Manage notebook control is disabled by the same gate");
+  assert.ok(String(noNotebookContract.get("#notebook-page-manage").title).includes("notebooks.controllerContractConfirmed is false"), "the page-level control explains the exact missing contract gate");
+  assert.equal(noNotebookContract.get("#notebook-page-policy").hidden, false, "the page shows a visible policy hint");
+  assert.ok(noNotebookContract.get("#notebook-page-policy").textContent.includes("notebooks.controllerContractConfirmed is false"), "the visible page hint names the contract gate");
+  assert.equal(noNotebookContract.get("#notebook-page-policy").textContent.includes("features.writesEnabled is false"), false, "the contract-only gate does not claim writes are disabled");
   noNotebookContract.closers[0].listeners.click[0]();
   noNotebookContract.openers[2].listeners.click[0]();
   assert.equal(noNotebookContract.get("#notebook-drawer").hidden, true, "the page-level Notebook opener is defensively refused without the controller contract");
@@ -1059,9 +1292,17 @@ async function bootHarness(options = {}) {
   const writesManage = noWrites.walk(noWrites.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Manage Notebook")[0];
   assert.ok(writesManage && writesManage.disabled, "Manage Notebook stays disabled when writes are disabled by policy");
   assert.ok(String(writesManage.title).includes("disabled by server policy"), "the disabled action explains the write policy gate");
+  assert.ok(noWrites.textOf(noWrites.get("#resource-details-body")).includes("features.writesEnabled is false"), "the details drawer shows the exact missing write gate");
+  assert.equal(noWrites.get("#notebook-page-manage").disabled, true, "the page-level Manage notebook control is disabled when writes are off");
+  assert.ok(String(noWrites.get("#notebook-page-manage").title).includes("features.writesEnabled is false"), "the page-level control explains the write gate");
+  assert.equal(noWrites.get("#notebook-page-policy").hidden, false, "the page shows a visible write-policy hint");
+  assert.ok(noWrites.get("#notebook-page-policy").textContent.includes("features.writesEnabled is false"), "the visible page hint names the write gate");
   noWrites.closers[0].listeners.click[0]();
   noWrites.openers[2].listeners.click[0]();
   assert.equal(noWrites.get("#notebook-drawer").hidden, true, "the page-level Notebook opener is defensively refused when writes are disabled");
+  const noNotebookGates = await bootHarness({ writes: false, notebookWrites: false });
+  assert.equal(noNotebookGates.get("#notebook-page-manage").disabled, true, "both missing Notebook gates disable the page control");
+  assert.ok(noNotebookGates.get("#notebook-page-policy").textContent.includes("features.writesEnabled is false") && noNotebookGates.get("#notebook-page-policy").textContent.includes("notebooks.controllerContractConfirmed is false"), "the page hint names both missing gates");
 
   // A refresh that replaces the bound Notebook is reported and refused before
   // any request; the form is never retargeted to another Notebook.
@@ -1229,6 +1470,348 @@ async function bootHarness(options = {}) {
   volumeName.click();
   assert.equal(storageTest.get("#resource-details-drawer").hidden, false, "the volume name opens the resource details drawer");
   assert.ok(storageTest.textOf(storageTest.get("#resource-details-body")).includes("claim: team/data"), "the volume details keep their labels");
+
+  // ---- Storage YAML edit and unused deletion ------------------------------
+  // Only PersistentVolume and PersistentVolumeClaim details offer Edit and
+  // Delete. StorageClass keeps its observed details without either action.
+  const storageActionTest = await bootHarness({});
+  await storageActionTest.click("storage");
+  const storageActionTable = storageActionTest.get('[data-table="storage"]');
+  const storageName = (kind, namespace, name) => storageActionTest.walk(storageActionTable, node =>
+    node.tagName === "BUTTON" && node.dataset.resourceKey === [kind, namespace, name].join("|"))[0];
+  storageName("PersistentVolumeClaim", "team", "data").click();
+  assert.equal(storageActionTest.get("#resource-details-drawer").hidden, false);
+  const pvcActions = storageActionTest.walk(storageActionTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && ["Edit", "Delete"].includes(node.textContent));
+  assert.deepEqual(pvcActions.map(button => button.textContent).sort(), ["Delete", "Edit"], "PVC details offer exactly Edit and Delete");
+  assert.ok(pvcActions.every(button => !button.disabled), "storage actions are enabled when both opt-ins and writes are on");
+  storageActionTest.closers[0].listeners.click[0]();
+  storageName("PersistentVolume", "", "data").click();
+  const pvActions = storageActionTest.walk(storageActionTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && ["Edit", "Delete"].includes(node.textContent));
+  assert.deepEqual(pvActions.map(button => button.textContent).sort(), ["Delete", "Edit"], "PV details offer exactly Edit and Delete");
+  storageActionTest.closers[0].listeners.click[0]();
+  storageName("StorageClass", "", "data").click();
+  assert.equal(storageActionTest.walk(storageActionTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && ["Edit", "Delete"].includes(node.textContent)).length, 0, "StorageClass details never offer Edit or Delete");
+  storageActionTest.closers[0].listeners.click[0]();
+
+  // The YAML editor fetches the restricted projection before it can be
+  // submitted. It pre-fills the exact UID and resourceVersion, keeps the
+  // partial projection hint visible and never exposes backend-only fields.
+  const storageEditTest = await bootHarness({});
+  await storageEditTest.click("storage");
+  storageEditTest.walk(storageEditTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  const editControl = storageEditTest.walk(storageEditTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0];
+  assert.ok(editControl, "the claim details offer Edit");
+  editControl.click();
+  await storageEditTest.settle();
+  const editDrawer = storageEditTest.get("#storage-edit-drawer");
+  assert.equal(editDrawer.hidden, false, "Edit opens the storage-edit right drawer");
+  assert.ok(storageEditTest.textOf(storageEditTest.get("#storage-edit-target")).includes("PersistentVolumeClaim team/data"));
+  assert.ok(html.includes("restricted server projection, not the full manifest"), "the editor states that the projection is partial");
+  const storageYaml = storageEditTest.get("#storage-edit-yaml");
+  assert.equal(storageYaml.disabled, false, "the editor becomes usable only after the document settles");
+  assert.equal(storageEditTest.get("#storage-edit-target-uid").value, "uid-pvc-team-data", "the selected inventory UID is bound to the form");
+  assert.equal(storageEditTest.get("#storage-edit-target-rv").value, "41", "the fetched resourceVersion is bound to the form");
+  assert.equal(storageEditTest.get("#storage-edit-warnings").hidden, false, "server-provided projection warnings stay visible");
+  assert.ok(storageEditTest.textOf(storageEditTest.get("#storage-edit-warnings")).includes("metadata.labels follows the server projection"), "the server label hint is delegated to the projection warnings");
+  for (const text of ["kind: PersistentVolumeClaim", "namespace: team", "uid: uid-pvc-team-data", 'resourceVersion: "41"', "storage: 10Gi"]) {
+    assert.ok(String(storageYaml.value).includes(text), "the restricted projection is missing " + text);
+  }
+  for (const hidden of ["status:", "finalizers:", "annotations:", "managedFields:", "ownerReferences:", "claimRef:", "volumeName:", "backendSecret"]) {
+    assert.equal(String(storageYaml.value).includes(hidden), false, "the editor exposes a hidden backend field: " + hidden);
+  }
+  const storageTamperedBefore = storageEditTest.bodies.length;
+  storageEditTest.get("#storage-edit-target-uid").value = "uid-tampered";
+  await storageEditTest.submitForm(5);
+  assert.equal(storageEditTest.bodies.length, storageTamperedBefore, "a tampered target UID never reaches the API");
+  assert.ok(storageEditTest.error.textContent.includes("target UID or resourceVersion"), "the tampered target identity is explained");
+  storageEditTest.get("#storage-edit-target-uid").value = "uid-pvc-team-data";
+  storageYaml.value = String(storageYaml.value).replace("storage: 10Gi", "storage: 20Gi");
+  const noEditReasonBefore = storageEditTest.bodies.length;
+  await storageEditTest.submitForm(5);
+  assert.equal(storageEditTest.bodies.length, noEditReasonBefore, "the console's audit reason is required before a storage edit plan");
+  assert.ok(storageEditTest.error.textContent.includes("requires a reason"), "the missing audit reason is explained");
+  storageEditTest.get("#storage-edit-reason").value = "grow the workspace claim";
+  const editBefore = storageEditTest.bodies.length;
+  await storageEditTest.submitForm(5);
+  assert.equal(storageEditTest.bodies.length, editBefore + 1, "the edit prepares one typed plan");
+  const editBody = storageEditTest.bodies[storageEditTest.bodies.length - 1];
+  assert.equal(editBody.kind, "pvc.edit");
+  assert.equal(editBody.namespace, "team");
+  assert.equal(editBody.name, "data");
+  assert.equal(editBody.targetUID, "uid-pvc-team-data");
+  assert.equal(editBody.targetResourceVersion, "41");
+  assert.equal(editBody.reason, "grow the workspace claim");
+  assert.ok(editBody.storageYAML.includes("storage: 20Gi"), "the exact edited projection is submitted");
+  assert.equal(editBody.confirmName, undefined, "an edit carries no deletion confirmation");
+  assert.equal(editBody.force, undefined, "an edit carries no force flag");
+  assert.equal(editBody.dataLossAck, undefined, "the browser acknowledgement is never an action field");
+  // Closing the plan dialog restores the exact visible name control.
+  storageEditTest.get("#cancel-plan").listeners.click[0]();
+  assert.equal(storageEditTest.activeElement, storageEditTest.walk(storageEditTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0], "closing the edit workflow focuses the exact visible name control");
+
+  // A PV edit is cluster scoped and carries no namespace.
+  const pvEditTest = await bootHarness({});
+  await pvEditTest.click("storage");
+  pvEditTest.walk(pvEditTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolume||data" && node.tagName === "BUTTON")[0].click();
+  pvEditTest.walk(pvEditTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await pvEditTest.settle();
+  assert.ok(String(pvEditTest.get("#storage-edit-yaml").value).includes("kind: PersistentVolume"));
+  assert.ok(String(pvEditTest.get("#storage-edit-yaml").value).includes("persistentVolumeReclaimPolicy: Retain"));
+  pvEditTest.get("#storage-edit-reason").value = "review the volume policy";
+  await pvEditTest.submitForm(5);
+  const pvEditBody = pvEditTest.bodies[pvEditTest.bodies.length - 1];
+  assert.equal(pvEditBody.kind, "pv.edit");
+  assert.equal(pvEditBody.namespace, undefined, "a PersistentVolume plan carries no namespace");
+  assert.equal(pvEditBody.name, "data");
+  assert.equal(pvEditBody.targetUID, "uid-pv-data");
+
+  // Both opt-ins are visible but disabled with a clear policy reason.
+  const storageGatedTest = await bootHarness({ storageEditing: false, storageDeletion: false });
+  await storageGatedTest.click("storage");
+  storageGatedTest.walk(storageGatedTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  const gatedActions = storageGatedTest.walk(storageGatedTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && ["Edit", "Delete"].includes(node.textContent));
+  assert.equal(gatedActions.length, 2, "disabled storage actions stay visible");
+  assert.ok(gatedActions.every(button => button.disabled), "disabled storage actions are not actionable");
+  assert.ok(gatedActions.every(button => String(button.title).includes("features.storage")), "the disabled action explains the exact gate");
+  const gatedText = storageGatedTest.textOf(storageGatedTest.get("#resource-details-body"));
+  assert.ok(gatedText.includes("features.storageEditing is false") && gatedText.includes("features.storageDeletion is false"), "the policy reason is visible, not only a tooltip");
+  const readonlyStorageTest = await bootHarness({ writes: false });
+  await readonlyStorageTest.click("storage");
+  readonlyStorageTest.walk(readonlyStorageTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  const readonlyStorageActions = readonlyStorageTest.walk(readonlyStorageTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && ["Edit", "Delete"].includes(node.textContent));
+  assert.ok(readonlyStorageActions.every(button => button.disabled), "read-only policy disables both storage actions");
+  assert.ok(readonlyStorageTest.textOf(readonlyStorageTest.get("#resource-details-body")).includes("features.writesEnabled is false"), "read-only policy is explained visibly");
+
+  // A returned document whose UID does not match the selected observation is
+  // refused, and no stale form or plan is shown.
+  const storageMismatchTest = await bootHarness({ storageDocument: ({ synthetic }) => ({ ...synthetic, uid: "uid-somewhere-else" }) });
+  await storageMismatchTest.click("storage");
+  storageMismatchTest.walk(storageMismatchTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  storageMismatchTest.walk(storageMismatchTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageMismatchTest.settle();
+  assert.equal(storageMismatchTest.get("#storage-edit-yaml").disabled, true, "a mismatched document never enables the editor");
+  assert.ok(storageMismatchTest.error.textContent.includes("UID changed"), "the UID mismatch is explained");
+  const mismatchBefore = storageMismatchTest.bodies.length;
+  await storageMismatchTest.submitForm(5);
+  assert.equal(storageMismatchTest.bodies.length, mismatchBefore, "a mismatched document never reaches the API");
+
+  // A late document for a closed target is discarded: opening a fresh target
+  // performs its own full fetch and never inherits the old form.
+  const storageAsyncTest = await bootHarness({ deferStorageDocument: true });
+  await storageAsyncTest.click("storage");
+  storageAsyncTest.walk(storageAsyncTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  storageAsyncTest.walk(storageAsyncTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageAsyncTest.settle();
+  assert.equal(storageAsyncTest.pendingStorageDocuments.length, 1, "the first document read is pending");
+  const pendingBefore = storageAsyncTest.bodies.length;
+  await storageAsyncTest.submitForm(5);
+  assert.equal(storageAsyncTest.bodies.length, pendingBefore, "a plan is never prepared before the current document settles");
+  storageAsyncTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  storageAsyncTest.walk(storageAsyncTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolume||data" && node.tagName === "BUTTON")[0].click();
+  storageAsyncTest.walk(storageAsyncTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageAsyncTest.settle();
+  assert.equal(storageAsyncTest.pendingStorageDocuments.length, 2, "the fresh target performs its own document read");
+  storageAsyncTest.resolveStorageDocument();
+  await storageAsyncTest.settle();
+  assert.equal(storageAsyncTest.get("#storage-edit-yaml").disabled, true, "the stale PVC document is discarded");
+  storageAsyncTest.resolveStorageDocument();
+  await storageAsyncTest.settle();
+  assert.ok(String(storageAsyncTest.get("#storage-edit-yaml").value).includes("kind: PersistentVolume"), "the fresh target shows its own document");
+  assert.equal(String(storageAsyncTest.get("#storage-edit-yaml").value).includes("kind: PersistentVolumeClaim"), false, "the stale target's document never overwrites the fresh form");
+  assert.equal(storageAsyncTest.get("#storage-edit-target-uid").value, "uid-pv-data", "the fresh target binds its own UID");
+
+  // A replacement under the open editor is reported and refuses a plan. A
+  // fresh open after the replacement fetches the new UID instead of reusing
+  // the old form.
+  const storageReplaceTest = await bootHarness({});
+  await storageReplaceTest.click("storage");
+  storageReplaceTest.walk(storageReplaceTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  storageReplaceTest.walk(storageReplaceTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageReplaceTest.settle();
+  storageReplaceTest.get("#storage-edit-reason").value = "typed before replacement";
+  storageReplaceTest.setResources(storageReplaceTest.resources().map(resource =>
+    resource.kind === "PersistentVolumeClaim" && resource.name === "data" ? { ...resource, uid: "uid-pvc-team-data-replaced" } : resource));
+  storageReplaceTest.get("#refresh").listeners.click[0]();
+  await storageReplaceTest.settle();
+  assert.ok(storageReplaceTest.error.textContent.includes("replaced"), "a replaced target is reported in the open editor");
+  assert.equal(storageReplaceTest.get("#storage-edit-reason").value, "typed before replacement", "a refresh never rewrites the typed reason");
+  const storageReplacedBefore = storageReplaceTest.bodies.length;
+  await storageReplaceTest.submitForm(5);
+  assert.equal(storageReplaceTest.bodies.length, storageReplacedBefore, "a replaced target never reaches the API");
+  storageReplaceTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  storageReplaceTest.walk(storageReplaceTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  storageReplaceTest.walk(storageReplaceTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageReplaceTest.settle();
+  assert.equal(storageReplaceTest.get("#storage-edit-target-uid").value, "uid-pvc-team-data-replaced", "a fresh open fetches and binds the current UID");
+  assert.ok(String(storageReplaceTest.get("#storage-edit-yaml").value).includes("uid: uid-pvc-team-data-replaced"));
+
+  // A storage plan POST is epoch guarded and cannot be duplicated while it is
+  // in flight. A refresh must not re-enable the submit control.
+  const storagePlanningTest = await bootHarness({ deferPlans: true });
+  await storagePlanningTest.click("storage");
+  storagePlanningTest.walk(storagePlanningTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  storagePlanningTest.walk(storagePlanningTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storagePlanningTest.settle();
+  storagePlanningTest.get("#storage-edit-reason").value = "grow the claim once";
+  storagePlanningTest.beginSubmitForm(5);
+  await storagePlanningTest.settle();
+  assert.equal(storagePlanningTest.pendingPlans.length, 1, "the storage plan request is pending");
+  assert.equal(storagePlanningTest.bodies.length, 1, "exactly one plan request was sent");
+  assert.equal(storagePlanningTest.get("#storage-edit-submit").disabled, true, "the storage submit control is disabled while a plan is in flight");
+  storagePlanningTest.get("#refresh").listeners.click[0]();
+  await storagePlanningTest.settle();
+  assert.equal(storagePlanningTest.get("#storage-edit-submit").disabled, true, "a refresh never re-enables a storage plan that is still in flight");
+  storagePlanningTest.beginSubmitForm(5);
+  await storagePlanningTest.settle();
+  assert.equal(storagePlanningTest.bodies.length, 1, "a second submit never creates a duplicate storage plan");
+  assert.equal(storagePlanningTest.pendingPlans.length, 1, "no second plan request was issued");
+  storagePlanningTest.resolvePlan();
+  await storagePlanningTest.settle();
+  assert.equal(storagePlanningTest.get("#plan-dialog").open, true, "the current storage plan opens after it resolves");
+  storagePlanningTest.get("#cancel-plan").listeners.click[0]();
+
+  // A plan resolved after the administrator switched to another storage
+  // target is discarded: it never closes the new drawer or opens the old plan.
+  const storageSwitchPlanTest = await bootHarness({ deferPlans: true });
+  await storageSwitchPlanTest.click("storage");
+  storageSwitchPlanTest.walk(storageSwitchPlanTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  storageSwitchPlanTest.walk(storageSwitchPlanTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageSwitchPlanTest.settle();
+  storageSwitchPlanTest.get("#storage-edit-reason").value = "old claim edit";
+  storageSwitchPlanTest.beginSubmitForm(5);
+  await storageSwitchPlanTest.settle();
+  assert.equal(storageSwitchPlanTest.pendingPlans.length, 1);
+  storageSwitchPlanTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  storageSwitchPlanTest.walk(storageSwitchPlanTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolume||data" && node.tagName === "BUTTON")[0].click();
+  storageSwitchPlanTest.walk(storageSwitchPlanTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageSwitchPlanTest.settle();
+  storageSwitchPlanTest.get("#storage-edit-reason").value = "new volume edit";
+  const newYaml = String(storageSwitchPlanTest.get("#storage-edit-yaml").value);
+  storageSwitchPlanTest.resolvePlan();
+  await storageSwitchPlanTest.settle();
+  assert.equal(storageSwitchPlanTest.get("#plan-dialog").open, false, "the old target's plan never opens after switching");
+  assert.equal(storageSwitchPlanTest.get("#storage-edit-drawer").hidden, false, "the new target's drawer is never closed by the old plan");
+  assert.equal(storageSwitchPlanTest.get("#storage-edit-reason").value, "new volume edit", "the old plan never rewrites the new form");
+  assert.equal(String(storageSwitchPlanTest.get("#storage-edit-yaml").value), newYaml, "the old plan never replaces the new projection");
+  assert.equal(storageSwitchPlanTest.error.hidden, true, "the old response injects no error into the new form");
+  storageSwitchPlanTest.beginSubmitForm(5);
+  await storageSwitchPlanTest.settle();
+  assert.equal(storageSwitchPlanTest.pendingPlans.length, 1, "the new target prepares its own plan request");
+  storageSwitchPlanTest.resolvePlan();
+  await storageSwitchPlanTest.settle();
+  assert.equal(storageSwitchPlanTest.get("#plan-dialog").open, true, "the new target's plan opens only when requested");
+  assert.equal(storageSwitchPlanTest.bodies[storageSwitchPlanTest.bodies.length - 1].kind, "pv.edit", "the opened plan belongs to the new target");
+
+  // A stale rejection is discarded as well: it must not show an old target's
+  // error in the new drawer.
+  const storageStaleErrorTest = await bootHarness({ deferPlans: true });
+  await storageStaleErrorTest.click("storage");
+  storageStaleErrorTest.walk(storageStaleErrorTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  storageStaleErrorTest.walk(storageStaleErrorTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageStaleErrorTest.settle();
+  storageStaleErrorTest.get("#storage-edit-reason").value = "old claim edit";
+  storageStaleErrorTest.beginSubmitForm(5);
+  await storageStaleErrorTest.settle();
+  storageStaleErrorTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  storageStaleErrorTest.walk(storageStaleErrorTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolume||data" && node.tagName === "BUTTON")[0].click();
+  storageStaleErrorTest.walk(storageStaleErrorTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageStaleErrorTest.settle();
+  storageStaleErrorTest.resolvePlan(true);
+  await storageStaleErrorTest.settle();
+  assert.equal(storageStaleErrorTest.get("#storage-edit-drawer").hidden, false, "a stale rejection never closes the new storage drawer");
+  assert.equal(storageStaleErrorTest.error.hidden, true, "a stale rejection is never shown in the new form");
+  assert.equal(storageStaleErrorTest.get("#plan-dialog").open, false, "a stale rejection never opens a plan");
+
+  // A missing UID after refresh fails closed instead of treating absence as a
+  // matching identity.
+  const storageMissingUIDTest = await bootHarness({});
+  await storageMissingUIDTest.click("storage");
+  storageMissingUIDTest.walk(storageMissingUIDTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  storageMissingUIDTest.walk(storageMissingUIDTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageMissingUIDTest.settle();
+  storageMissingUIDTest.setResources(storageMissingUIDTest.resources().map(resource =>
+    resource.kind === "PersistentVolumeClaim" && resource.name === "data" ? { ...resource, uid: "" } : resource));
+  storageMissingUIDTest.get("#refresh").listeners.click[0]();
+  await storageMissingUIDTest.settle();
+  assert.ok(storageMissingUIDTest.error.textContent.includes("no longer has a stable observed UID"), "a missing UID is reported as different from a replacement");
+  const missingUIDBefore = storageMissingUIDTest.bodies.length;
+  await storageMissingUIDTest.submitForm(5);
+  assert.equal(storageMissingUIDTest.bodies.length, missingUIDBefore, "a missing observed UID never reaches the plan API");
+
+
+  const storageDeleteTest = await bootHarness({});
+  await storageDeleteTest.click("storage");
+  storageDeleteTest.walk(storageDeleteTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  storageDeleteTest.walk(storageDeleteTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete")[0].click();
+  await storageDeleteTest.settle();
+  assert.equal(storageDeleteTest.get("#storage-delete-drawer").hidden, false, "Delete opens the storage-delete right drawer");
+  assert.equal(storageDeleteTest.get("#storage-delete-target-uid").value, "uid-pvc-team-data");
+  assert.equal(storageDeleteTest.get("#storage-delete-target-rv").value, "41");
+  const deleteWarning = storageDeleteTest.textOf(storageDeleteTest.get("#storage-delete-warning"));
+  assert.ok(deleteWarning.includes("not a filesystem wipe") && deleteWarning.includes("Retain") && deleteWarning.includes("never removes a finalizer") && deleteWarning.includes("needs-review"), "the deletion warning explains data, reclaim policy and review");
+  storageDeleteTest.get("#storage-delete-reason").value = "remove the unused claim";
+  storageDeleteTest.get("#storage-delete-confirm").value = "data";
+  let deleteBefore = storageDeleteTest.bodies.length;
+  await storageDeleteTest.submitForm(6);
+  assert.equal(storageDeleteTest.bodies.length, deleteBefore, "the client-side data-loss acknowledgement is required");
+  assert.ok(storageDeleteTest.error.textContent.includes("Acknowledge"), "the missing acknowledgement is explained");
+  storageDeleteTest.get("#storage-delete-ack").checked = true;
+  storageDeleteTest.get("#storage-delete-confirm").value = " data ";
+  deleteBefore = storageDeleteTest.bodies.length;
+  await storageDeleteTest.submitForm(6);
+  assert.equal(storageDeleteTest.bodies.length, deleteBefore, "a padded confirmation never reaches the API");
+  assert.ok(storageDeleteTest.error.textContent.includes("does not match"), "the exact confirmation is explained");
+  storageDeleteTest.get("#storage-delete-confirm").value = "data";
+  await storageDeleteTest.submitForm(6);
+  const storageDeleteBody = storageDeleteTest.bodies[storageDeleteTest.bodies.length - 1];
+  assert.equal(storageDeleteBody.kind, "pvc.delete");
+  assert.equal(storageDeleteBody.namespace, "team");
+  assert.equal(storageDeleteBody.name, "data");
+  assert.equal(storageDeleteBody.targetUID, "uid-pvc-team-data");
+  assert.equal(storageDeleteBody.targetResourceVersion, "41");
+  assert.equal(storageDeleteBody.confirmName, "data");
+  assert.equal(storageDeleteBody.reason, "remove the unused claim");
+  assert.equal(storageDeleteBody.force, undefined, "deletion carries no force field");
+  assert.equal(storageDeleteBody.dataLossAck, undefined, "the acknowledgement is never submitted");
+  assert.equal(storageDeleteBody.storageYAML, undefined, "deletion carries no YAML");
+  // The focus returns to the exact visible name control, never a closed
+  // drawer's Delete/Edit button.
+  storageDeleteTest.get("#cancel-plan").listeners.click[0]();
+  assert.equal(storageDeleteTest.activeElement, storageDeleteTest.walk(storageDeleteTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0], "closing deletion returns focus to the visible claim name");
+
+  // A PV deletion is cluster scoped and warns with the observed reclaim
+  // policy. It never sends a namespace or a force flag.
+  const pvDeleteTest = await bootHarness({});
+  await pvDeleteTest.click("storage");
+  pvDeleteTest.walk(pvDeleteTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolume||data" && node.tagName === "BUTTON")[0].click();
+  pvDeleteTest.walk(pvDeleteTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete")[0].click();
+  await pvDeleteTest.settle();
+  assert.ok(pvDeleteTest.textOf(pvDeleteTest.get("#storage-delete-warning")).includes("PersistentVolume data") && pvDeleteTest.textOf(pvDeleteTest.get("#storage-delete-warning")).includes("Retain"));
+  pvDeleteTest.get("#storage-delete-reason").value = "remove the spare volume";
+  pvDeleteTest.get("#storage-delete-confirm").value = "data";
+  pvDeleteTest.get("#storage-delete-ack").checked = true;
+  await pvDeleteTest.submitForm(6);
+  const pvDeleteBody = pvDeleteTest.bodies[pvDeleteTest.bodies.length - 1];
+  assert.equal(pvDeleteBody.kind, "pv.delete");
+  assert.equal(pvDeleteBody.namespace, undefined, "a PersistentVolume deletion carries no namespace");
+  assert.equal(pvDeleteBody.confirmName, "data");
+
+  // Closing the editor with Escape returns focus to the exact visible name
+  // control, not to the Edit control inside the closed details drawer.
+  const storageFocusTest = await bootHarness({});
+  await storageFocusTest.click("storage");
+  const focusClaim = storageFocusTest.walk(storageFocusTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0];
+  focusClaim.click();
+  storageFocusTest.walk(storageFocusTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Edit")[0].click();
+  await storageFocusTest.settle();
+  storageFocusTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
+  assert.equal(storageFocusTest.activeElement, focusClaim, "Escape returns to the visible claim name");
+  assert.notEqual(storageFocusTest.activeElement.textContent, "Edit", "focus never stays on a control inside a closed drawer");
+  focusClaim.click();
+  storageFocusTest.walk(storageFocusTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete")[0].click();
+  await storageFocusTest.settle();
+  storageFocusTest.get("#drawer-scrim").listeners.click[0]();
+  assert.equal(storageFocusTest.activeElement, focusClaim, "the scrim returns focus to the visible claim name after deletion review");
 
   // ---- Namespace summary resource drilldown ---------------------------------
   // Individual resources lead to the scoped page filtered to that resource,
@@ -1471,11 +2054,13 @@ async function bootHarness(options = {}) {
   duplicateKeyTest.get("#toggle-overview-table").listeners.click[0]();
   await duplicateKeyTest.click("storage");
   const storageKey = "PersistentVolumeClaim|team|data";
-  const storageControl = duplicateKeyTest.walk(duplicateKeyTest.get('[data-table="storage"]'), node => node.tagName === "BUTTON" && node.dataset.resourceKey === storageKey && node.textContent === "Details")[0];
+   const storageControl = duplicateKeyTest.walk(duplicateKeyTest.get('[data-table="storage"]'), node => node.tagName === "BUTTON" && node.dataset.resourceKey === storageKey && node.textContent === "data")[0];
   const overviewControl = duplicateKeyTest.walk(duplicateKeyTest.get('[data-table="overview"]'), node => node.tagName === "BUTTON" && node.dataset.resourceKey === storageKey)[0];
   assert.ok(storageControl && overviewControl, "the same resource is rendered in the Overview table and in the Storage table");
-  storageControl.click();
-  storageControl.hidden = true;
+   storageControl.click();
+   duplicateKeyTest.get("#refresh").listeners.click[0]();
+   await duplicateKeyTest.settle();
+   storageControl.hidden = true;
   duplicateKeyTest.handlers.keydown[0]({ key: "Escape", preventDefault() {} });
   assert.notEqual(duplicateKeyTest.activeElement, storageControl, "the hidden control never takes the focus back");
   assert.notEqual(duplicateKeyTest.activeElement, overviewControl, "the hidden Overview control never takes the focus back");

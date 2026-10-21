@@ -61,6 +61,39 @@ const resources = [
   {kind:"StorageClass",name:"team-class",details:{approved:"true"}}
 ];
 assert.deepEqual(scopedResources(resources,"team").map(r=>r.name),["team","work","data","bound-team","claim-team","available","team-class"]);
+
+// A Node scoped Pod count uses the canonical Pod kind and phase and an exact
+// projected node identity. Notebooks, StatefulSets, pending Pods, a node-name
+// prefix and Pods without a node are not part of the count.
+const nodePods = [
+  { kind: "Pod", name: "alpha-running", namespace: "alpha", state: "Running", details: { node: "node-a" } },
+  { kind: "Pod", name: "beta-running", namespace: "beta", state: "Running", details: { node: "node-a" } },
+  { kind: "Pod", name: "pending", namespace: "alpha", state: "Pending", details: { node: "node-a" } },
+  { kind: "Pod", name: "other-running", namespace: "alpha", state: "Running", details: { node: "node-b" } },
+  { kind: "Pod", name: "prefix-running", namespace: "alpha", state: "Running", details: { node: "node-a-extra" } },
+  { kind: "Pod", name: "missing-node", namespace: "alpha", state: "Running", details: {} },
+  { kind: "Pod", name: "unknown-node", namespace: "alpha", state: "Running", details: { node: "node-unknown" } },
+  { kind: "Notebook", name: "notebook", namespace: "alpha", state: "Running", details: { node: "node-a" } },
+  { kind: "StatefulSet", name: "statefulset", namespace: "alpha", state: "Running", details: { node: "node-a" } }
+];
+assert.deepEqual(logic.runningPodsOnNode(nodePods, "node-a").map(pod => pod.name).sort(), ["alpha-running", "beta-running"], "only exact Running Pod resources on the exact node are counted");
+assert.equal(logic.runningPodsOnNode(nodePods, "node").length, 0, "a node-name prefix is not the selected node");
+assert.equal(logic.runningPodsOnNode(nodePods, "node-zero").length, 0, "a node with no Running Pods has a genuine zero count");
+assert.equal(logic.runningPodsOnNode(nodePods, "").length, 0, "an empty node name never means every node");
+assert.equal(logic.runningPodsOnNode(null, "node-a").length, 0, "a missing inventory is safe");
+assert.equal(logic.podMatchesFilters(nodePods[0], { node: "node-a", phase: "Running" }), true);
+assert.equal(logic.podMatchesFilters(nodePods[2], { node: "node-a", phase: "Running" }), false, "the Pending Pod is not Running");
+assert.equal(logic.podMatchesFilters(nodePods[0], { node: "node-a", phase: "Succeeded" }), false);
+assert.equal(logic.podMatchesFilters(nodePods[7], { node: "node-a", phase: "Running" }), false, "a Notebook is never counted as a Pod");
+assert.deepEqual(logic.queryPodFilters("?node=node-a&phase=Running"), { node: "node-a", phase: "Running" });
+assert.deepEqual(logic.queryPodFilters("?node=node-a&phase=Pending"), { node: "node-a", phase: "Pending" });
+assert.deepEqual(logic.queryPodFilters("?node=node-a&phase=NotAPhase"), { node: "node-a", phase: "" }, "an unknown phase is ignored");
+assert.deepEqual(logic.queryPodFilters("?node=%20node-a%20&phase=Running"), { node: "node-a", phase: "Running" });
+assert.deepEqual(logic.queryPodFilters(null), { node: "", phase: "" }, "a missing query is safe");
+assert.equal(logic.podNodeHref("node-a"), "/pods?node=node-a&phase=Running", "the scoped link carries only the exact node and Running filters");
+const escapedNodeHref = logic.podNodeHref('node "a"<img>');
+assert.ok(escapedNodeHref.includes("node+%22a%22%3Cimg%3E"), "an unusual node name is URL encoded");
+assert.equal(escapedNodeHref.includes("<"), false, "a node name never appears as markup in the link");
 const plan = {id:"server-plan",actor:"issuer|admin",actorDisplay:"Alice Admin",prepared:{summary:"server summary",action:clear,warnings:["warning"],data:{policy:"DO_NOT_RENDER_OPAQUE_HASH",dependencies:[{digest:"also-opaque"}]}}};
 const preview = previewFields(plan), text = JSON.stringify(preview);
 assert.equal(text.includes("DO_NOT_RENDER_OPAQUE_HASH"),false); assert.equal(text.includes("also-opaque"),false);
@@ -83,6 +116,33 @@ assert.ok(cordonPreview.includes("spec.unschedulable=true") && cordonPreview.inc
 assert.ok(cordonPreview.includes("Force") && cordonPreview.includes("maintenance"));
 const uncordonPreview = JSON.stringify(previewFields({...plan,prepared:{...plan.prepared,action:buildAction([["kind","node.uncordon"],["name","worker-1"],["reason","done"],["force","on"]])}}));
 assert.ok(uncordonPreview.includes("spec.unschedulable=false") && uncordonPreview.includes("scheduled onto this node again"));
+
+// ---- Narrow storage YAML edit and deletion actions ------------------------
+assert.equal(logic.storageActionKind("PersistentVolume", "edit"), "pv.edit");
+assert.equal(logic.storageActionKind("PersistentVolume", "delete"), "pv.delete");
+assert.equal(logic.storageActionKind("PersistentVolumeClaim", "edit"), "pvc.edit");
+assert.equal(logic.storageActionKind("PersistentVolumeClaim", "delete"), "pvc.delete");
+assert.equal(logic.storageActionKind("StorageClass", "edit"), "", "StorageClass has no storage action");
+assert.equal(logic.storageTargetKey("PersistentVolume", "", "data"), "PersistentVolume||data", "a PV target is cluster scoped");
+assert.equal(logic.storageTargetKey("PersistentVolumeClaim", "team", "data"), "PersistentVolumeClaim|team|data", "a PVC target is namespaced");
+const pvcEdit = buildAction([["kind","pvc.edit"],["name","data"],["namespace","team"],["targetUID","uid-pvc"],["targetResourceVersion","7"],["storageYAML","apiVersion: v1\nkind: PersistentVolumeClaim\n"],["reason","  grow the claim  "],["confirmName","ignored"],["force","on"]]);
+assert.deepEqual(pvcEdit, {kind:"pvc.edit",name:"data",namespace:"team",targetUID:"uid-pvc",targetResourceVersion:"7",storageYAML:"apiVersion: v1\nkind: PersistentVolumeClaim\n",reason:"grow the claim"}, "a PVC edit carries the exact projection and target identity only");
+assert.equal(Object.hasOwn(pvcEdit,"confirmName"), false, "an edit carries no confirmation");
+assert.equal(Object.hasOwn(pvcEdit,"force"), false, "an edit carries no force flag");
+const pvDelete = buildAction([["kind","pv.delete"],["name","data"],["targetUID","uid-pv"],["targetResourceVersion","9"],["confirmName"," data "],["reason","  remove unused volume  "],["storageYAML","ignored"],["force","on"]]);
+assert.deepEqual(pvDelete, {kind:"pv.delete",name:"data",targetUID:"uid-pv",targetResourceVersion:"9",confirmName:" data ",reason:"remove unused volume"}, "a PV deletion carries no namespace, YAML or force flag and keeps the typed confirmation exact");
+const pvcDelete = buildAction([["kind","pvc.delete"],["name","data"],["namespace","team"],["targetUID","uid-pvc"],["targetResourceVersion","7"],["confirmName","data"],["reason","unused"]]);
+assert.deepEqual(pvcDelete, {kind:"pvc.delete",name:"data",namespace:"team",targetUID:"uid-pvc",targetResourceVersion:"7",confirmName:"data",reason:"unused"});
+const storageEditPreview = JSON.stringify(previewFields({...plan,prepared:{...plan.prepared,action:pvcEdit}}));
+assert.ok(storageEditPreview.includes("Restricted YAML projection") && storageEditPreview.includes("not the full manifest") && storageEditPreview.includes("features.pvcExpansion"), "the edit preview explains the partial projection and the growth gate");
+assert.ok(storageEditPreview.includes("server-provided warnings are authoritative for metadata.labels"), "the edit preview delegates label semantics to the server projection");
+assert.equal(storageEditPreview.includes("API requires an edit reason"), false, "the preview never claims the API requires an edit reason");
+assert.ok(storageEditPreview.includes("Read-only identity") && storageEditPreview.includes("targetUID") && storageEditPreview.includes("targetResourceVersion"), "the edit preview explains the read-only identity guard");
+const storageDeletePreview = JSON.stringify(previewFields({...plan,prepared:{...plan.prepared,action:pvDelete}}));
+assert.ok(storageDeletePreview.includes("not a filesystem wipe") && storageDeletePreview.includes("Retain reclaim policy") && storageDeletePreview.includes("never removes a finalizer"), "the deletion preview warns about data and cleanup");
+assert.ok(storageDeletePreview.includes("no observed Pod or Notebook") || storageDeletePreview.includes("Available, unclaimed"), "the deletion preview names the eligibility rule");
+assert.ok(storageDeletePreview.includes("needs-review") && storageDeletePreview.includes("do not retry"), "the deletion preview tells the operator not to retry an ambiguous result");
+assert.equal(storageDeletePreview.includes("force:true"), false, "the deletion preview never claims a force flag");
 
 // Kubernetes quantities, not lexicographic text.
 assert.equal(logic.quantityValue("500m"), 0.5);

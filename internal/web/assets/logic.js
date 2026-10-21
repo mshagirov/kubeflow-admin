@@ -3,6 +3,18 @@
 // the browser. No network access, credentials or Kubernetes manifests live here.
 ((root) => {
   const kinds = { "profile.quota": "profile.quota.change", "pvc.create": "pvc.create.dynamic", "pv.nfs.create": "storage.create.static", "pv.reserve": "pv.reserve-and-claim" };
+  // The narrow storage document workflow. Editing and deletion are separate
+  // server-owned actions; the browser only prepares a typed plan.
+  const storageEditKinds = new Set(["pv.edit", "pvc.edit"]);
+  const storageDeleteKinds = new Set(["pv.delete", "pvc.delete"]);
+  function storageActionKind(kind, verb) {
+    if (kind === "PersistentVolume") return verb === "edit" ? "pv.edit" : verb === "delete" ? "pv.delete" : "";
+    if (kind === "PersistentVolumeClaim") return verb === "edit" ? "pvc.edit" : verb === "delete" ? "pvc.delete" : "";
+    return "";
+  }
+  function storageTargetKey(kind, namespace, name) {
+    return [String(kind || ""), String(namespace || ""), String(name || "")].join("|");
+  }
   // A profile action carries only the fields its kind defines. Anything else in
   // the form (storage settings, a resource version, a stale confirmation) is
   // dropped before the request leaves the browser. A namespace is optional and
@@ -79,6 +91,31 @@
       delete action.namespace;
       delete action.owner;
     }
+    if (storageEditKinds.has(action.kind)) {
+      // The plan carries the exact typed projection and the observed target
+      // identity. The server revalidates metadata.uid/resourceVersion inside
+      // the projection and the independent target fields. No force or
+      // finalizer flag exists for this workflow.
+      action.reason = String(action.reason || "").trim();
+      action.storageYAML = String(action.storageYAML ?? "");
+      action.targetUID = String(action.targetUID ?? "");
+      action.targetResourceVersion = String(action.targetResourceVersion ?? "");
+      delete action.confirmName;
+      delete action.force;
+      if (!action.namespace) delete action.namespace;
+    }
+    if (storageDeleteKinds.has(action.kind)) {
+      // The exact typed name is the second confirmation. The browser-side
+      // data-loss acknowledgement is deliberately not an action field: it is
+      // never sent and it is never a security gate.
+      action.reason = String(action.reason || "").trim();
+      action.confirmName = String(action.confirmName ?? "");
+      action.targetUID = String(action.targetUID ?? "");
+      action.targetResourceVersion = String(action.targetResourceVersion ?? "");
+      delete action.storageYAML;
+      delete action.force;
+      if (!action.namespace) delete action.namespace;
+    }
     return keepProfileFields(action);
   }
   function scopedResources(resources, namespace) {
@@ -86,6 +123,40 @@
     return resources.filter(r => !namespace || r.namespace === namespace ||
       (["Profile", "Namespace"].includes(r.kind) && r.name === namespace) || r.kind === "StorageClass" ||
       (r.kind === "PersistentVolume" && (volumes.has(r.name) || r.details?.claim?.startsWith(namespace + "/") || (r.state === "Available" && !r.details?.claim))));
+  }
+  // Pod filters are typed and additive. Only canonical Pod phases are accepted
+  // from the URL; an unknown value is ignored rather than interpreted as a
+  // different state. The same matcher feeds both the node count and the Pods
+  // table so a scoped view can never promise a different set of rows.
+  const canonicalPodPhases = ["Pending", "Running", "Succeeded", "Failed", "Unknown"];
+  function queryPodFilters(search) {
+    let params;
+    try { params = new URLSearchParams(String(search || "")); }
+    catch { return { node: "", phase: "" }; }
+    const node = String(params.get("node") || "").trim();
+    const rawPhase = String(params.get("phase") || "").trim();
+    return { node, phase: canonicalPodPhases.includes(rawPhase) ? rawPhase : "" };
+  }
+  function podNodeHref(nodeName) {
+    const url = new URL("/pods", "https://console.invalid");
+    const node = String(nodeName ?? "");
+    if (node) url.searchParams.set("node", node);
+    url.searchParams.set("phase", "Running");
+    return url.pathname + url.search;
+  }
+  function podMatchesFilters(resource, filters = {}) {
+    if (!resource || resource.kind !== "Pod") return false;
+    const node = String(filters?.node ?? "");
+    const phase = String(filters?.phase ?? "");
+    if (node && String(resource.details?.node ?? "") !== node) return false;
+    if (phase && String(resource.state ?? "") !== phase) return false;
+    return true;
+  }
+  function runningPodsOnNode(resources, nodeName) {
+    const node = String(nodeName ?? "");
+    if (!node) return [];
+    return (Array.isArray(resources) ? resources : []).filter(resource =>
+      podMatchesFilters(resource, { node, phase: "Running" }));
   }
   function containerNames(resource) {
     return Object.keys(resource?.details || {}).filter(k => k.startsWith("image.") && k.length > 6).map(k => k.slice(6)).sort();
@@ -95,7 +166,8 @@
     storageClass: "Storage class", size: "Requested capacity", accessMode: "Access mode", pvName: "PV name", template: "Approved template", subdirectory: "Relative NFS subdirectory",
     container: "Named container", image: "Image", cpuRequest: "CPU request", cpuLimit: "CPU limit", memoryRequest: "Memory request", memoryLimit: "Memory limit",
     gpuPreset: "GPU preset", gpuCount: "GPU count", mounts: "Replacement PVC mounts", restart: "Restart after edit",
-    force: "Force", confirmName: "Confirmation name"
+    force: "Force", confirmName: "Confirmation name", storageYAML: "Restricted YAML projection",
+    targetResourceVersion: "Target resource version"
   };
   function previewFields(plan) {
     const p = plan.prepared, action = p.action;
@@ -140,6 +212,24 @@
       fields.push(["Storage and data", "The namespace cleanup deletes the volume claims inside it. A Delete reclaim policy lets the storage controller delete the backing volume, which can be irreversible. A Retain reclaim policy is not protection: the backend lifecycle or a later operator delete can still remove the volume."]);
       fields.push(["Snapshots and external data", "A namespaced VolumeSnapshot is deleted with its namespace, and the snapshot content behind it follows its own Delete or Retain policy. Retained volumes, volume snapshots and external storage such as NFS exports or object storage can keep their data. The console never wipes backend data itself."]);
       fields.push(["Confirmation", `The confirmation name must match the profile name "${action.name}" character for character. The console sends it exactly as typed and never trims it.`]);
+    }
+    if (storageEditKinds.has(action.kind)) {
+      fields.push(["Editable scope", "The server projects a restricted partial YAML document, not the full manifest. Only the fields it shows are editable. The server-provided warnings are authoritative for metadata.labels and for every omitted or preserved field; the console never copies, invents or infers a hidden value."]);
+      fields.push(["Read-only identity", "metadata.uid and metadata.resourceVersion are read-only targets. The plan carries targetUID and targetResourceVersion independently and the server refuses a changed identity."]);
+      if (action.kind === "pvc.edit") {
+        fields.push(["PVC growth", "A PersistentVolumeClaim size change may only increase the request and only when features.pvcExpansion is enabled. Shrink and no-op changes are refused by the server."]);
+      } else {
+        fields.push(["PV eligibility", "Only an Available, unclaimed and unreserved PersistentVolume in an approved StorageClass can be edited. The server revalidates the live object and its class."]);
+      }
+    }
+    if (storageDeleteKinds.has(action.kind)) {
+      fields.push(["Deletion scope", "Requests deletion of this storage object only. It is not a filesystem wipe and does not by itself remove backend data."]);
+      fields.push(["Data warning", "A Delete reclaim policy can let the storage controller remove the backing volume, which can be irreversible. A Retain reclaim policy may leave the backing data behind; it is not proof that the data is gone. The console never removes a finalizer or forces cleanup."]);
+      fields.push(["Eligibility", action.kind === "pvc.delete"
+        ? "The server revalidates that no observed Pod or Notebook references this claim."
+        : "The server revalidates that the PersistentVolume is Available, unclaimed, unreserved and in an approved StorageClass."]);
+      fields.push(["Confirmation", `The confirmation name must match "${action.name}" character for character. The browser-side data-loss acknowledgement is only a safeguard and is never sent as an action field.`]);
+      fields.push(["Needs review", "If the result is needs-review, do not retry. Inspect Operations and History and ask the operator to review the target."]);
     }
     return fields;
   }
@@ -750,6 +840,8 @@
 
   const logic = {
     buildAction, scopedResources, containerNames, previewFields,
+    queryPodFilters, podNodeHref, podMatchesFilters, runningPodsOnNode,
+    storageActionKind, storageTargetKey,
     quantityValue, timeValue, severityValue, readyValue, naturalCompare, isMissing,
     sortRows, searchMatch, filterRows, paginate,
     parseTarget, actorLabel, groupAudit,

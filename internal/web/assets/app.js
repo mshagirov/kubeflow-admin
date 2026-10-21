@@ -12,6 +12,11 @@
   // Profile deletion is a separate, reviewed opt-in. It is only offered when
   // the server projects the capability and writes are enabled.
   const profileDeletionFeature = meta("profile-deletion") === "true" && writes;
+  // Storage document editing and deletion are separate reviewed opt-ins. The
+  // server projects them only with writes enabled; the browser repeats the
+  // conjunction defensively and still shows the disabled action with a reason.
+  const storageEditingFeature = meta("storage-editing") === "true" && writes;
+  const storageDeletionFeature = meta("storage-deletion") === "true" && writes;
   const notificationScope = meta("notification-scope");
   const logic = globalThis.DashboardLogic;
 
@@ -30,6 +35,10 @@
   let page = route.page;
   let historyTab = route.tab || "operations";
   let namespaceContext = logic.queryNamespace(location.search);
+  // Typed Pod filters are URL state, not a hidden table setting. They are
+  // re-read on every navigation so a sidebar page change cannot inherit a
+  // node filter from an earlier scoped view.
+  let podFilters = logic.queryPodFilters(location.search);
   let inventory = null, inventoryAt = 0, inventoryError = false, loading = false;
   let currentPlan = null, submitKey = null, submitInflight = false;
   let drawerOpener = null;
@@ -43,6 +52,12 @@
   let notebookTarget = null;
   let notebookManagementFromDetails = false;
   let notebookReturnKey = "";
+  // The exact storage resource a YAML edit or deletion drawer belongs to. The
+  // epoch invalidates every in-flight document read when the drawer closes or
+  // another target opens. A document is only used when its kind, namespace,
+  // name and UID still match the selected observed resource.
+  let storageOperation = null;
+  let storageEpoch = 0;
   let overviewTableExpanded = false;
   let errorTipSeq = 0;
   let rowCache = {};
@@ -81,6 +96,9 @@
   for (const key of Object.keys(tableStates)) { tableStates[key].focus = null; tableStates[key].focusMirror = false; }
   // A cluster-scoped kind is never identified by a namespace.
   const clusterScopedKinds = new Set(["Profile", "Namespace", "Node", "PersistentVolume", "StorageClass"]);
+  // The only kinds with the narrow storage document workflow. StorageClasses
+  // keep their observed details and never grow Edit/Delete actions.
+  const storageActionKinds = new Set(["PersistentVolume", "PersistentVolumeClaim"]);
   // The kind a legacy deep link implies on a page that lists exactly one.
   // A page that lists several kinds treats a kind-less link as a name filter.
   const pageResourceKinds = { pods: "Pod", nodes: "Node", profiles: "Profile", namespaces: "Namespace" };
@@ -206,6 +224,23 @@
     if (namespaceContext && !names.includes(namespaceContext)) names.push(namespaceContext);
     return [...new Set(names)].sort(logic.naturalCompare);
   }
+  function applyPodFilters(search) {
+    const next = logic.queryPodFilters(search);
+    if (next.node === podFilters.node && next.phase === podFilters.phase) return;
+    podFilters = next;
+    rowCache = {};
+  }
+  function clearPodFilterScope() {
+    const url = new URL(location.href);
+    const hadFilter = !!podFilters.node || !!podFilters.phase ||
+      url.searchParams.has("node") || url.searchParams.has("phase");
+    podFilters = { node: "", phase: "" };
+    url.searchParams.delete("node");
+    url.searchParams.delete("phase");
+    if (hadFilter) window.history.replaceState(null, "", url.pathname + url.search);
+    rowCache = {};
+    return hadFilter;
+  }
   function desired(resource) { return resource.desired || resource.details?.requested || "Not reported"; }
   function capacity(resource) { return resource.details?.capacity || "Not reported"; }
   function notebookCondition(resource) { return resource.details?.["condition.Ready"] || capacity(resource); }
@@ -267,8 +302,8 @@
   // Names are the visible handle for the kinds whose full observation belongs
   // in the right-side details drawer. The separate Details control is removed
   // for these tables (Profiles opens its consolidated summary instead).
-  const nameDetailsKinds = new Set(["Notebook", "Pod", "Node"]);
-  const inlineDetailsKinds = new Set(["Profile", "Notebook", "Pod", "Node"]);
+  const nameDetailsKinds = new Set(["Notebook", "Pod", "Node", "PersistentVolume", "PersistentVolumeClaim", "StorageClass"]);
+  const inlineDetailsKinds = new Set(["Profile", ...nameDetailsKinds]);
   function detailsButton(resource) {
     if (inlineDetailsKinds.has(resource.kind)) return null;
     if (!detailEntries(resource).length) return null;
@@ -508,7 +543,10 @@
         resourceRow(resource, () => [resourceNameNode(resource), desired(resource), badge(resource.state), notebookCondition(resource), resource.owner || "Not reported"]));
     }
     if (stateKey === "pods") {
-      return scoped.filter(resource => resource.kind === "Pod").map(resource =>
+      // Node and phase filters are applied before row materialization. The
+      // matcher is shared with the Node scoped count, so the count and the
+      // destination cannot drift apart.
+      return scoped.filter(resource => logic.podMatchesFilters(resource, podFilters)).map(resource =>
         resourceRow(resource, () => [resourceNameNode(resource), podReady(resource), podRestartCount(resource), podResourceDetail(resource, "cpuRequest", "requested.cpu"), podResourceDetail(resource, "memoryRequest", "requested.memory"), podResourceDetail(resource, "cpuLimit", "limit.cpu"), podResourceDetail(resource, "memoryLimit", "limit.memory"), badge(resource.state), resource.details?.node || "—", resource.owner || resource.details?.owner || "Not reported", restartButton(resource)]));
     }
     if (stateKey === "nodes") {
@@ -569,7 +607,8 @@
   function cacheKey(stateKey) {
     if (stateKey === "historyOperations") return stateKey + "|" + historyCache.operations.at;
     if (stateKey === "historyAudit") return stateKey + "|" + historyCache.audit.at;
-    return stateKey + "|" + inventoryAt + "|" + namespaceContext;
+    const filters = stateKey === "pods" ? "|" + JSON.stringify(podFilters) : "";
+    return stateKey + "|" + inventoryAt + "|" + namespaceContext + filters;
   }
   function tableRows(stateKey) {
     const key = cacheKey(stateKey);
@@ -635,7 +674,7 @@
     const clear = el("button", "Clear filters", "secondary small");
     clear.type = "button";
     clear.dataset.clearFilters = "1";
-    clear.setAttribute("aria-label", "Clear the search and namespace filters for " + def.label);
+    clear.setAttribute("aria-label", "Clear all filters for " + def.label);
     clear.addEventListener("click", () => clearFilters(stateKey));
     const count = el("span", undefined, "result-count");
     count.dataset.count = "1";
@@ -652,21 +691,47 @@
     select.setAttribute("aria-label", "Namespace for " + def.label);
     select.addEventListener("change", () => setNamespace(select.value));
     scopeLabel.append(select);
+    if (stateKey === "pods") {
+      const filters = el("div", undefined, "active-filters");
+      filters.dataset.podFilters = "1";
+      filters.setAttribute("role", "group");
+      filters.setAttribute("aria-label", "Active Pod filters");
+      filters.hidden = true;
+      controls.append(searchLabel, scopeLabel, filters, clear, count);
+      return controls;
+    }
     controls.append(searchLabel, scopeLabel, clear, count);
     return controls;
   }
+  // The visible URL filters are rebuilt on every render. They are plain text
+  // built with textContent, so a node name is never interpreted as markup.
+  function syncPodFilterChips(controls) {
+    const filters = controls.querySelector("[data-pod-filters]");
+    if (!filters) return;
+    filters.replaceChildren();
+    const entries = [];
+    if (podFilters.node) entries.push(["Node", podFilters.node]);
+    if (podFilters.phase) entries.push(["State", podFilters.phase]);
+    filters.hidden = entries.length === 0;
+    entries.forEach(([label, value]) => {
+      const chip = el("span", undefined, "filter-chip");
+      chip.append(el("span", label, "filter-chip-label"), el("strong", value));
+      filters.append(chip);
+    });
+  }
   // The clear control is always reachable, but it is only actionable when a
-  // search text, the shared namespace scope or a resource focus is applied.
+  // search text, namespace scope, resource focus or typed Pod filter is applied.
   function syncClearFilters(controls, stateKey) {
     const clear = controls.querySelector("[data-clear-filters]");
     if (!clear) return;
     const state = tableStates[stateKey];
-    const active = !!String(state.search || "").trim() || !!namespaceContext || !!state.focus;
+    const podFilterActive = stateKey === "pods" && (!!podFilters.node || !!podFilters.phase);
+    const active = !!String(state.search || "").trim() || !!namespaceContext || !!state.focus || podFilterActive;
     clear.disabled = !active;
     clear.setAttribute("aria-disabled", active ? "false" : "true");
     clear.title = active
-      ? "Clear the search text, the namespace scope and the resource focus, and return to the first page."
-      : "No search text, namespace scope or resource focus is applied.";
+      ? "Clear the search text, the namespace scope, the Pod node and state filters and the resource focus, and return to the first page."
+      : "No search text, namespace scope, Pod node or state filter, or resource focus is applied.";
   }
   // A focus is dropped on its own. The mirrored search is cleared with it, but
   // a search the administrator typed is kept.
@@ -688,6 +753,9 @@
     state.page = 1;
     const search = container?.querySelector("[data-search]");
     if (search) search.value = "";
+    // A node/state filter is URL state. Clear it and its visible chips before
+    // the namespace branch rewrites the rest of the URL.
+    if (stateKey === "pods") clearPodFilterScope();
     if (namespaceContext) setNamespace("");
     else { dropResourceScope(); renderTable(stateKey); }
     const focus = container?.querySelector("[data-search]") || container?.querySelector("[data-clear-filters]");
@@ -709,6 +777,7 @@
     }
     const search = controls.querySelector("[data-search]");
     if (search && document.activeElement !== search) search.value = state.search;
+    syncPodFilterChips(controls);
     syncClearFilters(controls, stateKey);
     container.querySelectorAll(".table-scroll, .pager, .table-note, .empty-state").forEach(node => node.remove());
     const count = controls.querySelector("[data-count]");
@@ -742,11 +811,16 @@
       // A focused resource that is not observed must not look like an empty
       // scope; the message names the filter that produced the empty view.
       const focus = state.focus;
+      const podScope = stateKey === "pods"
+        ? [podFilters.node ? `node “${podFilters.node}”` : "", podFilters.phase ? `${podFilters.phase} state` : ""].filter(Boolean).join(" and ")
+        : "";
       const empty = focus
         ? (focus.kind
           ? `No observed ${focus.kind} named “${focus.name}” matches this scope. Clear the filters to see every loaded row.`
           : `No observed resource named “${focus.name}” matches this scope. This deep link filters by name only; clear the filters to see every loaded row.`)
-        : def.empty;
+        : (podScope
+          ? `No observed Pods match ${podScope} in this scope. Clear the filters to see every loaded row.`
+          : def.empty);
       container.append(el("div", empty, "empty-state"));
     } else {
       const scroll = el("div", undefined, "table-scroll");
@@ -906,6 +980,7 @@
     syncNotebookManagement();
     // A refreshed observation can make a client-side validation message
     // stale. A server answer is never cleared by an unrelated refresh.
+    syncStorageOperation();
     for (const form of [$("#profile-form"), $("#profile-delete-form")]) {
       if (!form) continue;
       const region = form.querySelector(".form-error");
@@ -1038,6 +1113,7 @@
     const current = logic.routeFor(location.pathname, location.search);
     page = current.page;
     if (current.tab) historyTab = current.tab;
+    applyPodFilters(location.search);
     applyResourceScope(location.search);
     $("#page-title").textContent = pageTitles[page]?.[0] || "Overview";
     $("#page-subtitle").textContent = pageTitles[page]?.[1] || "";
@@ -1123,6 +1199,16 @@
     const target = new URL(link.href, location.href);
     if (target.origin !== location.origin) return;
     event.preventDefault();
+    // A Node scoped Pods link is a fresh view, not the previous Pods search.
+    // The URL filters are authoritative and the visible search starts empty so
+    // unrelated state cannot hide rows behind the typed node view.
+    if (link.dataset.podNodeLink === "1") {
+      const pods = tableStates.pods;
+      pods.search = "";
+      pods.focus = null;
+      pods.focusMirror = false;
+      pods.page = 1;
+    }
     // A scoped summary link to Overview should land on the full table rather
     // than a collapsed dashboard, so Events and quota rows are immediately visible.
     if (target.pathname === "/" && link.closest?.("#namespace-summary-drawer")) overviewTableExpanded = true;
@@ -1172,6 +1258,7 @@
       const confirmName = String($("#profile-delete-confirm")?.value || "");
       return logic.profileDeleteValidation(name, { reason, confirmName }).message;
     }
+    if (form.id === "storage-edit-form" || form.id === "storage-delete-form") return storageSubmitError(form);
     return "";
   }
   function openDrawers() { return $$(".drawer").filter(drawer => !drawer.hidden); }
@@ -1220,6 +1307,12 @@
       target = notebookReturnKey ? resourceDetailsOpener(notebookReturnKey) : null;
       if (!target) target = $("#page-title");
     }
+    if (!target && (drawer?.id === "storage-edit-drawer" || drawer?.id === "storage-delete-drawer")) {
+      // Storage actions are opened from the observed details. The Edit/Delete
+      // control lives inside that now closed drawer, so the focus returns to
+      // the visible name control of the exact same storage resource.
+      target = storageOperation?.returnKey ? resourceDetailsOpener(storageOperation.returnKey) : null;
+    }
     if (!target) {
       const kind = String(drawer?.id || "").replace(/-drawer$/, "");
       // The management control of the drawer, when it is visible. Another
@@ -1252,6 +1345,10 @@
       notebookTarget = null;
       notebookTargetWarning("");
     }
+    if (last?.id === "storage-edit-drawer" || last?.id === "storage-delete-drawer") {
+      storageOperation = null;
+      storageEpoch++;
+    }
   }
   function focusable(drawer) {
     return $$("a[href], button:not([disabled]), input:not([type='hidden']):not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])", drawer)
@@ -1277,6 +1374,27 @@
     renderResourceDetails(resource, {});
     openDrawer(drawer, opener);
   }
+  // A Node's scoped view counts only observed Pod resources whose canonical
+  // phase is Running and whose projected node is exactly this Node. It is a
+  // snapshot count, never a live atomic proof, and the same typed filters drive
+  // the destination table. The href omits namespace so the link shows every
+  // namespace, and URLSearchParams keeps an unusual node name safely encoded.
+  function nodePodScopedView(resource) {
+    const name = String(resource.name || "");
+    const running = logic.runningPodsOnNode(inventory?.resources || [], name);
+    const count = running.length;
+    const section = el("section", undefined, "node-pod-scope");
+    section.dataset.nodePodScope = "1";
+    section.append(el("h3", "Scoped view"));
+    const link = el("a", undefined, "summary-link node-pod-scope-link");
+    link.href = logic.podNodeHref(name);
+    link.dataset.scopedLink = "1";
+    link.dataset.podNodeLink = "1";
+    link.setAttribute("aria-label", `${count} Running Pod${count === 1 ? "" : "s"} on node ${name}. Open the Pods page filtered to this node and Running state.`);
+    link.append(el("strong", String(count)), el("span", `Running Pod${count === 1 ? "" : "s"} on this node`));
+    section.append(link, el("p", "Counted from the latest inventory observation across all namespaces; this is not a live atomic proof. The link applies exactly this node and Running state to the Pods page.", "hint"));
+    return section;
+  }
   // The body of the drawer is rebuilt from one observation. It never claims to
   // be the latest observation while it shows an older one.
   function renderResourceDetails(resource, options = {}) {
@@ -1300,6 +1418,8 @@
       ["Observed state", resource.state || "Not reported"]
     ].forEach(([label, value]) => facts.append(el("dt", label), el("dd", value)));
     body.append(facts);
+    // The scoped Pod view sits above the raw projected details of a Node.
+    if ((resource.kind || "") === "Node") body.append(nodePodScopedView(resource));
     // The projected details keep their original labels and values. They are
     // written as text, never as markup.
     const entries = detailEntries(resource);
@@ -1316,16 +1436,38 @@
       const manage = el("button", "Manage Notebook", "secondary");
       manage.type = "button";
       manage.setAttribute("aria-label", `Manage Notebook ${resource.namespace || ""}/${name}`.trim());
-      manage.disabled = !writes || !notebookWrites || !!options.gone;
-      if (!writes) manage.title = "Changes are disabled by server policy.";
-      else if (!notebookWrites) manage.title = "Notebook changes require the confirmed Notebook controller contract.";
-      else if (options.gone) manage.title = "This Notebook is no longer observed. Refresh inventory before managing it.";
-      else manage.title = "Open Notebook management for this exact observed Notebook.";
+      const policyReason = notebookManagementReason();
+      const goneReason = options.gone ? "This Notebook is no longer observed. Refresh inventory before managing it." : "";
+      const unavailable = goneReason || policyReason;
+      manage.disabled = !!unavailable;
+      manage.title = unavailable || "Open Notebook management for this exact observed Notebook.";
       // The same drawer, prefill and policy gates as the page-level Notebook
       // action are reused. The selected action is never silently switched.
       manage.addEventListener("click", () => openNotebookManagement(resource));
       actions.append(manage);
       body.append(actions);
+      if (unavailable) body.append(el("p", "Manage Notebook is unavailable: " + unavailable, "hint"));
+    }
+    if (storageActionKinds.has(resource.kind || "")) {
+      const actions = el("div", undefined, "drawer-actions");
+      const edit = el("button", "Edit", "secondary");
+      edit.type = "button";
+      edit.setAttribute("aria-label", `Edit ${resource.kind} ${resource.namespace ? resource.namespace + "/" : ""}${name}`);
+      const remove = el("button", "Delete", "danger");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Delete ${resource.kind} ${resource.namespace ? resource.namespace + "/" : ""}${name}`);
+      const editReason = options.gone ? "This resource is no longer observed. Refresh inventory and open it again." : (!resource.uid ? "This resource has no stable observed UID. Refresh inventory before opening a change." : storageFeatureReason("edit"));
+      const deleteReason = options.gone ? "This resource is no longer observed. Refresh inventory and open it again." : (!resource.uid ? "This resource has no stable observed UID. Refresh inventory before opening a change." : storageFeatureReason("delete"));
+      edit.disabled = !!editReason;
+      remove.disabled = !!deleteReason;
+      edit.title = editReason || "Open the restricted YAML editor for this exact observed resource.";
+      remove.title = deleteReason || "Prepare a deletion plan for this exact observed resource.";
+      edit.addEventListener("click", event => openStorageAction(resource, "edit", event?.currentTarget));
+      remove.addEventListener("click", event => openStorageAction(resource, "delete", event?.currentTarget));
+      actions.append(edit, remove);
+      body.append(actions);
+      if (editReason) body.append(el("p", "Edit is unavailable: " + editReason, "hint"));
+      if (deleteReason) body.append(el("p", "Delete is unavailable: " + deleteReason, "hint"));
     }
   }
   // The observed resource behind the open drawer, if any.
@@ -1751,6 +1893,308 @@
     }
     return "";
   }
+  // ---- Notebook policy presentation ---------------------------------------
+  // The page-level and details actions share one reason. It names the exact
+  // configuration gates rather than hiding the action without explanation.
+  function notebookManagementReason() {
+    const missing = [];
+    if (!writes) missing.push("features.writesEnabled is false");
+    if (!notebookWrites) missing.push("notebooks.controllerContractConfirmed is false");
+    if (!missing.length) return "";
+    return `Notebook management is disabled by server policy because ${missing.join(" and ")}. Enable both only after the installed Notebook controller contract is actually verified; this console never enables them automatically.`;
+  }
+  function syncNotebookPagePolicy() {
+    const reason = notebookManagementReason();
+    const button = $("#notebook-page-manage");
+    if (button) {
+      button.disabled = !!reason;
+      button.title = reason || "Open Notebook management for an observed Notebook.";
+      button.setAttribute("aria-disabled", reason ? "true" : "false");
+    }
+    const hint = $("#notebook-page-policy");
+    if (hint) {
+      hint.textContent = reason;
+      hint.hidden = !reason;
+    }
+  }
+
+  // ---- Storage YAML edit and deletion -------------------------------------
+  // Both actions are only ever prepared through the existing typed plan
+  // workflow. The browser never sends a direct Kubernetes mutation and never
+  // stores the resource projection in local or session storage.
+  function storageFeatureReason(mode) {
+    if (!writes) return "Changes are disabled by server policy (features.writesEnabled is false).";
+    if (mode === "edit" && !storageEditingFeature) return "Storage YAML editing is disabled by server policy (features.storageEditing is false).";
+    if (mode === "delete" && !storageDeletionFeature) return "Storage deletion is disabled by server policy (features.storageDeletion is false).";
+    return "";
+  }
+  function storageLabel(operation) {
+    return `${operation.kind} ${operation.namespace ? operation.namespace + "/" : ""}${operation.name}`;
+  }
+  function storageDrawer(mode) { return $(`#storage-${mode}-drawer`); }
+  function storageDocumentQuery(operation) {
+    return "storage-document?kind=" + encodeURIComponent(operation.kind) +
+      "&name=" + encodeURIComponent(operation.name) +
+      (operation.namespace ? "&namespace=" + encodeURIComponent(operation.namespace) : "");
+  }
+  function storagePolicyHint(resource, mode) {
+    if (mode === "edit" && resource.kind === "PersistentVolumeClaim") {
+      return "A PersistentVolumeClaim size change may only increase the request, and only when features.pvcExpansion is enabled. Shrink and no-op changes are refused by the server. metadata.labels follows the server projection warnings; this console never infers a label change.";
+    }
+    if (mode === "edit") {
+      return "Only an Available, unclaimed and unreserved PersistentVolume in an approved StorageClass can be edited. The server revalidates the live object and its class. metadata.labels follows the server projection warnings; this console never infers a label change.";
+    }
+    if (resource.kind === "PersistentVolumeClaim") {
+      return "Deletion is allowed only when no observed Pod or Notebook references this claim. The server revalidates every observed reference.";
+    }
+    return "Deletion is allowed only for an Available, unclaimed and unreserved PersistentVolume in an approved StorageClass. The server revalidates the live object.";
+  }
+  function observedReclaimPolicy(resource) {
+    if (resource.kind === "PersistentVolume") return String(resource.details?.reclaimPolicy || "");
+    if (resource.kind !== "PersistentVolumeClaim") return "";
+    const volume = String(resource.details?.volume || "");
+    const claim = `${resource.namespace || ""}/${resource.name || ""}`;
+    const pv = (inventory?.resources || []).find(candidate => candidate.kind === "PersistentVolume" &&
+      (candidate.name === volume || String(candidate.details?.claim || "") === claim));
+    return String(pv?.details?.reclaimPolicy || resource.details?.reclaimPolicy || "");
+  }
+  function storageDeleteWarning(resource) {
+    const policy = observedReclaimPolicy(resource);
+    let text = `Deleting the ${storageLabel(resource)} object is not a filesystem wipe.`;
+    if (policy) text += ` The observed reclaim policy is ${policy}.`;
+    if (policy === "Delete") text += " A Delete policy can let the storage controller remove the backing volume, which can be irreversible.";
+    else if (policy === "Retain") text += " A Retain policy may leave the backing data behind for a separate operator decision; it is not proof that the data is gone.";
+    else text += " The reclaim policy may remove or retain the backing data; this console never wipes backend data itself.";
+    text += " The console never removes a finalizer and never forces cleanup. If the result is needs-review, do not retry: inspect History and ask the operator.";
+    return text;
+  }
+  function syncStorageSubmitButtons() {
+    for (const [mode, feature] of [["edit", storageEditingFeature], ["delete", storageDeletionFeature]]) {
+      const form = $(`#storage-${mode}-form`);
+      const button = form ? $('button[type="submit"]', form) : null;
+      if (!button) continue;
+      const operation = storageOperation;
+      button.disabled = !feature || !operation || operation.mode !== mode || !operation.doc || !!operation.planning;
+    }
+  }
+  function storageDocumentFailure(message) {
+    const operation = storageOperation;
+    if (!operation) return;
+    operation.doc = null;
+    const drawer = storageDrawer(operation.mode);
+    if (drawer && !drawer.hidden) {
+      const loading = $(`#storage-${operation.mode}-loading`);
+      if (loading) loading.hidden = true;
+      const form = $(`#storage-${operation.mode}-form`);
+      if (form) showFormError(form, message);
+    }
+    syncStorageSubmitButtons();
+  }
+  // A document read is used only when it still belongs to the current drawer
+  // epoch and to the exact selected kind, namespace, name and UID. A late
+  // answer for a closed or replaced target is discarded, never rendered.
+  async function loadStorageDocument(epoch) {
+    const operation = storageOperation;
+    if (!operation || operation.epoch !== epoch) return;
+    try {
+      const doc = await api(storageDocumentQuery(operation));
+      if (!storageOperation || storageOperation.epoch !== epoch || storageOperation.mode !== operation.mode) return;
+      const found = observedResource(operation);
+      if (!found) {
+        storageDocumentFailure(`The ${storageLabel(operation)} is no longer observed. Close this change and open the current resource again.`);
+        return;
+      }
+      if (String(found.uid || "") !== operation.uid) {
+        storageDocumentFailure(!found.uid
+          ? `The ${storageLabel(operation)} no longer has a stable observed UID. Close this change and open the current resource again.`
+          : `The ${storageLabel(operation)} was replaced by a new observation. Close this change and open the current resource again.`);
+        return;
+      }
+      const kind = String(doc?.kind || ""), namespace = String(doc?.namespace || ""), name = String(doc?.name || "");
+      if (kind !== operation.kind || namespace !== operation.namespace || name !== operation.name) {
+        storageDocumentFailure("The server returned a document for a different storage resource. Close this change and open the selected resource again.");
+        return;
+      }
+      if (!doc?.uid || String(doc.uid) !== operation.uid) {
+        storageDocumentFailure("The selected storage resource UID changed while the document was loading. Refresh inventory and open the current resource again.");
+        return;
+      }
+      if (!doc.resourceVersion) {
+        storageDocumentFailure("The server returned no resource version for this storage resource. Refresh and open it again.");
+        return;
+      }
+      if (typeof doc.yaml !== "string" || !doc.yaml.trim()) {
+        storageDocumentFailure("The server returned no restricted YAML projection for this storage resource.");
+        return;
+      }
+      operation.doc = doc;
+      operation.warnings = Array.isArray(doc.warnings) ? doc.warnings.map(String) : [];
+      const targetUID = $("#storage-" + operation.mode + "-target-uid");
+      const targetRV = $("#storage-" + operation.mode + "-target-rv");
+      if (targetUID) targetUID.value = String(doc.uid);
+      if (targetRV) targetRV.value = String(doc.resourceVersion);
+      const targetCaption = $(`#storage-${operation.mode}-target`);
+      if (targetCaption) targetCaption.textContent = `Target: ${storageLabel(operation)} · UID ${doc.uid} · resourceVersion ${doc.resourceVersion}. The document was fetched from the server for this exact target; the plan is unavailable until this read has settled.`;
+      const loading = $(`#storage-${operation.mode}-loading`);
+      if (loading) loading.hidden = true;
+      if (operation.mode === "edit") {
+        const textarea = $("#storage-edit-yaml");
+        if (textarea) {
+          // The projection is a string value, never markup. An arbitrary
+          // server projection can never become executable DOM here.
+          textarea.value = String(doc.yaml);
+          textarea.disabled = false;
+        }
+        const warnings = $("#storage-edit-warnings");
+        if (warnings) {
+          warnings.textContent = operation.warnings.join(" ");
+          warnings.hidden = !operation.warnings.length;
+        }
+      }
+      clearFormError($(`#storage-${operation.mode}-form`));
+      syncStorageSubmitButtons();
+    } catch (error) {
+      if (!storageOperation || storageOperation.epoch !== epoch) return;
+      storageDocumentFailure(error?.message || "The storage document could not be loaded. Refresh inventory and try again.");
+    }
+  }
+  function openStorageAction(resource, mode, opener) {
+    if (!storageActionKinds.has(resource?.kind || "")) return false;
+    const reason = storageFeatureReason(mode);
+    if (reason) return false;
+    const found = observedResource({ kind: resource.kind || "", namespace: resource.namespace || "", name: resource.name || "" });
+    if (!found) {
+      notify("error", `The observed ${resource.kind} ${resource.name || ""} is no longer present. Refresh inventory and open it again.`, "action", { persist: false });
+      return false;
+    }
+    if (!found.uid) {
+      notify("error", "This storage resource has no stable observed UID. Refresh inventory and open it again.", "action", { persist: false });
+      return false;
+    }
+    const drawer = storageDrawer(mode);
+    const form = $(`#storage-${mode}-form`);
+    if (!drawer || !form) return false;
+    const actionKind = logic.storageActionKind(found.kind, mode);
+    const kind = $("#storage-" + mode + "-kind"); if (kind) kind.value = actionKind;
+    const name = $("#storage-" + mode + "-name"); if (name) name.value = found.name || "";
+    const namespace = $("#storage-" + mode + "-namespace"); if (namespace) namespace.value = found.namespace || "";
+    const targetUID = $("#storage-" + mode + "-target-uid"); if (targetUID) targetUID.value = found.uid || "";
+    const targetRV = $("#storage-" + mode + "-target-rv"); if (targetRV) targetRV.value = "";
+    const target = $("#storage-" + mode + "-target");
+    if (target) target.textContent = `Target: ${storageLabel(found)} · selected observation UID ${found.uid} · the current server projection is fetched before any plan can be prepared.`;
+    const loading = $(`#storage-${mode}-loading`); if (loading) loading.hidden = false;
+    const reasonInput = $("#storage-" + mode + "-reason"); if (reasonInput) reasonInput.value = "";
+    clearFormError(form);
+    if (mode === "edit") {
+      const textarea = $("#storage-edit-yaml"); if (textarea) { textarea.value = ""; textarea.disabled = true; }
+      const warnings = $("#storage-edit-warnings"); if (warnings) { warnings.textContent = ""; warnings.hidden = true; }
+      const policy = $("#storage-edit-policy"); if (policy) policy.textContent = storagePolicyHint(found, mode);
+    } else {
+      const confirm = $("#storage-delete-confirm"); if (confirm) confirm.value = "";
+      const ack = $("#storage-delete-ack"); if (ack) ack.checked = false;
+      const warning = $("#storage-delete-warning"); if (warning) { warning.textContent = storageDeleteWarning(found); warning.hidden = false; }
+    }
+    // Opening a new drawer is a new operation context. openDrawer may close a
+    // previous storage drawer and clear its operation; the new binding is
+    // installed afterwards, with a fresh epoch that discards every old read.
+    openDrawer(drawer, opener);
+    storageEpoch++;
+    storageOperation = {
+      mode, kind: found.kind, namespace: found.namespace || "", name: found.name || "",
+      uid: String(found.uid || ""), returnKey: resourceKey(found), epoch: storageEpoch, doc: null, warnings: [], planning: false
+    };
+    syncStorageSubmitButtons();
+    loadStorageDocument(storageEpoch).catch(() => {});
+    return true;
+  }
+  function storageSubmitError(form) {
+    const mode = form?.id === "storage-delete-form" ? "delete" : "edit";
+    const operation = storageOperation;
+    if (!operation || operation.mode !== mode) return "Open a storage resource before preparing a change.";
+    if (!operation.doc) return "Wait for the current restricted resource document to load before preparing a change.";
+    const found = observedResource(operation);
+    if (!found) return `The ${storageLabel(operation)} is no longer observed. Close this change and open the current resource again.`;
+    if (String(found.uid || "") !== operation.uid) {
+      return !found.uid
+        ? `The ${storageLabel(operation)} no longer has a stable observed UID. Close this change and open the current resource again; no change was sent.`
+        : `The ${storageLabel(operation)} was replaced by a new observation. Close this change and open the current resource again; no change was sent.`;
+    }
+    const doc = operation.doc;
+    if (String(doc.uid || "") !== operation.uid || String(doc.kind || "") !== operation.kind ||
+      String(doc.namespace || "") !== operation.namespace || String(doc.name || "") !== operation.name) {
+      return "The loaded document no longer matches the selected storage resource. Close this change and open it again; no change was sent.";
+    }
+    const formUID = String($("#storage-" + mode + "-target-uid")?.value || "");
+    const formRV = String($("#storage-" + mode + "-target-rv")?.value || "");
+    if (formUID !== operation.uid || formRV !== String(doc.resourceVersion || "")) {
+      return "The target UID or resourceVersion field no longer matches the loaded document. Close this change and open it again; no change was sent.";
+    }
+    if (mode === "edit") {
+      if (!storageEditingFeature) return storageFeatureReason("edit");
+      const yaml = String($("#storage-edit-yaml")?.value || "");
+      if (!yaml.trim()) return "The restricted YAML projection is required.";
+      if (yaml.length > 32768) return "The restricted YAML projection is limited to 32 KiB.";
+      if (!String($("#storage-edit-reason")?.value || "").trim()) return "This console requires a reason for its audit trail before preparing a storage edit.";
+      return "";
+    }
+    if (!storageDeletionFeature) return storageFeatureReason("delete");
+    const reason = String($("#storage-delete-reason")?.value || "").trim();
+    const confirm = String($("#storage-delete-confirm")?.value || "");
+    const acknowledged = !!$("#storage-delete-ack")?.checked;
+    if (!reason) return "A reason is required to delete a storage resource.";
+    if (!confirm) return `Type "${operation.name}" to confirm the deletion.`;
+    if (confirm !== operation.name) return `The confirmation does not match "${operation.name}". Type it exactly.`;
+    if (!acknowledged) return "Acknowledge that deleting this storage object can lead to data loss before preparing the deletion plan.";
+    return "";
+  }
+  // A storage plan request is bound to the exact drawer epoch, mode and
+  // observed resource identity. A response for a closed or switched context
+  // is discarded before it can close another drawer, inject an old error or
+  // reopen an old plan.
+  function storagePlanContext(form) {
+    const operation = storageOperation;
+    if (!operation || !form || (form.id !== "storage-edit-form" && form.id !== "storage-delete-form")) return null;
+    return {
+      mode: operation.mode, epoch: operation.epoch, kind: operation.kind,
+      namespace: operation.namespace, name: operation.name, uid: operation.uid,
+      resourceVersion: String(operation.doc?.resourceVersion || "")
+    };
+  }
+  function storagePlanContextCurrent(context) {
+    if (!context) return true;
+    const operation = storageOperation;
+    if (!operation) return false;
+    return operation.epoch === context.epoch && operation.mode === context.mode &&
+      operation.kind === context.kind && operation.namespace === context.namespace &&
+      operation.name === context.name && operation.uid === context.uid &&
+      !!operation.doc && String(operation.doc.uid || "") === context.uid &&
+      String(operation.doc.kind || "") === context.kind && String(operation.doc.namespace || "") === context.namespace &&
+      String(operation.doc.name || "") === context.name &&
+      String(operation.doc.resourceVersion || "") === context.resourceVersion;
+  }
+  // A refresh never rewrites the open form. A disappeared or replaced target
+  // is reported and its plan is refused until the administrator opens the
+  // current resource again and a fresh document is fetched.
+  function syncStorageOperation() {
+    const operation = storageOperation;
+    if (!operation) return "";
+    const found = observedResource(operation);
+    let message = "";
+    if (!found) message = `The ${storageLabel(operation)} is no longer observed. Close this change and open the current resource again.`;
+    else if (!found.uid) message = `The ${storageLabel(operation)} no longer has a stable observed UID. Close this change and open the current resource again.`;
+    else if (String(found.uid) !== operation.uid) {
+      message = `The ${storageLabel(operation)} was replaced by a new observation. Close this change and open the current resource again.`;
+    }
+    if (!message) return "";
+    operation.doc = null;
+    const drawer = storageDrawer(operation.mode);
+    if (drawer && !drawer.hidden) {
+      const loading = $(`#storage-${operation.mode}-loading`); if (loading) loading.hidden = true;
+      showFormError($(`#storage-${operation.mode}-form`), message);
+    }
+    syncStorageSubmitButtons();
+    return message;
+  }
   // ---- Profile management ---------------------------------------------------
   // The owner of an existing Profile is read-only: the installed Profile
   // controller cannot transfer it. An update therefore submits the exact
@@ -2159,8 +2603,11 @@
       if (form?.id === "notebook-form" && !notebookWrites) disabled = true;
       if (form?.id === "pod-restart-form" && !podRestartFeature) disabled = true;
       if (form?.id === "node-cordon-form" && !nodeCordonFeature) disabled = true;
+      if (form?.id === "storage-edit-form" && !storageEditingFeature) disabled = true;
+      if (form?.id === "storage-delete-form" && !storageDeletionFeature) disabled = true;
       button.disabled = disabled;
     });
+    syncStorageSubmitButtons();
   }
   $$('[data-action-form]').forEach(form => form.addEventListener("submit", async event => {
     event.preventDefault();
@@ -2176,20 +2623,36 @@
       notify("error", refused, "action", { persist: false });
       return;
     }
+    let storageContext = null;
     try {
+      storageContext = storagePlanContext(form);
+      if (storageContext) {
+        storageOperation.planning = true;
+        syncStorageSubmitButtons();
+      }
       const plan = await api("plans", actionFrom(form));
+      if (storageContext && !storagePlanContextCurrent(storageContext)) return;
+      if (storageContext) storageOperation.planning = false;
       clearFormError(form);
       currentPlan = plan; submitKey = crypto.randomUUID(); preview(plan);
       $("#confirm-plan").checked = false; $("#submit-plan").disabled = true; $("#submit-status").textContent = "";
       closeDrawers(true);
       $("#plan-dialog").showModal();
     } catch (error) {
+      // A response for a closed or switched storage context is discarded. It
+      // must never close the new drawer or inject the old target's error into
+      // the new form.
+      if (storageContext && !storagePlanContextCurrent(storageContext)) return;
+      if (storageContext && storageOperation && storageOperation.epoch === storageContext.epoch) storageOperation.planning = false;
       // The drawer-scoped error is never suppressed by a dismissed toast and
       // survives until the user retries or closes the drawer.
       showFormError(form, error.message);
       notify("error", error.message, "action", { persist: false });
     }
-    finally { syncWriteButtons(); }
+    finally {
+      if (storageContext && storageOperation && storageOperation.epoch === storageContext.epoch) storageOperation.planning = false;
+      syncWriteButtons();
+    }
   }));
   $("#confirm-plan").addEventListener("change", () => { $("#submit-plan").disabled = !$("#confirm-plan").checked || !currentPlan || Date.now() >= new Date(currentPlan.expiresAt).getTime(); });
   $("#cancel-plan").addEventListener("click", () => {
@@ -2276,7 +2739,7 @@
     refresh(false);
   });
   const quotaKeys = new Set(); $$('[data-gpu-quota]').forEach(label => { if (quotaKeys.has(label.dataset.gpuQuota)) label.remove(); else quotaKeys.add(label.dataset.gpuQuota); });
-  storageFields(); notebookFields(); profileFields(); syncWriteButtons();
+  storageFields(); notebookFields(); profileFields(); syncWriteButtons(); syncNotebookPagePolicy();
   refresh(false);
   setInterval(updateTimestamp, 10000);
   setInterval(() => refresh(false), 30000);

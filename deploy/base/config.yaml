@@ -51,6 +51,10 @@ features:
   # enabled. This flag grants no Kubernetes permission; the reviewed RBAC
   # grant is installed separately by the operator.
   profileDeletion: false
+  # Separate opt-ins for restricted PV/PVC YAML edits and unused-only deletion.
+  # Each needs writesEnabled and its own reviewed RBAC grant.
+  storageEditing: false
+  storageDeletion: false
 ui:
   # Optional footer of the console. Empty by default: the console renders no
   # footer at all. The value may be plain text or a small amount of HTML for

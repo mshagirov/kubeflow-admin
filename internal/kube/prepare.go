@@ -55,6 +55,12 @@ func (s *Service) Prepare(ctx context.Context, a model.Action) (model.Prepared, 
 	if a.Kind == "profile.delete" {
 		return s.prepareProfileDelete(ctx, a)
 	}
+	if a.Kind == "pv.edit" || a.Kind == "pvc.edit" {
+		return s.prepareStorageEdit(ctx, a)
+	}
+	if a.Kind == "pv.delete" || a.Kind == "pvc.delete" {
+		return s.prepareStorageDelete(ctx, a)
+	}
 	w, err := s.build(ctx, a)
 	if err != nil {
 		return model.Prepared{}, err
@@ -480,6 +486,12 @@ func quantityEqual(a, b string) bool {
 func (s *Service) Execute(ctx context.Context, p model.Prepared, cp func(string) error) error {
 	if p.Action.Kind == "profile.delete" {
 		return s.executeProfileDelete(ctx, p, cp)
+	}
+	if p.Action.Kind == "pv.edit" || p.Action.Kind == "pvc.edit" {
+		return s.executeStorageEdit(ctx, p, cp)
+	}
+	if p.Action.Kind == "pv.delete" || p.Action.Kind == "pvc.delete" {
+		return s.executeStorageDelete(ctx, p, cp)
 	}
 	if p.Action.Kind == "pod.restart" {
 		return s.executePodRestart(ctx, p, cp)

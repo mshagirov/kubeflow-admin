@@ -114,6 +114,16 @@ type Features struct {
 	// Enabling the flag grants no Kubernetes permission by itself; the
 	// reviewed RBAC grant is a separate, operator-installed step.
 	ProfileDeletion bool `yaml:"profileDeletion"`
+	// StorageEditing enables the restricted YAML edit workflow for a single
+	// unused PersistentVolume (reclaim policy and console-owned labels) or a
+	// PersistentVolumeClaim (storage increase and console-owned labels). It
+	// is never implied by WritesEnabled and grants no Kubernetes permission
+	// by itself.
+	StorageEditing bool `yaml:"storageEditing"`
+	// StorageDeletion enables the unused-only delete workflow for a single
+	// PersistentVolume or PersistentVolumeClaim. It is a separate destructive
+	// opt-in and is never implied by WritesEnabled or StorageEditing.
+	StorageDeletion bool `yaml:"storageDeletion"`
 }
 
 // UI holds the console presentation settings a site may set. It carries no
@@ -259,6 +269,9 @@ func (c Config) Validate() error {
 	}
 	if c.Kubernetes.RequestTimeoutSeconds < 1 || c.Kubernetes.RequestTimeoutSeconds > 60 {
 		return fmt.Errorf("request timeout must be 1..60 seconds")
+	}
+	if (c.Features.StorageEditing || c.Features.StorageDeletion) && !c.Features.WritesEnabled {
+		return fmt.Errorf("storageEditing and storageDeletion require features.writesEnabled")
 	}
 	// The footer is a bounded branding block: plain text or a small amount
 	// of sanitized HTML. The bound is counted in runes (Unicode code

@@ -1,5 +1,6 @@
 "use strict";
-// Optional real-browser acceptance runner for the Profile workflow.
+// Optional real-browser acceptance runner for the Profile and storage
+// workflows.
 //
 // It is not part of the normal Go test path and it adds no dependency to the
 // repository. Run it with:
@@ -28,6 +29,12 @@
 //   PROFILE_READONLY_FIXTURE_PORT  loopback port of the fixture without writes
 //   PROFILE_NOCONTRACT_FIXTURE_PORT loopback port of the fixture without the
 //                           confirmed Notebook controller contract
+//   PROFILE_STORAGE_GATED_FIXTURE_PORT loopback port of the fixture with both
+//                           storage opt-ins disabled
+//
+// The fixture also accepts KF_ADMIN_STORAGE_EDITING and
+// KF_ADMIN_STORAGE_DELETION; the runner starts the storage-gated instance with
+// both set to 0.
 //
 // Without a Playwright module or without a usable Chrome the runner prints
 // SKIP and exits successfully. Everything else is a failure: a fixture that
@@ -51,6 +58,7 @@ const FIXTURE_PORT = process.env.PROFILE_FIXTURE_PORT || "18768";
 const GATED_FIXTURE_PORT = process.env.PROFILE_GATED_FIXTURE_PORT || "18769";
 const READONLY_FIXTURE_PORT = process.env.PROFILE_READONLY_FIXTURE_PORT || "18770";
 const NOCONTRACT_FIXTURE_PORT = process.env.PROFILE_NOCONTRACT_FIXTURE_PORT || "18771";
+const STORAGE_GATED_FIXTURE_PORT = process.env.PROFILE_STORAGE_GATED_FIXTURE_PORT || "18772";
 
 const DESKTOP = { width: 1280, height: 844 };
 const MOBILE = { width: 390, height: 844 };
@@ -110,8 +118,16 @@ const STATEFULSET_WORK = { kind: "StatefulSet", name: "work", namespace: NAMESPA
 const POD_WORK = { kind: "Pod", name: "work", namespace: NAMESPACE, detail: "node: node-a" };
 const BETA_WORK = { namespace: "team-beta" };
 const CLAIM = { kind: "PersistentVolumeClaim", name: "team-alpha-claim", namespace: NAMESPACE, detail: "storageClass: standard" };
+// The same name in two kinds is a different resource. The fixture exposes a
+// Bound claim and volume named data, plus an unclaimed Available volume.
+const STORAGE_CLAIM = { kind: "PersistentVolumeClaim", name: "data", namespace: NAMESPACE, uid: "uid-pvc-team-alpha-data" };
+const STORAGE_VOLUME = { kind: "PersistentVolume", name: "data", namespace: "", uid: "uid-pv-data" };
+const STORAGE_AVAILABLE = { kind: "PersistentVolume", name: "spare-volume", namespace: "", uid: "uid-pv-spare-volume" };
 const POD = { kind: "Pod", name: "team-alpha-notebook-0-0", namespace: NAMESPACE, detail: "node: node-a" };
 const NODE = { kind: "Node", name: "node-a", detail: "version: v1.31.4" };
+// The synthetic fixture observes three Running Pods on node-a, across two
+// namespaces: work, team-alpha-notebook-0-0 and shared-worker.
+const NODE_RUNNING_PODS = 3;
 // The typed synthetic Notebook detail model. The management drawer has to
 // prefill from this observed model, not from a fresh guess.
 const NOTEBOOK_MODEL = {
@@ -166,7 +182,7 @@ async function buildFixture() {
 // offline by construction: the fixture never opens a kubeconfig and never
 // talks to a cluster. A fixed port keeps the base URL stable; an occupied
 // port falls back to an ephemeral one.
-async function startFixture({ artifact, writes = true, deletion = true, contract = true, port } = {}) {
+async function startFixture({ artifact, writes = true, deletion = true, contract = true, storageEditing = true, storageDeletion = true, port } = {}) {
   const launch = async requestedPort => {
     const child = spawn(artifact, [], {
       env: {
@@ -175,6 +191,8 @@ async function startFixture({ artifact, writes = true, deletion = true, contract
         KF_ADMIN_WRITES: writes ? "1" : "0",
         KF_ADMIN_PROFILE_DELETION: deletion ? "1" : "0",
         KF_ADMIN_NOTEBOOK_CONTRACT: contract ? "1" : "0",
+        KF_ADMIN_STORAGE_EDITING: storageEditing ? "1" : "0",
+        KF_ADMIN_STORAGE_DELETION: storageDeletion ? "1" : "0",
         KF_ADMIN_PORT: requestedPort || ""
       },
       stdio: ["ignore", "pipe", "pipe"]
@@ -442,8 +460,61 @@ async function assertNotebookManageFocus(page, details, manage, key) {
     "closing Notebook management focused the Manage control inside the closed details drawer");
 }
 
-// notebookField resolves one control of the Notebook management drawer across
-// the labelled and the legacy selector spellings.
+// openStorageDetails opens the observed details of one exact storage resource.
+// A claim, a volume and a storage class can share a name, so the row is
+// resolved by its kind, namespace and name rather than by its name alone.
+async function openStorageDetails(page, base, resource) {
+  const route = resource.namespace ? "/storage?namespace=" + encodeURIComponent(resource.namespace) : "/storage";
+  await gotoTable(page, base, route, "storage");
+  const rows = page.locator('[data-table="storage"] tbody tr');
+  let target = null;
+  for (let index = 0; index < await rows.count(); index++) {
+    const row = rows.nth(index);
+    if ((await rowKind(row)) !== resource.kind) continue;
+    if ((await resourceNameText(row)) !== resource.name) continue;
+    target = row;
+    break;
+  }
+  assert.ok(target, `the storage table does not show ${resource.kind} ${resource.name}`);
+  const control = target.locator("button.link-button").first();
+  await control.click();
+  const drawer = page.locator("#resource-details-drawer");
+  await drawer.waitFor({ state: "visible", timeout: 10000 });
+  return drawer;
+}
+
+// openStorageEdit follows the visible Edit action and waits until the current
+// restricted document has settled into the editor.
+async function openStorageEdit(page, base, resource) {
+  const details = await openStorageDetails(page, base, resource);
+  const edit = details.locator("button").filter({ hasText: /^Edit$/ }).first();
+  await edit.click();
+  const drawer = page.locator("#storage-edit-drawer");
+  await drawer.waitFor({ state: "visible", timeout: 10000 });
+  await page.waitForFunction(() => {
+    const textarea = document.querySelector("#storage-edit-yaml");
+    return !!(textarea && !textarea.disabled);
+  }, null, { timeout: 10000 });
+  return { details, edit, drawer };
+}
+
+// openStorageDelete follows the visible Delete action and waits until the
+// current document has bound the target UID and resourceVersion.
+async function openStorageDelete(page, base, resource) {
+  const details = await openStorageDetails(page, base, resource);
+  const remove = details.locator("button").filter({ hasText: /^Delete$/ }).first();
+  await remove.click();
+  const drawer = page.locator("#storage-delete-drawer");
+  await drawer.waitFor({ state: "visible", timeout: 10000 });
+  await page.waitForFunction(() => {
+    const uid = document.querySelector("#storage-delete-target-uid");
+    const rv = document.querySelector("#storage-delete-target-rv");
+    return !!(uid && uid.value && rv && rv.value);
+  }, null, { timeout: 10000 });
+  return { details, remove, drawer };
+}
+
+
 async function notebookField(form, candidates) {
   for (const selector of candidates) {
     const field = form.locator(selector);
@@ -607,7 +678,7 @@ async function checkRenderedProjection(context) {
   if (state) assert.equal(csrf, state.identity.csrf, "the projected CSRF token is the session token");
   const scope = await page.locator('meta[name="notification-scope"]').getAttribute("content");
   assert.ok(scope && scope.trim(), "the notification scope is not projected");
-  for (const name of ["notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "node-cordon", "profile-deletion"]) {
+  for (const name of ["notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "node-cordon", "profile-deletion", "storage-editing", "storage-deletion"]) {
     const value = await page.locator(`meta[name="${name}"]`).getAttribute("content");
     assert.ok(value !== null, `the ${name} capability is not projected`);
   }
@@ -618,6 +689,10 @@ async function checkRenderedProjection(context) {
       "the deletion capability does not match the configuration");
     assert.equal(await page.locator('meta[name="notebook-writes"]').getAttribute("content"), String(state.features.notebookContract),
       "the Notebook controller contract capability does not match the configuration");
+    assert.equal(await page.locator('meta[name="storage-editing"]').getAttribute("content"), String(state.features.storageEditing),
+      "the storage editing capability does not match the configuration");
+    assert.equal(await page.locator('meta[name="storage-deletion"]').getAttribute("content"), String(state.features.storageDeletion),
+      "the storage deletion capability does not match the configuration");
   }
   if (state) {
     for (const secret of state.forbiddenStrings) {
@@ -1500,10 +1575,280 @@ async function checkResourceDetailsDrawer(context) {
   await assertRightAligned(page, drawer, "the resource details drawer");
 }
 
-// The Notebook details drawer is the one place that opens Notebook
-// management. Manage Notebook binds the exact observed namespace, Notebook and
-// container. Close and Escape return the focus to a visible control of that
-// same Notebook, never to the Manage control inside a closed details drawer.
+// A Node details drawer shows a scoped Running Pod count above its raw
+// observed details. The link opens the Pods page with an exact, URL-backed node
+// and Running filter across all namespaces. Clearing filters removes it and
+// browser history restores it without any hidden table state.
+async function checkNodeScopedPods(context) {
+  const { page } = context;
+  await gotoTable(page, context.base, "/nodes", "nodes");
+  const drawer = await clickResourceName(page, "nodes", NODE.name);
+  const body = drawer.locator("#resource-details-body");
+  const headings = (await body.locator("h3").allTextContents()).map(heading => heading.trim());
+  const scopedAt = headings.indexOf("Scoped view");
+  const observedAt = headings.indexOf("Observed details");
+  assert.ok(scopedAt >= 0, "the Node details drawer has no Scoped view section");
+  assert.ok(observedAt > scopedAt, "the Node Scoped view is not above Observed details");
+  const link = body.locator("[data-pod-node-link]").first();
+  await link.waitFor({ state: "visible", timeout: 5000 });
+  assert.equal(await link.getAttribute("href"), "/pods?node=node-a&phase=Running",
+    "the Node scoped link does not carry exactly the node and Running filters");
+  assert.match(await visibleText(link), new RegExp(String(NODE_RUNNING_PODS) + "\\s+Running Pods"),
+    "the Node scoped view does not show the observed Running Pod count");
+  await link.click();
+  await page.waitForURL(/\/pods\?node=node-a&phase=Running$/, { timeout: 10000 });
+  const filterUrl = new URL(page.url());
+  assert.equal(filterUrl.searchParams.get("node"), "node-a", "the destination URL lost the exact node");
+  assert.equal(filterUrl.searchParams.get("phase"), "Running", "the destination URL lost the Running filter");
+  assert.equal(filterUrl.searchParams.has("namespace"), false, "the node-scoped view is not restricted to one namespace");
+  assert.equal(await drawer.isVisible().catch(() => false), false, "the Node details drawer stayed open after the scoped handoff");
+  assert.equal(await page.evaluate(() => document.activeElement?.id || ""), "page-title",
+    "the scoped handoff did not focus the visible Pods page heading");
+  const table = page.locator('[data-table="pods"]');
+  const rows = table.locator("tbody tr");
+  await rows.first().waitFor({ timeout: 10000 });
+  assert.equal(await rows.count(), NODE_RUNNING_PODS, "the scoped Pods view does not show exactly the Running Pods on node-a");
+  const states = (await table.locator("tbody tr td:nth-child(8)").allTextContents()).map(value => value.trim());
+  const nodes = (await table.locator("tbody tr td:nth-child(9)").allTextContents()).map(value => value.trim());
+  assert.ok(states.every(state => state === "Running"), "the scoped Pods view includes a non-Running Pod");
+  assert.ok(nodes.every(node => node === "node-a"), "the scoped Pods view includes a Pod from another node");
+  const chip = table.locator("[data-pod-filters]");
+  await chip.waitFor({ state: "visible", timeout: 5000 });
+  const chipText = await visibleText(chip);
+  assert.ok(/Node/i.test(chipText) && chipText.includes("node-a") && /Running/.test(chipText),
+    "the destination does not show a visible node and Running filter chip");
+
+  // Back and forward rehydrate the URL-backed filters and their visible chip.
+  await page.goBack();
+  await page.waitForURL(/\/nodes$/, { timeout: 10000 });
+  await page.goForward();
+  await page.waitForURL(/\/pods\?node=node-a&phase=Running$/, { timeout: 10000 });
+  await rows.first().waitFor({ timeout: 10000 });
+  assert.equal(await rows.count(), NODE_RUNNING_PODS, "browser forward did not restore the node-scoped Pods");
+  await chip.waitFor({ state: "visible", timeout: 5000 });
+
+  // Clear filters rewrites the URL and removes the chip; every Pod returns.
+  await table.locator("[data-clear-filters]").click();
+  await page.waitForFunction(() => location.pathname === "/pods" && location.search === "");
+  assert.equal(await chip.isHidden(), true, "Clear filters left the node chip visible");
+  assert.ok(await rows.count() > NODE_RUNNING_PODS, "Clear filters did not restore the unfiltered Pods view");
+}
+
+// Only the observed PersistentVolume and PersistentVolumeClaim details offer
+// Edit and Delete. A StorageClass keeps its details and grows no actions.
+async function checkStorageDetailsActions(context) {
+  const { page } = context;
+  await gotoTable(page, context.base, "/storage", "storage");
+  const tableActions = await page.locator('[data-table="storage"] button').evaluateAll(nodes =>
+    nodes.filter(node => ["Edit", "Delete"].includes((node.textContent || "").trim())).length);
+  assert.equal(tableActions, 0, "the storage table exposes table-level Edit/Delete actions");
+  for (const resource of [STORAGE_CLAIM, STORAGE_VOLUME]) {
+    const details = await openStorageDetails(page, context.base, resource);
+    const actions = await details.locator("button").evaluateAll(nodes =>
+      nodes.filter(node => ["Edit", "Delete"].includes((node.textContent || "").trim())).map(node => ({
+        text: (node.textContent || "").trim(), disabled: node.disabled, title: node.title || ""
+      })));
+    assert.deepEqual(actions.map(action => action.text).sort(), ["Delete", "Edit"],
+      `the ${resource.kind} details do not offer exactly Edit and Delete`);
+    assert.ok(actions.every(action => !action.disabled), `the ${resource.kind} actions are disabled while both opt-ins are on`);
+    await page.keyboard.press("Escape");
+    await details.waitFor({ state: "hidden", timeout: 5000 });
+  }
+  const storageClass = await openStorageDetails(page, context.base, { kind: "StorageClass", name: "data" });
+  const classActions = await storageClass.locator("button").evaluateAll(nodes =>
+    nodes.filter(node => ["Edit", "Delete"].includes((node.textContent || "").trim())).length);
+  assert.equal(classActions, 0, "StorageClass details expose an Edit or Delete action");
+  await page.keyboard.press("Escape");
+  await storageClass.waitFor({ state: "hidden", timeout: 5000 });
+}
+
+// The YAML editor fetches the current restricted projection, binds the exact
+// observed UID and resourceVersion and submits the typed projection through
+// the existing plan workflow.
+async function checkStorageEditPayload(context) {
+  const { page, capture } = context;
+  const documentReads = [];
+  page.on("request", request => {
+    try { if (new URL(request.url()).pathname === "/api/v1/storage-document") documentReads.push(request.url()); } catch { /* ignore */ }
+  });
+  const { drawer } = await openStorageEdit(page, context.base, STORAGE_CLAIM);
+  const target = (await drawer.locator("#storage-edit-target").innerText()).trim();
+  assert.ok(target.includes("PersistentVolumeClaim") && target.includes("team-alpha/data"), "the editor does not name the exact selected claim");
+  assert.equal(await drawer.locator("#storage-edit-target-uid").inputValue(), STORAGE_CLAIM.uid, "the editor does not bind the observed claim UID");
+  const resourceVersion = await drawer.locator("#storage-edit-target-rv").inputValue();
+  assert.ok(resourceVersion.trim(), "the editor does not bind the current resourceVersion");
+  const textarea = drawer.locator("#storage-edit-yaml");
+  const original = await textarea.inputValue();
+  for (const text of ["kind: PersistentVolumeClaim", "namespace: team-alpha", "uid: uid-pvc-team-alpha-data", "resourceVersion:", "storage: 10Gi"]) {
+    assert.ok(original.includes(text), "the restricted claim projection is missing " + text);
+  }
+  for (const hidden of ["status:", "finalizers:", "annotations:", "managedFields:", "ownerReferences:", "claimRef:", "volumeName:", "synthetic-storage-backend-source"]) {
+    assert.ok(!original.includes(hidden), "the editor exposes a hidden backend field: " + hidden);
+  }
+  assert.match(await drawer.locator("#storage-edit-preserve-hint").innerText(), /not the full manifest/i,
+    "the editor does not state that the projection is partial");
+  const warnings = drawer.locator("#storage-edit-warnings");
+  assert.equal(await warnings.isVisible().catch(() => false), true, "the server-provided projection warnings are not visible");
+  assert.match(await warnings.innerText(), /metadata\.labels follows the server projection/i,
+    "the editor does not delegate label semantics to the server warnings");
+  assert.match(await drawer.locator("#storage-edit-reason-hint").innerText(), /API treats an edit reason as optional/i,
+    "the editor does not distinguish its audit reason from the optional API field");
+  await textarea.fill(original.replace("storage: 10Gi", "storage: 20Gi"));
+  await drawer.locator("#storage-edit-reason").fill("Grow the synthetic claim for browser acceptance");
+  const before = capture.plans.length;
+  await drawer.locator('button[type="submit"]').click();
+  await assertLivePlan(context, capture, before + 1);
+  const plan = capture.plans[before];
+  assert.equal(plan.body.kind, "pvc.edit", "the storage edit did not plan pvc.edit");
+  assert.equal(plan.body.namespace, "team-alpha", "the storage edit lost the claim namespace");
+  assert.equal(plan.body.name, "data", "the storage edit lost the claim name");
+  assert.equal(plan.body.targetUID, STORAGE_CLAIM.uid, "the plan does not carry the observed target UID");
+  assert.equal(plan.body.targetResourceVersion, resourceVersion, "the plan does not carry the observed resourceVersion");
+  assert.ok(String(plan.body.storageYAML).includes("storage: 20Gi"), "the plan does not carry the typed projection");
+  assert.equal(plan.body.confirmName, undefined, "a storage edit carries a deletion confirmation");
+  assert.equal(plan.body.force, undefined, "a storage edit carries a force flag");
+  const dialog = page.locator("#plan-dialog");
+  await page.locator("#cancel-plan").click();
+  await dialog.waitFor({ state: "hidden", timeout: 5000 });
+
+  // Every fresh open performs a full document read; a closed drawer's answer
+  // is never reused as the next form.
+  const beforeReopen = documentReads.length;
+  const reopened = await openStorageEdit(page, context.base, STORAGE_CLAIM);
+  assert.ok(documentReads.length > beforeReopen, "reopening the editor reused an old document instead of fetching the current one");
+  await page.keyboard.press("Escape");
+  await reopened.drawer.waitFor({ state: "hidden", timeout: 5000 });
+
+  // A cluster-scoped PV edit carries no namespace. The synthetic fixture uses
+  // the Available spare volume for a plan, so the acceptance check never
+  // implies that a Bound volume is eligible.
+  const pv = await openStorageEdit(page, context.base, STORAGE_AVAILABLE);
+  const pvYaml = await pv.drawer.locator("#storage-edit-yaml").inputValue();
+  assert.ok(pvYaml.includes("kind: PersistentVolume") && pvYaml.includes("persistentVolumeReclaimPolicy: Retain"),
+    "the PV projection does not show the restricted reclaim policy");
+  await pv.drawer.locator("#storage-edit-reason").fill("Review the synthetic volume policy");
+  const pvBefore = capture.plans.length;
+  await pv.drawer.locator('button[type="submit"]').click();
+  await assertLivePlan(context, capture, pvBefore + 1);
+  const pvPlan = capture.plans[pvBefore];
+  assert.equal(pvPlan.body.kind, "pv.edit");
+  assert.equal(pvPlan.body.namespace, undefined, "a PV edit carries a namespace");
+  assert.equal(pvPlan.body.name, "spare-volume");
+  assert.equal(pvPlan.body.targetUID, STORAGE_AVAILABLE.uid);
+  await page.locator("#cancel-plan").click();
+  await dialog.waitFor({ state: "hidden", timeout: 5000 });
+
+  // The projection is never persisted in browser storage.
+  const stored = await page.evaluate(() => ({
+    local: JSON.stringify(window.localStorage || {}),
+    session: JSON.stringify(window.sessionStorage || {})
+  }));
+  for (const value of [stored.local, stored.session]) {
+    assert.ok(!value.includes("PersistentVolume") && !value.includes("storageYAML") && !value.includes("apiVersion"),
+      "the restricted YAML projection was persisted in browser storage");
+  }
+}
+
+// Deletion requires the current document, a reason, the exact typed name and a
+// separate browser-only acknowledgement. The fixture records a pending plan
+// and operation and never claims a live controller execution.
+async function checkStorageDeletePayload(context) {
+  const { page, capture } = context;
+  const { drawer } = await openStorageDelete(page, context.base, STORAGE_CLAIM);
+  const warning = (await drawer.locator("#storage-delete-warning").innerText()).trim();
+  for (const text of ["not a filesystem wipe", "never removes a finalizer", "needs-review", "do not retry"]) {
+    assert.ok(warning.includes(text), "the deletion warning is missing: " + text);
+  }
+  assert.equal(await drawer.locator("#storage-delete-target-uid").inputValue(), STORAGE_CLAIM.uid);
+  const resourceVersion = await drawer.locator("#storage-delete-target-rv").inputValue();
+  await drawer.locator("#storage-delete-reason").fill("Remove the synthetic unused claim");
+  await drawer.locator("#storage-delete-confirm").fill("data");
+  let before = capture.plans.length;
+  await drawer.locator('button[type="submit"]').click();
+  await page.waitForTimeout(300);
+  assert.equal(capture.plans.length, before, "the deletion proceeded without the data-loss acknowledgement");
+  assert.match(await drawer.locator("#storage-delete-form .form-error").innerText(), /acknowledge/i,
+    "the missing acknowledgement is not explained");
+  await drawer.locator("#storage-delete-ack").check();
+  await drawer.locator("#storage-delete-confirm").fill(" data ");
+  await drawer.locator('button[type="submit"]').click();
+  await page.waitForTimeout(300);
+  assert.equal(capture.plans.length, before, "a padded confirmation reached the plan API");
+  assert.match(await drawer.locator("#storage-delete-form .form-error").innerText(), /does not match/i,
+    "the exact confirmation mismatch is not explained");
+  await drawer.locator("#storage-delete-confirm").fill("data");
+  await drawer.locator('button[type="submit"]').click();
+  await assertLivePlan(context, capture, before + 1);
+  const plan = capture.plans[before];
+  assert.equal(plan.body.kind, "pvc.delete");
+  assert.equal(plan.body.namespace, "team-alpha");
+  assert.equal(plan.body.name, "data");
+  assert.equal(plan.body.targetUID, STORAGE_CLAIM.uid);
+  assert.equal(plan.body.targetResourceVersion, resourceVersion);
+  assert.equal(plan.body.confirmName, "data");
+  assert.ok(String(plan.body.reason).includes("Remove the synthetic unused claim"));
+  assert.equal(plan.body.force, undefined, "the deletion carries a force flag");
+  assert.equal(plan.body.storageYAML, undefined, "the deletion carries a YAML projection");
+  assert.equal(plan.body.dataLossAck, undefined, "the browser acknowledgement reached the plan API");
+  // The fixture only records a pending operation.
+  const operationsBefore = capture.operations.length;
+  await page.locator("#confirm-plan").check();
+  await page.locator("#submit-plan").click();
+  await page.waitForFunction(() => {
+    const notices = document.querySelector("#notifications");
+    return !!(notices && notices.innerText.includes("accepted (Pending)"));
+  }, null, { timeout: 10000 });
+  const operationsBeforeAfter = capture.operations.length;
+  assert.ok(operationsBeforeAfter > operationsBefore, "the confirmed deletion was not submitted as an operation");
+  const notice = (await page.locator("#notifications").innerText()).trim();
+  assert.ok(notice.includes("accepted (Pending)"), "the fixture pending operation is not reported honestly: " + notice);
+  assert.ok(!/succeeded|deleted/i.test(notice), "the console claimed a completed deletion that the fixture never executed");
+
+  const pv = await openStorageDelete(page, context.base, STORAGE_AVAILABLE);
+  const pvWarning = (await pv.drawer.locator("#storage-delete-warning").innerText()).trim();
+  assert.ok(pvWarning.includes("PersistentVolume spare-volume") && pvWarning.includes("Retain"),
+    "the PV deletion warning does not name the observed reclaim policy");
+  await pv.drawer.locator("#storage-delete-reason").fill("Remove the synthetic spare volume");
+  await pv.drawer.locator("#storage-delete-confirm").fill("spare-volume");
+  await pv.drawer.locator("#storage-delete-ack").check();
+  const pvBefore = capture.plans.length;
+  await pv.drawer.locator('button[type="submit"]').click();
+  await assertLivePlan(context, capture, pvBefore + 1);
+  const pvPlan = capture.plans[pvBefore];
+  assert.equal(pvPlan.body.kind, "pv.delete");
+  assert.equal(pvPlan.body.namespace, undefined, "a PV deletion carries a namespace");
+  assert.equal(pvPlan.body.confirmName, "spare-volume");
+  await page.locator("#cancel-plan").click();
+}
+
+// The storage actions stay visible but disabled when either opt-in or writes
+// is off, and the exact gate is stated in visible text.
+async function checkStorageGated(context, label) {
+  const { page, capture } = context;
+  const state = await fetchJson(context.base + "/__fixture").catch(() => null);
+  if (!state) {
+    console.log("NOTE  profile_browser_optional: the external fixture does not expose its capabilities; storage gating is " + label);
+    return;
+  }
+  const details = await openStorageDetails(page, context.base, STORAGE_CLAIM);
+  const actions = await details.locator("button").evaluateAll(nodes =>
+    nodes.filter(node => ["Edit", "Delete"].includes((node.textContent || "").trim())).map(node => ({
+      text: (node.textContent || "").trim(), disabled: node.disabled
+    })));
+  assert.equal(actions.length, 2, "gated storage actions are hidden instead of visible and disabled (" + label + ")");
+  assert.ok(actions.every(action => action.disabled), "a gated storage action is enabled (" + label + ")");
+  const text = (await details.innerText()).trim();
+  if (state.features.writesEnabled === false) {
+    assert.ok(text.includes("features.writesEnabled is false"), "the read-only policy is not explained (" + label + ")");
+  } else {
+    assert.ok(text.includes("features.storageEditing is false"), "the editing gate is not explained (" + label + ")");
+    assert.ok(text.includes("features.storageDeletion is false"), "the deletion gate is not explained (" + label + ")");
+  }
+  assert.equal(capture.plans.length, 0, "a gated storage action planned a change (" + label + ")");
+  await page.keyboard.press("Escape");
+}
+
+
 async function checkNotebookManagementTarget(context) {
   const { page, capture } = context;
   const details = await openNotebookDetails(page, context.base);
@@ -1516,6 +1861,10 @@ async function checkNotebookManagementTarget(context) {
   const manage = await notebookManageControl(details);
   assert.equal(await manage.isDisabled().catch(() => false), false,
     "Manage Notebook is disabled while writes and the controller contract are enabled");
+  assert.equal(await page.locator("#notebook-page-manage").isDisabled().catch(() => false), false,
+    "the page-level Manage notebook control is disabled while both gates are on");
+  assert.equal(await page.locator("#notebook-page-policy").isVisible().catch(() => false), false,
+    "a policy hint is visible while both Notebook gates are on");
 
   await manage.click();
   const form = await findVisible(page, [
@@ -1755,6 +2104,25 @@ async function checkNotebookManagementGated(context, label) {
     assert.equal(await manage.isDisabled().catch(() => false), true,
       "Manage Notebook is enabled without " + label);
   }
+  const manageText = manage ? (await manage.evaluate(node => node.closest("#resource-details-body")?.innerText || "")).trim() : "";
+  const pageButton = page.locator("#notebook-page-manage");
+  assert.equal(await pageButton.isDisabled().catch(() => false), true,
+    "the page-level Manage notebook control is enabled without " + label);
+  const pageHint = page.locator("#notebook-page-policy");
+  assert.equal(await pageHint.isVisible().catch(() => false), true,
+    "the page-level Manage notebook control has no visible policy hint (" + label + ")");
+  const hintText = (await pageHint.innerText()).trim();
+  if (state.features.writesEnabled === false) {
+    assert.match(hintText, /features\.writesEnabled is false/, "the page hint does not name the write gate (" + label + ")");
+  }
+  if (state.features.notebookWrites === false) {
+    assert.match(hintText, /notebooks\.controllerContractConfirmed is false/, "the page hint does not name the controller contract gate (" + label + ")");
+  }
+  if (manage) {
+    assert.match(manageText, /Manage Notebook is unavailable:/, "the details drawer does not show a visible reason (" + label + ")");
+    assert.match(manageText, /features\.writesEnabled is false|notebooks\.controllerContractConfirmed is false/,
+      "the details reason does not name a gate (" + label + ")");
+  }
   assert.equal(capture.plans.length, 0, "a gated Notebook management action planned a change (" + label + ")");
   assert.equal(capture.operations.length, 0, "a gated Notebook management action submitted an operation (" + label + ")");
 }
@@ -1861,6 +2229,7 @@ async function checkResponsive(context) {
   let gatedBase = base;
   let readonlyBase = base;
   let noContractBase = base;
+  let storageGatedBase = base;
   const fixtures = [];
   let artifactDir = "";
   if (!base) {
@@ -1883,6 +2252,9 @@ async function checkResponsive(context) {
       const noContract = await startFixture({ artifact, writes: true, deletion: false, contract: false, port: NOCONTRACT_FIXTURE_PORT });
       fixtures.push(noContract);
       noContractBase = noContract.base;
+      const storageGated = await startFixture({ artifact, writes: true, deletion: false, storageEditing: false, storageDeletion: false, port: STORAGE_GATED_FIXTURE_PORT });
+      fixtures.push(storageGated);
+      storageGatedBase = storageGated.base;
     } catch (error) {
       console.error("FAIL profile_browser_optional: the synthetic fixture could not be built or started (" + error.message + ")");
       for (const fixture of fixtures) fixture.stop();
@@ -1918,7 +2290,7 @@ async function checkResponsive(context) {
     page.on("pageerror", error => errors.push(String((error && error.message) || error)));
     const capture = attachCapture(page);
     try {
-      await fn({ page, capture, errors, base: options.base || base, gatedBase, readonlyBase, noContractBase });
+      await fn({ page, capture, errors, base: options.base || base, gatedBase, readonlyBase, noContractBase, storageGatedBase });
       passed.push(title);
     } catch (error) {
       failures.push(title + ": " + (error && error.message ? error.message : String(error)));
@@ -1945,6 +2317,12 @@ async function checkResponsive(context) {
     await run("the namespace summary links are scoped and filtered by name", checkNamespaceScopedLinks);
     await run("resources of different kinds can share a name", checkCollidingResourceRows);
     await run("the observed details open the right hand drawer", checkResourceDetailsDrawer);
+    await run("a Node opens its exact Running Pods view", checkNodeScopedPods);
+    await run("only PV and PVC details offer Edit and Delete", checkStorageDetailsActions);
+    await run("the storage YAML editor binds the exact target and submits one plan", checkStorageEditPayload);
+    await run("storage deletion needs an exact confirmation and records a pending plan", checkStorageDeletePayload);
+    await run("gated storage actions stay visible with the exact policy reason", checkStorageGated, { base: storageGatedBase });
+    await run("read-only storage actions stay visible with the write policy reason", context => checkStorageGated(context, "writes"), { base: readonlyBase });
     await run("Manage Notebook binds the exact observed target and returns focus", checkNotebookManagementTarget);
     await run("Notebook Edit keeps blank fields and sends exactly the typed change", checkNotebookEditBlankAndPayload);
     await run("switching Notebook clears typed resources, mounts and errors", checkNotebookSwitchClearsTypedState);

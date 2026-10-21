@@ -66,6 +66,29 @@ func TestDatabaseOptions(t *testing.T) {
 	}
 }
 
+func TestStorageFeaturesRequireWrites(t *testing.T) {
+	c, err := load(t, valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.StorageEditing || c.Features.StorageDeletion {
+		t.Fatal("storage write features must be off by default")
+	}
+	for name, body := range map[string]string{
+		"editing":  "features:\n  storageEditing: true\n",
+		"deletion": "features:\n  storageDeletion: true\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := load(t, valid+body); err == nil {
+				t.Fatal("storage feature accepted without writesEnabled")
+			}
+		})
+	}
+	if _, err := load(t, valid+"features:\n  writesEnabled: true\n  storageEditing: true\n  storageDeletion: true\n"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHistoryAndLoggingLimits(t *testing.T) {
 	c, err := load(t, valid)
 	if err != nil {

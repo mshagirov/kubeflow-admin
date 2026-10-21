@@ -1,5 +1,5 @@
 // Package kube implements the deliberately restricted Kubernetes adapter. It never
-// accepts manifests, reads Secrets, or writes child workloads. The separately
+// accepts arbitrary manifests, reads Secrets, or writes child workloads. The separately
 // gated Profile deletion workflow deletes only a reviewed Profile; Kubernetes
 // controllers and garbage collection handle its owned namespace and contents.
 package kube

@@ -55,11 +55,71 @@ Consequently:
 
 ## Dynamic PVCs and expansion
 
-For a new dynamically provisioned workspace, choose an approved class explicitly; do not create a PV yourself. Review Delete versus Retain behavior before choosing a class. The app never directly deletes a PVC/PV. The separately enabled Profile deletion workflow can cascade through its owned namespace and delete every PVC inside it: a Delete reclaim policy can irreversibly delete backing volumes, while Retain-policy PVs and external storage data may remain. Never use Profile deletion as storage cleanup; see [workflow acceptance](ui-workflow-acceptance.md).
+For a new dynamically provisioned workspace, choose an approved class explicitly; do not create a PV yourself. Review Delete versus Retain behavior before choosing a class. Direct PV/PVC deletion is separately gated and unused-only, as described below. Profile deletion can cascade through its owned namespace and delete every PVC inside it: a Delete reclaim policy can irreversibly delete backing volumes, while Retain-policy PVs and external storage data may remain. Never use Profile deletion as storage cleanup; see [workflow acceptance](ui-workflow-acceptance.md).
 
 With `volumeBindingMode: WaitForFirstConsumer`, the operation reports creation success while the claim is still `Pending`: the PVC cannot bind until a consuming Pod is scheduled, and the app never creates that Pod. This is creation success only, not provisioning verification — no volume exists yet, and real binding, capacity and backend behavior remain unproven until the operator schedules a workload and observes the bound claim.
 
 Expansion is upward-only and feature/RBAC gated. A class advertising `allowVolumeExpansion` does not prove its backend procedure works. The initial adapter requires a bound CSI volume whose driver matches the class; plain NFS PV expansion is unsupported. A successful spec patch is not proof that filesystem resize completed. Do not use expansion to change a class, access mode or volume mode.
+
+## Restricted YAML editing and unused-only deletion
+
+Storage resource names open **Resource Details**; the table has no separate
+Details button. PV/PVC details offer **Edit** and **Delete**, subject to the
+server capabilities and fresh target validation. StorageClasses are read-only.
+
+These are separate opt-ins, not implied by `writesEnabled` or `staticStorage`:
+
+```yaml
+features:
+  writesEnabled: true
+  storageEditing: true
+  storageDeletion: true
+  # Needed additionally if increasing a PVC's storage request:
+  pvcExpansion: true
+```
+
+Install only the permissions reviewed for the site:
+`deploy/overlays/storage-editing/rbac.yaml` and/or
+`deploy/overlays/storage-deletion/rbac.yaml`. These grant patch and delete
+respectively on PVs/PVCs, not `cluster-admin`. For a composed site overlay,
+copy the RBAC manifests into that overlay and list them as resources; do not
+stack overlays that each include the base. All shipped feature flags stay false.
+RBAC cannot enforce field-level patch restrictions or unused-only deletion;
+admission policy and coordination must cover other privileged writers too.
+
+**Edit is a restricted YAML projection, not a full manifest editor.** It shows
+the fresh object identity (`apiVersion`, kind, name, namespace, UID and resource
+version), console-owned labels under `kubeflow-admin.io/`, and either the PV
+reclaim policy or PVC storage request. Approved changes are restricted to those
+labels, a PV reclaim policy of `Retain`/`Delete`, and upward-only PVC requests
+subject to the existing expansion checks. PV management is limited to approved,
+Available, unreserved PVs. The identity cannot be changed. Backend addresses,
+NFS paths, volume handles, driver attributes, annotations, unrelated labels,
+status, owner references and finalizers remain hidden and untouched. Unsupported
+fields, YAML aliases, duplicate keys, multiple documents, shrinkage and no-op
+edits are refused. Omit `metadata.labels` to preserve the current console-owned
+labels; supply a map to replace that console-owned subset, including `{}` to
+remove all of it. Unrelated labels are always preserved. A reclaim-policy change can affect later data reclamation;
+it is not just a cosmetic edit.
+
+**Delete requires a reason, exact typed target name and a reviewed plan.** It
+refuses PVCs referenced by observed Pods or Notebook templates (including stopped
+Notebooks), and PVs that are bound, reserved, referenced or not Available. Read
+errors fail closed. Deleting an unused bound PVC may still cause its Delete-policy
+backing volume and data to be destroyed. Deleting a Retain PV object does not
+erase or prove reclamation of the backing data. No finalizer removal, force
+deletion or implicit delete/recreate path exists.
+
+Both workflows fetch fresh identity, dry-run, revalidate and issue a single
+conditional write after the durable checkpoint. A stale UID/resourceVersion
+requires a new review. Deletion succeeds only after disappearance is observed;
+finalizers or an uncertain API result may require operator review, not a retry.
+Incomplete operations are not automatically replayed and retain their locks.
+
+An unused-resource check is **not atomic** with workload creation, a binder or
+external administrator. Run one app writer, coordinate a maintenance window,
+and enforce cluster-side admission/protection where necessary. The UI cannot
+guarantee that storage remains unused between separate Kubernetes API calls.
 
 ## App database is separate
 

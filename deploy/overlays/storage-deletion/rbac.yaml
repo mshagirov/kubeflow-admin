@@ -1,0 +1,25 @@
+# Separate destructive storage opt-in. The application refuses referenced PVCs
+# and bound/reserved PVs. RBAC cannot enforce those state-dependent checks;
+# use admission and coordination to cover other privileged writers too.
+# Never grants finalizer mutation, namespace deletion or forced cleanup.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflow-admin-storage-deletion
+rules:
+  - apiGroups: ['']
+    resources: [persistentvolumes, persistentvolumeclaims]
+    verbs: [delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeflow-admin-storage-deletion
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeflow-admin-storage-deletion
+subjects:
+  - kind: ServiceAccount
+    name: kubeflow-admin
+    namespace: kubeflow-admin

@@ -264,7 +264,7 @@ func observations() []resource {
 			},
 		},
 		{
-			Kind: "PersistentVolumeClaim", Namespace: "team-alpha", Name: "team-alpha-claim", State: "Bound",
+			Kind: "PersistentVolumeClaim", Namespace: "team-alpha", Name: "team-alpha-claim", State: "Bound", UID: "uid-pvc-team-alpha-claim",
 			Details: map[string]string{
 				"requested": "50Gi", "capacity": "50Gi", "storageClass": "standard",
 				"volume": "pvc-team-alpha-claim", "claim": "team-alpha/team-alpha-claim",
@@ -272,7 +272,7 @@ func observations() []resource {
 			},
 		},
 		{
-			Kind: "PersistentVolumeClaim", Namespace: "team-beta", Name: "team-beta-claim", State: "Bound",
+			Kind: "PersistentVolumeClaim", Namespace: "team-beta", Name: "team-beta-claim", State: "Bound", UID: "uid-pvc-team-beta-claim",
 			Details: map[string]string{
 				"requested": "20Gi", "capacity": "20Gi", "storageClass": "standard",
 				"volume": "pvc-team-beta-claim", "claim": "team-beta/team-beta-claim",
@@ -283,15 +283,15 @@ func observations() []resource {
 			// A claim and a volume share the name "data", and a storage class
 			// shares it as well: a row is only identified by its kind and its
 			// name, never by its name alone.
-			Kind: "PersistentVolumeClaim", Namespace: "team-alpha", Name: "data", State: "Bound",
+			Kind: "PersistentVolumeClaim", Namespace: "team-alpha", Name: "data", State: "Bound", UID: "uid-pvc-team-alpha-data",
 			Details: map[string]string{
 				"requested": "10Gi", "capacity": "10Gi", "storageClass": "standard",
-				"volume": "pvc-team-alpha-data", "claim": "team-alpha/data",
+				"volume": "data", "claim": "team-alpha/data",
 				"createdAt": ago(20*day + 3*time.Minute),
 			},
 		},
 		{
-			Kind: "PersistentVolume", Name: "data", State: "Bound",
+			Kind: "PersistentVolume", Name: "data", State: "Bound", UID: "uid-pv-data",
 			Details: map[string]string{
 				"capacity": "10Gi", "storageClass": "standard", "reclaimPolicy": "Retain",
 				"claim": "team-alpha/data", "createdAt": ago(20*day + 2*time.Minute),
@@ -302,10 +302,20 @@ func observations() []resource {
 			Details: map[string]string{"provisioner": "kubeflow.io/data", "reclaimPolicy": "Delete"},
 		},
 		{
-			Kind: "PersistentVolume", Name: "pvc-team-alpha-claim", State: "Bound",
+			Kind: "PersistentVolume", Name: "pvc-team-alpha-claim", State: "Bound", UID: "uid-pv-team-alpha-claim",
 			Details: map[string]string{
 				"capacity": "50Gi", "storageClass": "standard", "reclaimPolicy": "Retain",
 				"claim": "team-alpha/team-alpha-claim", "createdAt": ago(20*day + 10*time.Minute),
+			},
+		},
+		{
+			// An unclaimed Available volume in the approved class: the review
+			// fixture can exercise the PV edit and deletion drawers without
+			// implying that a Bound volume is eligible.
+			Kind: "PersistentVolume", Name: "spare-volume", State: "Available", UID: "uid-pv-spare-volume",
+			Details: map[string]string{
+				"capacity": "20Gi", "storageClass": "standard", "reclaimPolicy": "Retain",
+				"createdAt": ago(18 * day),
 			},
 		},
 		{
@@ -395,7 +405,7 @@ func observations() []resource {
 // resource keys, allowed images, approved storage class and template names
 // and the optional footer text.
 // No database path, no kubeconfig location and no secret ever reaches it.
-func projection(writes, deletion, notebookContract bool) map[string]any {
+func projection(writes, deletion, notebookContract, storageEditing, storageDeletion bool) map[string]any {
 	return map[string]any{
 		"Identity": map[string]any{
 			"Email":             fixtureIdentity.Email,
@@ -412,6 +422,8 @@ func projection(writes, deletion, notebookContract bool) map[string]any {
 				"PodRestarts":     true,
 				"NodeCordon":      true,
 				"ProfileDeletion": deletion && writes,
+				"StorageEditing":  storageEditing && writes,
+				"StorageDeletion": storageDeletion && writes,
 			},
 			"Notebooks": map[string]any{
 				"ControllerContractConfirmed": notebookContract,
@@ -485,14 +497,16 @@ type capture struct {
 }
 
 type server struct {
-	mu             sync.Mutex
-	captures       []capture
-	warnings       []string
-	writes         bool
-	deletion       bool
-	notebookWrites bool
-	tmpl           *template.Template
-	assets         string
+	mu              sync.Mutex
+	captures        []capture
+	warnings        []string
+	writes          bool
+	deletion        bool
+	storageEditing  bool
+	storageDeletion bool
+	notebookWrites  bool
+	tmpl            *template.Template
+	assets          string
 }
 
 func main() {
@@ -507,15 +521,19 @@ func main() {
 	}
 	writes := os.Getenv("KF_ADMIN_WRITES") != "0"
 	deletion := os.Getenv("KF_ADMIN_PROFILE_DELETION") != "0"
+	storageEditing := os.Getenv("KF_ADMIN_STORAGE_EDITING") != "0"
+	storageDeletion := os.Getenv("KF_ADMIN_STORAGE_DELETION") != "0"
 	// The installed Notebook controller contract is an independent capability:
 	// a deployment may enable writes without confirming it.
 	notebookWrites := writes && os.Getenv("KF_ADMIN_NOTEBOOK_CONTRACT") != "0"
 	s := &server{
-		writes:         writes,
-		deletion:       deletion,
-		notebookWrites: notebookWrites,
-		tmpl:           template.Must(template.New("index.html").Parse(string(page))),
-		assets:         assets,
+		writes:          writes,
+		deletion:        deletion,
+		storageEditing:  storageEditing,
+		storageDeletion: storageDeletion,
+		notebookWrites:  notebookWrites,
+		tmpl:            template.Must(template.New("index.html").Parse(string(page))),
+		assets:          assets,
 	}
 
 	mux := http.NewServeMux()
@@ -524,6 +542,7 @@ func main() {
 	mux.HandleFunc("GET /__fixture/captures", s.handleCaptures)
 	mux.HandleFunc("GET /api/v1/me", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, fixtureIdentity) })
 	mux.HandleFunc("GET /api/v1/inventory", s.handleInventory)
+	mux.HandleFunc("GET /api/v1/storage-document", s.handleStorageDocument)
 	for _, list := range []string{"overview", "profiles", "namespaces", "pvs", "pvcs", "notebooks", "storage-classes", "pods", "events", "quotas", "limit-ranges", "role-bindings", "statefulsets", "nodes"} {
 		mux.HandleFunc("GET /api/v1/"+list, s.handleInventory)
 	}
@@ -570,7 +589,7 @@ func port() string {
 
 // handlePage renders the real console template with the projection.
 func (s *server) handlePage(w http.ResponseWriter, r *http.Request) {
-	view := projection(s.writes, s.deletion, s.notebookWrites)
+	view := projection(s.writes, s.deletion, s.notebookWrites, s.storageEditing, s.storageDeletion)
 	if gaps := missingProjectionFields(s.tmpl, view); len(gaps) > 0 {
 		warning := "projection gap: " + strings.Join(gaps, ", ")
 		s.mu.Lock()
@@ -610,8 +629,89 @@ func (s *server) handleStatic(name string) http.HandlerFunc {
 	}
 }
 
-// handleInventory answers the observation list. The list is filtered the same
-// way the real console filters it.
+// handleStorageDocument answers the narrow protected projection the storage
+// editor and deletion drawer review. It is deliberately derived from the same
+// synthetic observation set: no full manifest exists in the fixture, and the
+// answer contains no status, finalizer, annotation, owner reference, claim
+// reference or backend source.
+func (s *server) handleStorageDocument(w http.ResponseWriter, r *http.Request) {
+	kind, ok := canonicalStorageKind(r.URL.Query().Get("kind"))
+	if !ok || !boundedStorageName(r.URL.Query().Get("name"), 253) {
+		writeJSON(w, 400, map[string]any{"error": map[string]any{"code": "invalid_request", "message": "A valid storage kind and name are required."}})
+		return
+	}
+	namespace := strings.TrimSpace(r.URL.Query().Get("namespace"))
+	if kind == "PersistentVolume" {
+		if namespace != "" {
+			writeJSON(w, 400, map[string]any{"error": map[string]any{"code": "invalid_request", "message": "A PersistentVolume takes no namespace."}})
+			return
+		}
+	} else if !boundedStorageName(namespace, 63) {
+		writeJSON(w, 400, map[string]any{"error": map[string]any{"code": "invalid_request", "message": "A valid namespace is required for a PersistentVolumeClaim."}})
+		return
+	}
+	name := r.URL.Query().Get("name")
+	for _, item := range observations() {
+		if item.Kind != kind || item.Name != name || item.Namespace != namespace {
+			continue
+		}
+		response := map[string]any{
+			"kind": kind, "name": name,
+			"uid": item.UID, "resourceVersion": "9001",
+			"yaml": storageProjection(item),
+			"warnings": []string{
+				"Synthetic restricted projection only. No full manifest exists in this fixture.",
+				"metadata.labels follows the server projection. Read these warnings as authoritative; the console never infers a label change from an omitted or empty map.",
+			},
+		}
+		if namespace != "" {
+			response["namespace"] = namespace
+		}
+		writeJSON(w, 200, response)
+		return
+	}
+	writeJSON(w, 404, map[string]any{"error": map[string]any{"code": "resource_not_found", "message": "The storage resource is not observed."}})
+}
+
+func canonicalStorageKind(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "persistentvolume", "pv":
+		return "PersistentVolume", true
+	case "persistentvolumeclaim", "pvc":
+		return "PersistentVolumeClaim", true
+	}
+	return "", false
+}
+
+var storageNamePattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+
+func boundedStorageName(value string, max int) bool {
+	return value != "" && len(value) <= max && storageNamePattern.MatchString(value)
+}
+
+func storageProjection(item resource) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "apiVersion: v1\nkind: %s\nmetadata:\n  name: %s\n", item.Kind, item.Name)
+	if item.Namespace != "" {
+		fmt.Fprintf(&b, "  namespace: %s\n", item.Namespace)
+	}
+	fmt.Fprintf(&b, "  uid: %s\n  resourceVersion: \"9001\"\n  labels:\n    kubeflow-admin.io/managed: \"synthetic\"\n", item.UID)
+	if item.Kind == "PersistentVolume" {
+		policy := item.Details["reclaimPolicy"]
+		if policy == "" {
+			policy = "Retain"
+		}
+		fmt.Fprintf(&b, "spec:\n  persistentVolumeReclaimPolicy: %s\n", policy)
+	} else {
+		requested := item.Details["requested"]
+		if requested == "" {
+			requested = "1Gi"
+		}
+		fmt.Fprintf(&b, "spec:\n  resources:\n    requests:\n      storage: %s\n", requested)
+	}
+	return b.String()
+}
+
 func (s *server) handleInventory(w http.ResponseWriter, r *http.Request) {
 	list := strings.TrimPrefix(r.URL.Path, "/api/v1/")
 	all := observations()
@@ -638,6 +738,7 @@ var allowedActionFields = map[string]bool{
 	"template": true, "subdirectory": true, "container": true, "image": true,
 	"cpuRequest": true, "cpuLimit": true, "memoryRequest": true, "memoryLimit": true,
 	"gpuPreset": true, "gpuCount": true, "mounts": true, "restart": true, "force": true,
+	"storageYAML": true, "targetUID": true, "targetResourceVersion": true,
 }
 
 var quotaKeyPattern = regexp.MustCompile(`^[A-Za-z0-9]+([./-][A-Za-z0-9]+)*$`)
@@ -682,6 +783,55 @@ func (s *server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The synthetic fixture records the narrow storage actions. It validates
+	// the typed identity and reasons, but it never reads a real object and
+	// never executes a controller.
+	switch body["kind"] {
+	case "pv.edit", "pvc.edit":
+		if !s.writes || !s.storageEditing {
+			writeJSON(w, 403, map[string]any{"error": map[string]any{"code": "policy_denied", "message": "Storage editing is disabled by server policy."}})
+			return
+		}
+		yaml, _ := body["storageYAML"].(string)
+		reason, _ := body["reason"].(string)
+		targetUID, _ := body["targetUID"].(string)
+		targetRV, _ := body["targetResourceVersion"].(string)
+		switch {
+		case strings.TrimSpace(yaml) == "":
+			writeJSON(w, 422, map[string]any{"error": map[string]any{"code": "validation_failed", "message": "A restricted YAML projection is required."}})
+			return
+		case len(yaml) > 32768:
+			writeJSON(w, 422, map[string]any{"error": map[string]any{"code": "validation_failed", "message": "The restricted YAML projection is limited to 32 KiB."}})
+			return
+		case len([]rune(reason)) > 500:
+			writeJSON(w, 422, map[string]any{"error": map[string]any{"code": "validation_failed", "message": "An edit reason is optional but must not exceed 500 characters."}})
+			return
+		case targetUID == "" || targetRV == "":
+			writeJSON(w, 422, map[string]any{"error": map[string]any{"code": "validation_failed", "message": "A storage edit requires the observed target UID and resourceVersion."}})
+			return
+		}
+	case "pv.delete", "pvc.delete":
+		if !s.writes || !s.storageDeletion {
+			writeJSON(w, 403, map[string]any{"error": map[string]any{"code": "policy_denied", "message": "Storage deletion is disabled by server policy."}})
+			return
+		}
+		name, _ := body["name"].(string)
+		confirm, _ := body["confirmName"].(string)
+		reason, _ := body["reason"].(string)
+		targetUID, _ := body["targetUID"].(string)
+		targetRV, _ := body["targetResourceVersion"].(string)
+		switch {
+		case confirm != name || name == "":
+			writeJSON(w, 422, map[string]any{"error": map[string]any{"code": "validation_failed", "message": "The typed confirmation must exactly match the storage resource name."}})
+			return
+		case strings.TrimSpace(reason) == "":
+			writeJSON(w, 422, map[string]any{"error": map[string]any{"code": "validation_failed", "message": "A reason is required for storage deletion."}})
+			return
+		case targetUID == "" || targetRV == "":
+			writeJSON(w, 422, map[string]any{"error": map[string]any{"code": "validation_failed", "message": "Storage deletion requires the observed target UID and resourceVersion."}})
+			return
+		}
+	}
 	s.record("plan", body, r)
 
 	// The plan is dated against the real clock of the fixture, for every
@@ -689,12 +839,19 @@ func (s *server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	// console refuses to submit a plan whose expiry has passed, so a fixture
 	// that answered with a stale instant would block the whole workflow.
 	now := time.Now().UTC()
+	warnings := []string{"Synthetic fixture plan: no cluster was contacted and nothing was mutated."}
+	switch body["kind"] {
+	case "pv.edit", "pvc.edit":
+		warnings = append(warnings, "The fixture records the typed restricted projection only; no object was patched.")
+	case "pv.delete", "pvc.delete":
+		warnings = append(warnings, "The fixture records a pending deletion only; no object was deleted and no reclaim policy was exercised.")
+	}
 	prepared := map[string]any{
 		"action":          body,
 		"targetUID":       "synthetic-uid-0001",
 		"resourceVersion": "4242",
 		"summary":         "Synthetic plan captured in memory by the offline fixture.",
-		"warnings":        []string{"Synthetic fixture plan: no cluster was contacted and nothing was mutated."},
+		"warnings":        warnings,
 	}
 	if changes := quotaChanges(body); len(changes) > 0 {
 		prepared["changes"] = changes
@@ -753,6 +910,8 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 			"podRestarts":      true,
 			"nodeCordon":       true,
 			"profileDeletion":  s.deletion && s.writes,
+			"storageEditing":   s.storageEditing && s.writes,
+			"storageDeletion":  s.storageDeletion && s.writes,
 			"notebookWrites":   s.notebookWrites,
 			"notebookContract": s.notebookWrites,
 		},
@@ -761,6 +920,7 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 			// so the runner can prove that they do not reach the page.
 			"/nonexistent/synthetic-fixture-kubeconfig",
 			"/nonexistent/synthetic-fixture-admin.db",
+			"synthetic-storage-backend-source",
 		},
 		"captures": len(s.captures),
 		"warnings": s.warnings,
