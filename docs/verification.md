@@ -2,9 +2,9 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
-## Planned 0.4.1 — storage, Notebook gates and Node scope (unpublished)
+## 0.4.1 — storage, Notebook gates and Node scope (22 October 2026)
 
-This work is not in the published `0.4.0` digest below. It adds name-only storage
+This work is published as `0.4.1`, not in the historical `0.4.0` digest below. It adds name-only storage
 details controls, separately gated restricted PV/PVC YAML editing and unused-only
 deletion, plus explicit Notebook management gate explanations. The Node scoped
 Running-Pods view was implemented after the scheduled wake at 05:21 Singapore
@@ -52,10 +52,39 @@ Focused integration evidence before the scheduled Node work:
   found no HIGH/CRITICAL dependency vulnerabilities, detected secrets or manifest
   misconfigurations in the staged release-source snapshot.
 
-GitHub CI and runtime image publication/verification remain pending.
-The next publication must use `0.4.1`, leaving the published `0.4.0` tag intact.
-Commit/push, GitHub CI and image publication follow final verification;
-nothing in this unpublished section is deployment evidence.
+GitHub CI [`39679933717`](https://github.com/mshagirov/kubeflow-admin/actions/runs/39679933717)
+passed both test and security jobs for source commit
+`cb1df16edb52c7b0b70b2dff308ae58728a2adbc`, including race tests, vet/build,
+OpenAPI/manifests, source security scans and AMD64/ARM64 image compilation.
+Both offline runtime images passed Trivy HIGH/CRITICAL vulnerability and secret
+scans. Revision/version labels, non-root UID/GID `65532:65532` and the byte-identical
+`/LICENSE` were verified. Both platforms also failed closed without configuration
+under read-only-root, network-disabled container smoke tests.
+
+### Published image
+
+- Tag: `docker.io/muratshagirov/kubeflow-admin:0.4.1`.
+- Multi-platform index:
+  `sha256:743e39bf0a7ef6ca36f9c64b63cc4652670002c0a3a4b0219fc16b5d39bd5280`.
+- Linux AMD64 manifest:
+  `sha256:2b2893664d06ba61fc44474e8bc9c1969d19fe19d6a9c74fc3d999ffe19ffbfd`.
+- Linux ARM64 manifest:
+  `sha256:c8289f408bd2a71dd0a9bfba327a2aede567465c99a7c9f42bdeb0f70b24a879`.
+- Registry platform manifests exactly match the offline-scanned artifacts.
+  SPDX SBOM and provenance attestations were verified for both platforms.
+  The `0.4.0` registry index was re-read and confirmed unchanged.
+
+Pin the immutable index in the site overlay, on one YAML line:
+
+```yaml
+image: docker.io/muratshagirov/kubeflow-admin@sha256:743e39bf0a7ef6ca36f9c64b63cc4652670002c0a3a4b0219fc16b5d39bd5280
+```
+
+No deployment or live cluster workflow was performed. Storage editing/deletion
+remain separately disabled by default and need reviewed feature flags/RBAC.
+Notebook management still requires writes and a verified controller-contract
+opt-in; the UI now explains missing gates instead of failing silently. Receipt-only
+documentation commits do not change the published application binaries.
 
 ## UI and deployed-quota follow-up — 22 October 2026
 
