@@ -80,7 +80,40 @@ Artifact identity and final verification results are recorded with publication.
   stopped-app, backup, same-cluster and immutable-evidence requirements are
   documented in [operations](operations.md#offline-reconciliation-of-a-profile-deletion).
 
-Image publication receipts follow once complete.
+### Published image receipt
+
+- Application source commit: [`9fa2fc9131302d97fdbd55635b23fcd359bc9435`](https://github.com/mshagirov/kubeflow-admin/commit/9fa2fc9131302d97fdbd55635b23fcd359bc9435).
+- [GitHub CI run 39595823328](https://github.com/mshagirov/kubeflow-admin/actions/runs/39595823328)
+  passed both test and security jobs, including the normal parallel package
+  race suite, vet/build, manifest/OpenAPI checks, source security scans and
+  AMD64/ARM64 container compilation.
+- Published **`docker.io/muratshagirov/kubeflow-admin:0.4.0`** with provenance
+  and SPDX SBOM attestations for both platforms.
+- Multi-platform index:
+  `sha256:676a55357615b31237076c75cc83ec8998315221d54ff1cede21946cead2a452`.
+- Linux AMD64 manifest:
+  `sha256:a9da2bd3b51151e03d807147539794ad4d3829d27e06fc8d64dc95db12d34a2d`.
+- Linux ARM64 manifest:
+  `sha256:83de53176c128a6ffb1cdbe8aac03cbb2c563caf887612090ad01a258560edd1`.
+- Both runtime images passed Trivy HIGH/CRITICAL vulnerability and secret scans.
+  The registry platform manifest digests **exactly match** the offline-scanned
+  artifacts. Registry provenance/SBOM attestations were checked after upload.
+  Both images run as `65532:65532`, carry the source revision label and include
+  the byte-identical repository MIT notice at `/LICENSE`.
+
+The tag was deliberately reused; deploy the **new immutable index digest**,
+not an older `0.4.0` digest or a cached tag. The container image reference must
+remain on one YAML line:
+
+```yaml
+image: docker.io/muratshagirov/kubeflow-admin@sha256:676a55357615b31237076c75cc83ec8998315221d54ff1cede21946cead2a452
+```
+
+No Kubernetes deployment or live workflow test was performed. Profile deletion
+remains separately disabled by default; review its permission and deployment
+prerequisites before enabling it. The configurable HTML footer defaults empty.
+Receipt-only documentation commits after the source commit do not change the
+published binaries.
 
 ## Sidebar and security refresh — 21 October 2026
 
