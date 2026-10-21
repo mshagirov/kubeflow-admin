@@ -18,6 +18,9 @@ for (const [form, backend] of [["profile.create","profile.create"],["profile.quo
 assert.deepEqual(buildAction([["kind","profile.quota"],["owner","unused"],["quota.requests.cpu","2"],["quota.requests.memory",""]]), {kind:"profile.quota.change",quota:{"requests.cpu":"2"}});
 assert.equal(buildAction([["kind","profile.create"],["owner","CaseSensitive-Username"]]).owner,"CaseSensitive-Username");
 assert.deepEqual(buildAction([["kind","pod.restart"],["namespace","team"],["name","work-0"],["reason","  recover stalled kernel  "]]), {kind:"pod.restart",namespace:"team",name:"work-0",reason:"recover stalled kernel"});
+assert.deepEqual(buildAction([["kind","node.cordon"],["namespace","team"],["owner","ignored"],["name","worker-1"],["reason","  drain maintenance  "]]), {kind:"node.cordon",name:"worker-1",reason:"drain maintenance",force:false});
+assert.deepEqual(buildAction([["kind","node.uncordon"],["name","worker-1"],["reason","maintenance complete"],["force","on"]]), {kind:"node.uncordon",name:"worker-1",reason:"maintenance complete",force:true});
+assert.equal(buildAction([["kind","node.cordon"],["name","worker-1"],["reason","x"]], {force:true}).force, true, "explicit force option is preserved");
 assert.deepEqual(containerNames({details:{"image.main":"registry/image","image.sidecar":"proxy","capacity":"10Gi"}}),["main","sidecar"]);
 const resources = [
   {kind:"Profile",name:"team"}, {kind:"Profile",name:"other"},
@@ -37,7 +40,8 @@ assert.equal(text.includes("DO_NOT_RENDER_OPAQUE_HASH"),false); assert.equal(tex
 assert.equal(preview.find(([label])=>label==="GPU count")[1],0);
 assert.deepEqual(preview.find(([label])=>label==="Replacement PVC mounts")[1],[]);
 assert.equal(preview.find(([label])=>label==="Actor")[1],"Alice Admin");
-assert.equal(preview.find(([label])=>label==="Actor ID")[1],"issuer|admin");
+assert.equal(preview.find(([label])=>label==="Actor ID"),undefined,"raw actor IDs are never displayed");
+assert.equal(text.includes("issuer|admin"),false,"legacy actor keys never leak into plan previews");
 assert.ok(text.includes("500m") && text.includes("4Gi") && text.includes("Remove all PVC mounts"));
 assert.ok(text.includes("previously running"));
 const preservePreview = JSON.stringify(previewFields({...plan,prepared:{...plan.prepared,action:unchanged}}));
@@ -47,6 +51,11 @@ const podPreview = JSON.stringify(previewFields({...plan,prepared:{...plan.prepa
 assert.ok(podPreview.includes("pod.restart") && podPreview.includes("recover"));
 assert.ok(podPreview.includes("disruption-budget-aware eviction"));
 assert.ok(podPreview.includes("Force deletion") && podPreview.includes("Never used automatically"));
+const cordonPreview = JSON.stringify(previewFields({...plan,prepared:{...plan.prepared,action:buildAction([["kind","node.cordon"],["name","worker-1"],["reason","maintenance"]])}}));
+assert.ok(cordonPreview.includes("spec.unschedulable=true") && cordonPreview.includes("SchedulingDisabled") && cordonPreview.includes("not evicted"));
+assert.ok(cordonPreview.includes("Force") && cordonPreview.includes("maintenance"));
+const uncordonPreview = JSON.stringify(previewFields({...plan,prepared:{...plan.prepared,action:buildAction([["kind","node.uncordon"],["name","worker-1"],["reason","done"],["force","on"]])}}));
+assert.ok(uncordonPreview.includes("spec.unschedulable=false") && uncordonPreview.includes("scheduled onto this node again"));
 
 // Kubernetes quantities, not lexicographic text.
 assert.equal(logic.quantityValue("500m"), 0.5);
@@ -85,6 +94,11 @@ assert.equal(logic.severityValue("Lost"), 3);
 assert.equal(logic.severityValue("Applying"), 1);
 assert.equal(logic.severityValue("NotActive"), 3);
 assert.equal(logic.severityValue("Not running"), 3);
+assert.equal(logic.severityValue("Ready"), 0);
+assert.equal(logic.severityValue("Ready,SchedulingDisabled"), 2, "cordoned but ready node is a warning");
+assert.equal(logic.severityValue("SchedulingDisabled"), 2);
+assert.equal(logic.severityValue("NotReady"), 3);
+assert.equal(logic.severityValue("NotReady,SchedulingDisabled"), 3, "not-ready outranks the cordon warning");
 assert.equal(logic.severityValue("Mystery-state"), 2, "unrecognized state is neutral, not healthy");
 assert.equal(logic.readyValue("1/1 ready"), 1);
 assert.equal(logic.readyValue("0/2 ready"), 0);
@@ -119,10 +133,10 @@ assert.deepEqual(logic.parseTarget("pod:team/work-0"), {kind:"pod",namespace:"te
 assert.deepEqual(logic.parseTarget("profile:team"), {kind:"profile",namespace:"",name:"team"});
 assert.deepEqual(logic.parseTarget("unstructured"), {kind:"",namespace:"",name:"unstructured"});
 assert.equal(logic.actorLabel({actorDisplay:"Alice",actor:"issuer|subject"}), "Alice");
-assert.equal(logic.actorLabel({actor:"issuer|subject"}), "subject", "legacy labels use the subject after |, not the issuer key");
-assert.equal(logic.actorID({actor:"issuer|subject"}), "issuer|subject", "full issuer key stays secondary metadata");
-assert.equal(logic.actorLabel({actor:"https://issuer.example|" + "a".repeat(400)}).length, 160, "legacy labels are bounded");
-assert.equal(logic.actorLabel({}), "Unknown administrator");
+assert.equal(logic.actorLabel({actor:"issuer|subject"}), "Legacy administrator", "legacy rows never expose the encoded issuer|subject key");
+assert.equal(logic.actorLabel({actor:"https://issuer.example|" + "a".repeat(400)}), "Legacy administrator", "legacy records fall back to one readable label");
+assert.equal(logic.actorLabel({actorDisplay:"A".repeat(400)}).length, 160, "display labels are bounded");
+assert.equal(logic.actorLabel({}), "Legacy administrator");
 
 // Audit summary groups stages per operation, keeps input reason only and
 // never concatenates operation identifiers into the reason.
@@ -168,13 +182,78 @@ const profileList = [
   {kind:"Notebook",name:"work",namespace:"team"}, {kind:"Notebook",name:"system",namespace:"kube-system"},
   {kind:"Pod",name:"work-0",namespace:"team"}, {kind:"Pod",name:"system-0",namespace:"kube-system"},
   {kind:"PersistentVolumeClaim",name:"data",namespace:"team"},
-  {kind:"ResourceQuota",name:"quota",namespace:"team"}, {kind:"ResourceQuota",name:"quota",namespace:"kube-system"}
+  {kind:"StatefulSet",name:"work",namespace:"team"},
+  {kind:"ResourceQuota",name:"quota",namespace:"team"}, {kind:"ResourceQuota",name:"quota",namespace:"kube-system"},
+  {kind:"LimitRange",name:"limits",namespace:"team"},
+  {kind:"RoleBinding",name:"editors",namespace:"team"},
+  {kind:"Event",name:"started",namespace:"team"}
 ];
 assert.deepEqual(logic.profileSummary(profileList,"team").map(entry=>[entry.label,entry.count]), [["Notebooks",1],["Pods",1],["Persistent volume claims",1]]);
 assert.deepEqual(logic.profileSummary(profileList,"empty"), [], "zero counts are omitted, never inferred");
 const visibleProfiles = logic.profileResources(profileList, "").map(resource => resource.kind + ":" + (resource.namespace ? resource.namespace + "/" : "") + resource.name).sort();
-assert.deepEqual(visibleProfiles, ["Namespace:team","Profile:empty","Profile:team"], "Profiles lists only Profiles and name-associated namespaces");
+assert.deepEqual(visibleProfiles, ["Profile:empty","Profile:team"], "Profiles lists only Profiles; namespaces have their own page");
+assert.deepEqual(logic.profileResources(profileList, "kube-system").map(resource => resource.name).sort(), ["empty","team"], "Profiles stay cluster-wide when a namespace scope is active");
+assert.deepEqual(logic.profileNames(profileList).size, 2);
 assert.deepEqual(logic.namespaceOptions(profileList), ["empty","kube-system","team"]);
+
+// Namespace summaries group observed resources by kind and omit empty groups.
+const namespaceGroups = logic.namespaceResources(profileList, "team");
+assert.deepEqual(namespaceGroups.map(group => [group.kind, group.label, group.count]), [
+  ["Notebook","Notebooks",1], ["Pod","Pods",1], ["PersistentVolumeClaim","Persistent volume claims",1],
+  ["StatefulSet","StatefulSets",1], ["ResourceQuota","Resource quotas",1], ["LimitRange","Limit ranges",1],
+  ["RoleBinding","Role bindings",1], ["Event","Events",1]
+]);
+assert.equal(namespaceGroups.find(group => group.kind === "Notebook").href, "/notebooks");
+assert.equal(namespaceGroups.find(group => group.kind === "ResourceQuota").href, "/");
+assert.equal(namespaceGroups.find(group => group.kind === "Pod").items[0].name, "work-0");
+assert.deepEqual(logic.namespaceResources(profileList, "empty"), [], "empty groups are omitted, never inferred");
+assert.deepEqual(logic.namespaceResources(profileList, ""), []);
+assert.equal(namespaceGroups.some(group => group.kind === "Namespace"), false, "the Namespace object is not listed as its own content");
+
+// Concise kubectl-style ages.
+assert.equal(logic.formatAge("2026-01-01T00:00:00Z", Date.parse("2026-01-01T00:00:45Z")), "45s");
+assert.equal(logic.formatAge("2026-01-01T00:00:00Z", Date.parse("2026-01-01T00:12:00Z")), "12m");
+assert.equal(logic.formatAge("2026-01-01T00:00:00Z", Date.parse("2026-01-01T06:00:00Z")), "6h");
+assert.equal(logic.formatAge("2026-01-01T00:00:00Z", Date.parse("2026-01-15T00:00:00Z")), "14d");
+assert.equal(logic.formatAge("", Date.parse("2026-01-15T00:00:00Z")), "—");
+assert.equal(logic.formatAge("not-a-time", Date.parse("2026-01-15T00:00:00Z")), "—");
+assert.equal(logic.formatAge(undefined, Date.parse("2026-01-15T00:00:00Z")), "—");
+
+// Workspace health summary classifies each resource into exactly one state.
+const healthResources = [
+  {kind:"Notebook",name:"running",namespace:"team",state:"Running / Ready"},
+  {kind:"Notebook",name:"stopped",namespace:"team",state:"Stopped"},
+  {kind:"Notebook",name:"broken",namespace:"team",state:"Failed"},
+  {kind:"Pod",name:"ready",namespace:"team",state:"Running",details:{ready:"true",restarts:"0"}},
+  {kind:"Pod",name:"restarting",namespace:"team",state:"Running",details:{ready:"true",restarts:"2"}},
+  {kind:"Pod",name:"pending",namespace:"team",state:"Pending",details:{ready:"false",restarts:"0"}},
+  {kind:"Pod",name:"failed",namespace:"team",state:"CrashLoopBackOff",details:{ready:"false"}},
+  {kind:"Node",name:"n1",state:"Ready",details:{}},
+  {kind:"Node",name:"n2",state:"Ready,SchedulingDisabled",details:{}},
+  {kind:"Node",name:"n3",state:"NotReady",details:{}},
+  {kind:"PersistentVolumeClaim",name:"pvc1",namespace:"team",state:"Bound"},
+  {kind:"PersistentVolumeClaim",name:"pvc2",namespace:"team",state:"Pending"},
+  {kind:"PersistentVolumeClaim",name:"pvc3",namespace:"team",state:"Lost"},
+  {kind:"PersistentVolume",name:"pv1",state:"Bound",details:{}},
+  {kind:"PersistentVolume",name:"pv2",state:"Available",details:{}},
+  {kind:"PersistentVolume",name:"pv3",state:"Failed",details:{}},
+  {kind:"Event",name:"e1",namespace:"team",state:"Normal"},
+  {kind:"Event",name:"e2",namespace:"team",state:"Warning"}
+];
+const health = logic.workspaceHealthSummary(healthResources, "");
+assert.equal(health.Notebooks.total, 3);
+assert.deepEqual(health.Notebooks.states.map(state => [state.label,state.count,state.tone]), [["Running",1,"good"],["Stopped",1,"warn"],["Transitioning",0,"warn"],["Errors",1,"bad"]]);
+assert.deepEqual(health.Pods.states.map(state => [state.label,state.count]), [["Running",1],["Warning",2],["Errors",1]]);
+assert.deepEqual(health.Nodes.states.map(state => [state.label,state.count]), [["Ready",1],["Cordoned",1],["NotReady",1]]);
+assert.deepEqual(health.PersistentVolumeClaims.states.map(state => [state.label,state.count]), [["Bound",1],["Pending",1],["Errors",1]]);
+assert.deepEqual(health.PersistentVolumes.states.map(state => [state.label,state.count]), [["Bound",1],["Available",1],["Other / Error",1]]);
+assert.deepEqual(health.Events.states.map(state => [state.label,state.count]), [["Normal",1],["Warning",1]]);
+for (const key of Object.keys(health)) assert.equal(health[key].states.reduce((sum,state)=>sum+state.count,0), health[key].total, key + " states add up to the total");
+assert.equal(logic.workspaceHealthSummary(healthResources, "team").Nodes.total, 3, "Nodes stay cluster-wide even when a namespace is selected");
+assert.equal(logic.workspaceHealthSummary([], "").Pods.total, 0);
+const missingHealth = logic.workspaceHealthSummary([{kind:"Node", name:"missing"}, {kind:"PersistentVolume", name:"unavailable", state:"Unavailable"}], "");
+assert.equal(missingHealth.Nodes.states.find(state => state.label === "NotReady").count, 1, "missing readiness never implies a healthy Node");
+assert.equal(missingHealth.PersistentVolumes.states.find(state => state.label === "Other / Error").count, 1, "Unavailable never matches Available");
 
 // Navigation, storage-scoped dismissal identifiers and refresh policy.
 assert.deepEqual(logic.routeFor("/operations",""), {page:"history",tab:"operations"});
@@ -183,6 +262,9 @@ assert.deepEqual(logic.routeFor("/history","?tab=audit"), {page:"history",tab:"a
 assert.deepEqual(logic.routeFor("/history","?tab=operations"), {page:"history",tab:"operations"});
 assert.deepEqual(logic.routeFor("/history","?tab=unknown"), {page:"history",tab:"operations"});
 assert.deepEqual(logic.routeFor("/pods",""), {page:"pods",tab:null});
+assert.deepEqual(logic.routeFor("/namespaces",""), {page:"namespaces",tab:null});
+assert.deepEqual(logic.routeFor("/nodes",""), {page:"nodes",tab:null});
+assert.deepEqual(logic.routeFor("/unknown",""), {page:"overview",tab:null});
 assert.deepEqual(logic.routeFor("/",""), {page:"overview",tab:null});
 assert.equal(logic.queryNamespace("?namespace=team"), "team");
 assert.equal(logic.hrefFor("/notebooks","team"), "/notebooks?namespace=team");

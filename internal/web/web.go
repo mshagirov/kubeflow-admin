@@ -53,6 +53,7 @@ type pageFeatures struct {
 	StaticStorage bool
 	PVCExpansion  bool
 	PodRestarts   bool
+	NodeCordon    bool
 }
 type pageNotebooks struct {
 	ControllerContractConfirmed bool
@@ -85,6 +86,7 @@ func buildPageView(identity model.Identity, cfg config.Config) pageView {
 				StaticStorage: cfg.Features.StaticStorage,
 				PVCExpansion:  cfg.Features.PVCExpansion,
 				PodRestarts:   cfg.Features.PodRestarts,
+				NodeCordon:    cfg.Features.NodeCordon,
 			},
 			Notebooks: pageNotebooks{
 				ControllerContractConfirmed: cfg.Notebooks.ControllerContractConfirmed,
@@ -176,7 +178,7 @@ func (s *server) routes(protect func(http.Handler) http.Handler, login, callback
 	private.HandleFunc("POST /logout", logout)
 	private.HandleFunc("POST /auth/logout", logout)
 	tmpl := template.Must(template.ParseFS(assets, "assets/index.html"))
-	for _, path := range []string{"/{$}", "/profiles", "/storage", "/notebooks", "/pods", "/history", "/operations", "/audit"} {
+	for _, path := range []string{"/{$}", "/profiles", "/namespaces", "/storage", "/notebooks", "/pods", "/nodes", "/history", "/operations", "/audit"} {
 		private.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {
 			identity, ok := s.identity(r.Context())
 			if !ok {

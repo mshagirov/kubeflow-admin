@@ -21,20 +21,26 @@ new vm.Script(fs.readFileSync(path.join(root, "logic.js"), "utf8"), { filename: 
 const nav = html.match(/<nav aria-label="Main navigation">([\s\S]*?)<\/nav>/);
 assert.ok(nav, "main navigation is missing");
 const links = [...nav[1].matchAll(/data-page="([^"]+)"[^>]*>([^<]+)</g)].map(match => [match[1], match[2]]);
-assert.deepEqual(links, [["overview", "Overview"], ["profiles", "Profiles"], ["storage", "Storage"], ["notebooks", "Notebooks"], ["pods", "Pods"], ["history", "History"]]);
+assert.deepEqual(links, [["overview", "Overview"], ["profiles", "Profiles"], ["namespaces", "Namespaces"], ["storage", "Storage"], ["notebooks", "Notebooks"], ["pods", "Pods"], ["nodes", "Nodes"], ["history", "History"]]);
 assert.ok(html.includes('href="/history" data-page="history"'));
+assert.ok(html.includes('class="source-link"') && html.includes('href="https://github.com/mshagirov/kubeflow-admin.git"') && html.includes('class="gh-icon"') && html.includes('rel="noopener noreferrer"'), "sidebar links to the public source repository");
+assert.ok(style.includes(".source-link") && style.includes(".gh-icon"));
+assert.equal(html.includes("Administrative control plane"), false, "sidebar omits the administrative control plane label");
+assert.equal(html.includes('<span class="dot"></span>'), false, "sidebar omits the status dot");
 assert.equal(/data-page="(operations|audit)"/.test(html), false, "History replaces separate sidebar entries");
 assert.equal(html.includes('<section id="operations"'), false);
 assert.equal(html.includes('<section id="audit"'), false);
 assert.deepEqual(logic.routeFor("/operations", ""), { page: "history", tab: "operations" });
 assert.deepEqual(logic.routeFor("/audit", ""), { page: "history", tab: "audit" });
 assert.deepEqual(logic.routeFor("/history", "?tab=audit"), { page: "history", tab: "audit" });
+assert.deepEqual(logic.routeFor("/namespaces", ""), { page: "namespaces", tab: null });
+assert.deepEqual(logic.routeFor("/nodes", ""), { page: "nodes", tab: null });
 
 // Required page containers and shared viewers.
-for (const table of ["overview", "profiles", "storage", "notebooks", "pods", "historyOperations", "historyAudit"]) {
+for (const table of ["overview", "profiles", "namespaces", "storage", "notebooks", "pods", "nodes", "historyOperations", "historyAudit"]) {
   assert.ok(html.includes(`data-table="${table}"`), `missing table ${table}`);
 }
-for (const id of ["overview", "profiles", "storage", "notebooks", "pods", "history"]) {
+for (const id of ["overview", "profiles", "namespaces", "storage", "notebooks", "pods", "nodes", "history"]) {
   assert.ok(new RegExp(`<section id="${id}" class="page"`).test(html), `missing page ${id}`);
 }
 assert.ok(html.includes('role="tablist"') && html.includes('data-history-tab="operations"') && html.includes('data-history-tab="audit"'));
@@ -42,6 +48,8 @@ assert.ok(html.includes('role="tablist"') && html.includes('data-history-tab="op
 // Supervisors inject these; the browser must not make an extra /me round trip.
 assert.ok(html.includes('<meta name="notification-scope" content="{{.Identity.NotificationScope}}">'));
 assert.ok(html.includes('<meta name="pod-restarts" content="{{.Config.Features.PodRestarts}}">'));
+assert.ok(html.includes('<meta name="node-cordon" content="{{.Config.Features.NodeCordon}}">'));
+assert.ok(app.includes("nodeCordonFeature") && app.includes('meta("node-cordon")'));
 assert.ok(html.includes('<meta name="csrf-token" content="{{.Identity.CSRF}}">'));
 assert.ok(html.includes("{{if .Identity.DisplayName}}"));
 assert.ok(html.includes('action="/auth/logout" method="post"'));
@@ -53,6 +61,18 @@ assert.ok(app.includes("setBackgroundInert") && app.includes("main.inert") && ap
 assert.ok(app.includes("node.isConnected") || app.includes("target.isConnected"));
 assert.ok(app.includes("showFormError") && app.includes("clearFormErrors"), "drawer form errors are scoped and cleared on close");
 assert.ok(app.includes("persistableCode") && app.includes('code === "inventory"') && app.includes("/^policy:/"), "only stable observation/policy notices remember dismissals");
+assert.equal(app.includes("logic.actorID"), false, "raw actor IDs are never rendered or searched in the UI");
+assert.equal(logic.actorID, undefined, "the Actor ID helper is removed from shared frontend logic");
+assert.equal(logic.profileResources([{kind:"Profile",name:"team"},{kind:"Namespace",name:"team"}], "other").length, 1, "Profiles remain cluster-wide");
+assert.ok(app.includes("actorLabel(record)") && logic.actorLabel({actor:"issuer|subject"}) === "Legacy administrator", "legacy actors use one readable label");
+assert.ok(app.includes("operationStateCell") && app.includes("state-error-slot") && app.includes("error-tooltip") && app.includes('"Failure details: "'), "failure indicators occupy a fixed slot with an accessible tooltip");
+assert.ok(app.includes("aria-describedby") && app.includes("aria-label") && !app.includes("button.title = failure"), "failure tooltip is linked accessibly without a native title duplicate");
+assert.ok(app.includes('id: "toggle-overview-table"') || html.includes('id="toggle-overview-table"'), "the detailed overview table has a toggle");
+assert.ok(html.includes('id="overview-table" data-table="overview" hidden'), "the detailed overview table starts hidden");
+assert.ok(app.includes("workspaceHealthSummary") && html.includes('id="workspace-health-summary"') && html.includes('id="overview-namespace"'), "workspace health summary and its namespace selector are wired");
+assert.ok(app.includes("openNamespaceSummary") && html.includes('id="namespace-summary-drawer"'), "namespace names open a right-side resource summary");
+assert.ok(app.includes("openNodeCordon") && html.includes('id="node-cordon-drawer"') && html.includes('name="force"'), "nodes expose a cordon/uncordon drawer with force");
+assert.ok(app.includes("logic.namespaceResources") && app.includes("logic.formatAge"), "namespaces and age use shared pure helpers");
 assert.ok(app.includes("historyInflight") && app.includes("ensureActiveHistory"), "per-tab in-flight history loading is independent of inventory refresh");
 assert.ok(app.includes("historyLimit") && app.includes("historyWindow") && app.includes("X-History-Limit") && app.includes("X-History-Window"));
 assert.ok(app.includes("submitInflight") && app.includes("cancelPlanForNavigation"), "navigation preserves an in-flight idempotent submit");
@@ -68,13 +88,15 @@ assert.ok(app.includes("historyCache[tab].rows") && app.includes("logic.parseTar
 
 // Accessible management drawers for Profile, Storage, Notebook and Pod restart,
 // including the scoped Profile summary modal.
-for (const drawer of ["profile-drawer", "storage-drawer", "notebook-drawer", "profile-summary-drawer", "pod-restart-drawer"]) {
+for (const drawer of ["profile-drawer", "storage-drawer", "notebook-drawer", "profile-summary-drawer", "pod-restart-drawer", "namespace-summary-drawer", "node-cordon-drawer"]) {
   assert.ok(html.includes(`id="${drawer}"`), `missing ${drawer}`);
 }
-assert.equal((html.match(/aria-modal="true"/g) || []).length >= 5, true);
+assert.equal((html.match(/aria-modal="true"/g) || []).length >= 7, true);
 for (const kind of ["profile", "storage", "notebook"]) assert.ok(html.includes(`data-open-drawer="${kind}"`));
-assert.ok(html.includes('id="profile-form"') && html.includes('id="storage-form"') && html.includes('id="notebook-form"') && html.includes('id="pod-restart-form"'));
+assert.ok(html.includes('id="profile-form"') && html.includes('id="storage-form"') && html.includes('id="notebook-form"') && html.includes('id="pod-restart-form"') && html.includes('id="node-cordon-form"'));
 assert.ok(html.includes('name="kind" value="pod.restart"'));
+assert.ok(html.includes('name="kind" value="node.cordon"'));
+assert.ok(html.includes("spec.unschedulable=true") || app.includes("spec.unschedulable=true"), "cordon description explains the exact effect");
 assert.ok(html.includes("Only Notebook StatefulSet-managed Pods are supported"));
 assert.ok(app.includes("closeDrawers(true)") && app.includes("showModal()"), "drawer closes before the plan dialog");
 assert.ok(app.includes('event.key === "Escape"') && app.includes("focusable(drawer)"));
@@ -94,6 +116,12 @@ assert.ok(style.includes(".notification.warning") && style.includes(".notificati
 assert.ok(style.includes(".notifications{position:fixed;bottom:18px") && style.includes("max-height:50vh"), "notices sit bottom-right with a bounded stack");
 assert.ok(style.includes("body.signed-out main{margin-left:0"), "public signed-out page does not inherit sidebar margin");
 assert.ok(style.includes(".form-error") && style.includes(".policy-status"));
+assert.ok(style.includes(".state-error-slot") && style.includes(".error-dot") && style.includes(".error-tooltip"), "failure indicator styling is fixed-size and does not shift rows");
+assert.ok(style.includes("right:calc(100% + 8px)") && style.includes("transform:translateY(-50%)") && style.includes(".error-dot.open+.error-tooltip"), "failure tooltips open left of the dot and can be pinned by click");
+assert.ok(style.includes(".drawer .table-scroll>table{min-width:0;width:100%}"), "drawer summary tables fit the drawer");
+assert.ok(style.includes('[data-table="historyOperations"] .table-scroll>table{min-width:780px}') && style.includes('[data-table="namespaces"] .table-scroll>table{min-width:460px}'));
+assert.ok(style.includes(".health-summary") && style.includes(".health-count"), "workspace health dashboard cards are styled");
+assert.ok(style.includes('[data-table="nodes"]') && style.includes('[data-table="namespaces"]'));
 
 // Credentials, action schema and plan workflow boundaries.
 assert.ok(app.includes('crypto.randomUUID()'));
@@ -240,17 +268,19 @@ async function bootHarness(options = {}) {
     if (!nodes.has(selector)) nodes.set(selector, new Element("div", selector));
     return nodes.get(selector);
   }
-  const sidebar = [["overview", "/"], ["profiles", "/profiles"], ["storage", "/storage"], ["notebooks", "/notebooks"], ["pods", "/pods"], ["history", "/history"]].map(([page, href]) => {
+  const sidebar = [["overview", "/"], ["profiles", "/profiles"], ["namespaces", "/namespaces"], ["storage", "/storage"], ["notebooks", "/notebooks"], ["pods", "/pods"], ["nodes", "/nodes"], ["history", "/history"]].map(([page, href]) => {
     const link = new Element("a"); link.dataset.page = page; link.href = "https://admin.example.invalid" + href; return link;
   });
-  const sections = ["overview", "profiles", "storage", "notebooks", "pods", "history"].map(id => { const section = new Element("section"); section.id = id; return section; });
+  const sections = ["overview", "profiles", "namespaces", "storage", "notebooks", "pods", "nodes", "history"].map(id => { const section = new Element("section"); section.id = id; return section; });
   const tabs = ["operations", "audit"].map(tab => { const button = new Element("button"); button.dataset.historyTab = tab; return button; });
-  const drawers = ["profile", "storage", "notebook", "profile-summary", "pod-restart"].map(kind => { const drawer = get("#" + kind + "-drawer"); drawer.hidden = true; return drawer; });
+  const drawers = ["profile", "storage", "notebook", "profile-summary", "pod-restart", "namespace-summary", "node-cordon"].map(kind => { const drawer = get("#" + kind + "-drawer"); drawer.hidden = true; return drawer; });
   const sharedError = new Element("p"); sharedError.className = "form-error"; sharedError.hidden = true;
   const sharedSubmit = new Element("button"); sharedSubmit.type = "submit"; sharedSubmit.textContent = "Prepare plan";
   const forms = ["profile-form", "storage-form", "notebook-form", "pod-restart-form"].map(id => {
     const form = new Element("form"); form.id = id; form.append(sharedError, sharedSubmit); return form;
   });
+  const nodeCordonForm = get("#node-cordon-form");
+  nodeCordonForm.elements = { kind: new Element("input"), name: new Element("input"), reason: new Element("input"), force: new Element("input") };
   const openers = ["profile", "storage", "notebook"].map(kind => { const button = new Element("button"); button.dataset.openDrawer = kind; return button; });
   const closers = [new Element("button")];
   const labels = ["pvc.create pvc.expand pv.nfs.create pv.reserve", "pvc.create pv.nfs.create pv.reserve", "pv.reserve", "pv.nfs.create", "pv.nfs.create"].map(value => { const label = new Element("label"); label.dataset.storage = value; return label; });
@@ -276,6 +306,12 @@ async function bootHarness(options = {}) {
       if (selector === "[data-gpu-quota]") return [];
       if (selector === "[data-storage]") return labels;
       if (selector === ".form-error") return [sharedError];
+      if (selector === ".error-dot.open") {
+        const openDots = [];
+        const visit = node => { for (const child of node.children || []) { if (!child || !child.tagName) continue; if (String(child.className).split(/\s+/).includes("error-dot") && child.classList.contains("open")) openDots.push(child); visit(child); } };
+        for (const node of nodes.values()) visit(node);
+        return openDots;
+      }
       if (selector === "[data-action-form] button[type=\"submit\"]") return [sharedSubmit];
       return [];
     },
@@ -283,14 +319,16 @@ async function bootHarness(options = {}) {
     createTextNode(text) { const node = new Element("#text"); node._text = text; return node; },
     addEventListener(name, handler) { (handlers[name] || (handlers[name] = [])).push(handler); }
   };
-  const notebookWrites = options.notebookWrites !== false, podRestarts = options.podRestarts !== false;
-  for (const name of ["csrf-token", "notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "notification-scope"]) {
+  const notebookWrites = options.notebookWrites !== false, podRestarts = options.podRestarts !== false, nodeCordon = options.nodeCordon !== false;
+  for (const name of ["csrf-token", "notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "node-cordon", "notification-scope"]) {
     get(`meta[name="${name}"]`).content = name === "csrf-token" ? "test-csrf"
       : name === "notebook-writes" ? String(notebookWrites)
       : name === "pod-restarts" ? String(podRestarts)
+      : name === "node-cordon" ? String(nodeCordon)
       : name === "notification-scope" ? "random-test-scope" : "false";
   }
   get("#storage-kind").value = "pvc.create"; get("#notebook-kind").value = "notebook.start"; get("#profile-kind").value = "profile.create";
+  get("#overview-table").hidden = true;
   get("#storage-template").selectedOptions = []; get("#pv-selector").selectedOptions = []; get("#replace-mounts").checked = false;
   const mountHint = new Element("p"); mountHint.className = "hint"; get("#replace-mounts").append(mountHint);
   const location = new URL("https://admin.example.invalid/");
@@ -305,12 +343,18 @@ async function bootHarness(options = {}) {
     // Deliberately skewed server time proves the browser uses local receipt age.
     observedAt: options.observedAt || "2000-01-01T00:00:00Z",
     resources: [
-      { kind: "Profile", name: "team" }, { kind: "Namespace", name: "team" },
+      { kind: "Profile", name: "team" },
+      { kind: "Namespace", name: "team", state: "Active", details: { createdAt: "2026-01-01T00:00:00Z" } },
+      { kind: "Namespace", name: "other", state: "Active", details: { createdAt: "2026-01-02T00:00:00Z" } },
       { kind: "Notebook", name: "work", namespace: "team", state: "Running / Ready", details: { "image.main": "image" } },
-      { kind: "Pod", name: "work-0", namespace: "team", state: "Running", owner: "StatefulSet/work", details: { ready: "true", containers: "1/1 ready", restarts: "2", "requested.cpu": "500m", "requested.memory": "1Gi", "limit.cpu": "2", "limit.memory": "4Gi" } },
-      { kind: "Pod", name: "legacy-0", namespace: "team", state: "Running", owner: "Deployment/legacy", details: { ready: "true", containers: "1/1 ready", restarts: "0" } },
+      { kind: "Pod", name: "work-0", namespace: "team", state: "Running", owner: "StatefulSet/work", details: { node: "node-1", ready: "true", containers: "1/1 ready", restarts: "2", "requested.cpu": "500m", "requested.memory": "1Gi", "limit.cpu": "2", "limit.memory": "4Gi" } },
+      { kind: "Pod", name: "legacy-0", namespace: "team", state: "Running", owner: "Deployment/legacy", details: { node: "node-1", ready: "true", containers: "1/1 ready", restarts: "0" } },
       { kind: "PersistentVolumeClaim", name: "data", namespace: "team", state: "Bound", details: { requested: "10Gi", capacity: "10Gi", storageClass: "team-class" } },
-      { kind: "StorageClass", name: "team-class" }
+      { kind: "StorageClass", name: "team-class" },
+      { kind: "Event", name: "scheduled", namespace: "team", state: "Warning" },
+      { kind: "Node", name: "node-1", state: "Ready,SchedulingDisabled", details: { roles: "control-plane", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.1", externalIP: "", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd://2.0", unschedulable: "true", controlPlane: "true" } },
+      { kind: "Node", name: "node-2", state: "Ready", details: { roles: "control-plane", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.2", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd://2.0", unschedulable: "false", controlPlane: "true" } },
+      { kind: "Node", name: "node-3", state: "NotReady", details: { roles: "worker", createdAt: "2026-01-01T00:00:00Z", version: "v1.31.1", internalIP: "10.0.0.3", osImage: "Flatcar", kernelVersion: "6.6.0", containerRuntime: "containerd://2.0", unschedulable: "false", controlPlane: "false" } }
     ],
     warnings: ["Filesystem usage is not available."]
   };
@@ -403,8 +447,25 @@ async function bootHarness(options = {}) {
   assert.equal(appTest.calls.filter(url => url.endsWith("operations")).length, 1, "history loads independently of inventory");
   assert.equal(appTest.calls.some(url => url.includes("/api/v1/me")), false, "the shell must not make an extra identity round trip");
 
+  // Workspace Health dashboard cards respect scope and the detailed table is opt-in.
+  await appTest.click("overview");
+  const healthText = appTest.textOf(appTest.get("#workspace-health-summary"));
+  assert.ok(healthText.includes("Pods") && healthText.includes("Notebooks") && healthText.includes("PVCs") && healthText.includes("PVs") && healthText.includes("Events"), "dashboard cards cover each resource category");
+  assert.ok(healthText.includes("Running") && healthText.includes("Warning") && healthText.includes("Errors"));
+  const overviewTable = appTest.get("#overview-table");
+  assert.equal(overviewTable.hidden, true, "detailed workspace table starts collapsed");
+  appTest.get("#toggle-overview-table").listeners.click[0]();
+  assert.equal(overviewTable.hidden, false, "toggle reveals the detailed table");
+  assert.ok(appTest.textOf(appTest.get("#toggle-overview-table")).includes("Hide detailed resource table"));
+  appTest.get("#toggle-overview-table").listeners.click[0]();
+  assert.equal(overviewTable.hidden, true, "toggle collapses the detailed table again");
+
   // Audit window headers, grouped counts, terminal result and lazily built details.
   await appTest.click("history");
+  const operationHeaders = appTest.walk(appTest.get('[data-table="historyOperations"]'), node => node.tagName === "TH")
+    .map(node => appTest.textOf(node).replace(/[↕▲▼]/g, "").trim()).filter(Boolean);
+  assert.deepEqual(operationHeaders, ["Time", "Actor", "Kind", "Namespace", "Name", "Action", "State"], "operation history keeps exactly the seven readable columns");
+  for (const absent of ["Step", "Detail", "IDs"]) assert.equal(operationHeaders.includes(absent), false, absent + " column is removed");
   appTest.tabs[0].listeners.keydown[0]({ key: "ArrowRight", preventDefault() {} });
   assert.equal(appTest.activeElement, appTest.tabs[1], "ArrowRight moves keyboard focus to the selected History tab");
   await appTest.settle();
@@ -427,11 +488,117 @@ async function bootHarness(options = {}) {
 
   // Unsupported observed owners are disabled and explained.
   await appTest.click("pods");
-  const restartButtons = appTest.walk(appTest.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.textContent === "Restart");
+  const podsContainer = appTest.get('[data-table="pods"]');
+  const podHeaders = appTest.walk(podsContainer, node => node.tagName === "TH")
+    .map(node => appTest.textOf(node).replace(/[↕▲▼]/g, "").trim()).filter(Boolean);
+  assert.ok(podHeaders.indexOf("Node") > podHeaders.indexOf("State"), "Node column follows State on the Pods table");
+  assert.ok(appTest.textOf(podsContainer).includes("node-1"), "Pod rows show the observed node");
+  const restartButtons = appTest.walk(podsContainer, node => node.tagName === "BUTTON" && node.textContent === "Restart");
   assert.ok(restartButtons.length >= 2, "Pod rows expose restart controls");
   const unsupported = restartButtons.find(button => String(button.title).includes("not a StatefulSet"));
   assert.ok(unsupported && unsupported.disabled, "observed non-StatefulSet owner disables restart");
   assert.ok(restartButtons.some(button => !button.disabled), "supported observed StatefulSet Pod stays enabled when policy allows");
+
+  const failureTest = await bootHarness({ operations: [
+    { id: "operation-failed", actor: "https://issuer.example|raw-subject", target: "pod:team/work-0", action: "pod.restart", state: "failed", error: "Synthetic failure detail", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    { id: "operation-expired", actor: "https://issuer.example|raw-subject", target: "pod:team/work-0", action: "pod.restart", state: "failed", historyExpired: true, createdAt: new Date(Date.now() - 1000).toISOString(), updatedAt: new Date(Date.now() - 1000).toISOString() }
+  ] });
+  await failureTest.click("history");
+  const failureContainer = failureTest.get('[data-table="historyOperations"]');
+  const failureText = failureTest.textOf(failureContainer);
+  assert.ok(failureText.includes("Legacy administrator") && !failureText.includes("raw-subject"), "history shows only the readable actor label");
+  assert.ok(failureText.includes("Detailed operation history expired; compact retry record retained."), "history-expired records keep a compact explanation");
+  const errorDots = failureTest.walk(failureContainer, node => String(node.className).includes("error-dot"));
+  const errorDot = errorDots.find(dot => String(dot.attributes["aria-label"]).includes("Synthetic failure detail"));
+  const errorTooltip = failureTest.walk(failureContainer, node => String(node.className).includes("error-tooltip"))
+    .find(tooltip => tooltip.textContent === "Synthetic failure detail");
+  assert.ok(errorDot && errorDot.attributes["aria-label"] === "Failure details: Synthetic failure detail", "failed operations expose an accessible failure indicator");
+  assert.equal(errorDot.title, undefined, "the failure indicator does not duplicate the message in a native title");
+  assert.ok(errorTooltip && errorTooltip.attributes.role === "tooltip" && errorTooltip.id && errorDot.attributes["aria-describedby"] === errorTooltip.id, "the tooltip has a unique id linked by aria-describedby");
+  errorDot.listeners.click[0]();
+  assert.equal(errorDot.classList.contains("open"), true, "clicking the dot keeps the tooltip open");
+  let tooltipPrevented = false;
+  failureTest.handlers.keydown[0]({ key: "Escape", preventDefault() { tooltipPrevented = true; } });
+  assert.equal(tooltipPrevented, true, "Escape closes an open failure tooltip");
+  assert.equal(errorDot.classList.contains("open"), false, "Escape removes the open state");
+
+  // Legacy audit rows show one readable Actor label in the summary and stages.
+  const legacyAuditTest = await bootHarness({ audit: [
+    { id: "legacy-q", operationID: "legacy-op", actor: "https://issuer.example|raw-subject", action: "notebook.stop", target: "notebook:team/work", result: "queued", reason: "legacy reason", time: "2026-01-01T00:00:00Z" },
+    { id: "legacy-s", operationID: "legacy-op", actor: "https://issuer.example|raw-subject", action: "notebook.stop", target: "notebook:team/work", result: "succeeded", reason: "", time: "2026-01-01T00:00:05Z" }
+  ] });
+  await legacyAuditTest.click("history");
+  await legacyAuditTest.clickTab("audit");
+  const legacyAuditContainer = legacyAuditTest.get('[data-table="historyAudit"]');
+  const legacyAuditText = legacyAuditTest.textOf(legacyAuditContainer);
+  assert.ok(legacyAuditText.includes("Legacy administrator") && !legacyAuditText.includes("raw-subject"), "legacy audit summaries show the fallback actor label only");
+  const legacyDetails = legacyAuditTest.walk(legacyAuditContainer, node => String(node.className).includes("stage-details"))[0];
+  legacyDetails.open = true;
+  for (const handler of legacyDetails.listeners.toggle || []) handler();
+  const legacyStageText = legacyAuditTest.textOf(legacyDetails);
+  assert.ok(legacyStageText.includes("Legacy administrator") && !legacyStageText.includes("raw-subject"), "legacy audit stages never reveal the encoded actor key");
+
+  // Namespaces page is cluster-wide even when a page-scope namespace is active.
+  appTest.get("#overview-namespace").value = "team";
+  for (const handler of appTest.get("#overview-namespace").listeners.change || []) handler();
+  await appTest.settle();
+  assert.equal(appTest.location.search, "?namespace=team");
+  await appTest.click("namespaces");
+  const namespacesContainer = appTest.get('[data-table="namespaces"]');
+  const namespacesText = appTest.textOf(namespacesContainer);
+  assert.ok(namespacesText.includes("team") && namespacesText.includes("other"), "Namespaces always lists every observed namespace");
+  assert.ok(namespacesText.includes("Active"), "Namespaces table lists observed Namespace state");
+  assert.equal(namespacesContainer.querySelector("[data-namespace]"), null, "cluster-wide tables omit the namespace selector");
+  const namespaceButton = appTest.walk(namespacesContainer, node => node.tagName === "BUTTON" && node.textContent === "team")[0];
+  assert.ok(namespaceButton, "Namespace names are buttons that open the summary drawer");
+  namespaceButton.listeners.click[0]();
+  const namespaceDrawer = appTest.get("#namespace-summary-drawer");
+  assert.equal(namespaceDrawer.hidden, false, "Namespace summary opens on the right");
+  const namespaceBody = appTest.textOf(appTest.get("#namespace-summary-body"));
+  assert.ok(namespaceBody.includes("Notebooks") && namespaceBody.includes("work") && namespaceBody.includes("Pods") && namespaceBody.includes("Events"), "Namespace summary groups observed resources");
+  appTest.closers[0].listeners.click[0]();
+
+  // A scoped Events link opens Overview with the detailed table already expanded.
+  namespaceButton.listeners.click[0]();
+  const eventsLink = appTest.walk(appTest.get("#namespace-summary-body"), node => node.tagName === "A" && node.href === "/?namespace=team")[0];
+  assert.ok(eventsLink, "namespace summary exposes a scoped Events link to Overview");
+  for (const handler of appTest.handlers.click || []) handler({ target: eventsLink, defaultPrevented: false, button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, preventDefault() {} });
+  await appTest.settle();
+  assert.equal(appTest.get("#overview-table").hidden, false, "scoped Overview links auto-expand the detailed table");
+
+  // Profiles also stay cluster-wide under an active namespace context.
+  await appTest.click("profiles");
+  const profilesContainer = appTest.get('[data-table="profiles"]');
+  assert.ok(appTest.textOf(profilesContainer).includes("team"), "Profiles always lists every Profile");
+  assert.equal(profilesContainer.querySelector("[data-namespace]"), null, "Profiles table has no namespace selector");
+
+  // Nodes remain cluster-wide under an active namespace context.
+  await appTest.click("nodes");
+  const nodesContainer = appTest.get('[data-table="nodes"]');
+  const nodesText = appTest.textOf(nodesContainer);
+  assert.ok(nodesText.includes("node-1") && nodesText.includes("node-2") && nodesText.includes("node-3"), "Nodes always lists every cluster node");
+  assert.ok(nodesText.includes("Ready,SchedulingDisabled") && nodesText.includes("containerd://2.0"), "Nodes table shows wide node details");
+  assert.equal(nodesContainer.querySelector("[data-namespace]"), null, "Nodes table has no namespace selector");
+  assert.ok(appTest.walk(nodesContainer, node => node.tagName === "TH").map(node => node.textContent).includes("Cordon / Uncordon"));
+  const uncordon = appTest.walk(nodesContainer, node => node.tagName === "BUTTON" && node.textContent === "Uncordon")[0];
+  assert.ok(uncordon && !uncordon.disabled, "cordoned nodes offer an enabled Uncordon action");
+  uncordon.listeners.click[0]();
+  assert.equal(appTest.get("#node-cordon-drawer").hidden, false, "cordon/uncordon opens its modal drawer");
+  assert.ok(appTest.get("#node-cordon-description").textContent.includes("spec.unschedulable=false"));
+  assert.equal(appTest.get("#node-cordon-warning").hidden, true, "uncordoning a control-plane node does not require Force");
+  assert.equal(appTest.get("#node-cordon-warning").textContent, "");
+  assert.equal(appTest.get("#node-cordon-form").elements.force.checked, false, "force is opt-in and starts unchecked");
+  appTest.closers[0].listeners.click[0]();
+
+  const cordonNode = name => appTest.walk(nodesContainer, node => node.tagName === "BUTTON" && node.textContent === "Cordon" && node.attributes["aria-label"] === "Cordon node " + name)[0];
+  cordonNode("node-2").listeners.click[0]();
+  assert.equal(appTest.get("#node-cordon-warning").hidden, false, "cordoning a schedulable control-plane node warns about Force");
+  assert.ok(appTest.get("#node-cordon-warning").textContent.includes("control-plane"));
+  appTest.closers[0].listeners.click[0]();
+  cordonNode("node-3").listeners.click[0]();
+  assert.equal(appTest.get("#node-cordon-warning").hidden, false, "cordoning a NotReady node warns about Force");
+  assert.ok(appTest.get("#node-cordon-warning").textContent.includes("NotReady"));
+  appTest.closers[0].listeners.click[0]();
 
   // Drawers inert the background, preserve/restore focus input, and close cleanly.
   appTest.openers[0].focus();
@@ -494,7 +661,7 @@ async function bootHarness(options = {}) {
   await raceTest.click("history");
   assert.equal(raceTest.calls.filter(url => url.endsWith("operations")).length, 1, "History fetches while inventory is still pending");
   assert.equal(raceTest.textOf(raceTest.get('[data-table="historyOperations"]')).includes("Loading history"), false, "History leaves Loading once its independent request resolves");
-  assert.ok(raceTest.textOf(raceTest.get('[data-table="historyOperations"]')).includes("operation-race"));
+  assert.ok(raceTest.textOf(raceTest.get('[data-table="historyOperations"]')).includes("notebook.stop"), "loaded operation rows render without an ID column");
   raceTest.resolveInventory();
   await raceTest.settle();
   assert.equal(raceTest.calls.filter(url => url.endsWith("inventory")).length, 1);
@@ -511,6 +678,11 @@ async function bootHarness(options = {}) {
   assert.ok(appTest.textOf(noController.get("#notifications")).includes("Notebook changes are disabled"), "controller policy becomes a dismissible notice");
   const noPodRestart = await bootHarness({ podRestarts: false });
   assert.ok(appTest.textOf(noPodRestart.get("#notifications")).includes("Pod restarts are disabled"), "pod-restart policy becomes a dismissible notice");
+  const noNodeCordon = await bootHarness({ nodeCordon: false });
+  assert.ok(noNodeCordon.textOf(noNodeCordon.get("#notifications")).includes("Node cordon and uncordon are disabled"), "node cordon policy becomes a dismissible notice");
+  await noNodeCordon.click("nodes");
+  const disabledCordons = noNodeCordon.walk(noNodeCordon.get('[data-table="nodes"]'), node => node.tagName === "BUTTON" && ["Cordon", "Uncordon"].includes(node.textContent));
+  assert.ok(disabledCordons.length > 0 && disabledCordons.every(button => button.disabled), "cordon controls stay disabled when policy denies them");
   await noController.click("pods");
   const disabledRestarts = noController.walk(noController.get('[data-table="pods"]'), node => node.tagName === "BUTTON" && node.textContent === "Restart");
   assert.ok(disabledRestarts.length > 0 && disabledRestarts.every(button => button.disabled), "pod restart stays disabled without the controller contract");

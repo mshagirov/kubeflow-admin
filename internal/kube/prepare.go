@@ -36,6 +36,10 @@ type work struct {
 	podNotebook    *unstructured.Unstructured
 	podNode        *corev1.Node
 	podFingerprint string
+
+	// Node cordon targets are cluster-scoped and intentionally bypass Profile
+	// scope. The Node is re-read in Execute; only stable fields are evidence.
+	node *corev1.Node
 }
 
 func (s *Service) Prepare(ctx context.Context, a model.Action) (model.Prepared, error) {
@@ -61,13 +65,22 @@ func (s *Service) build(ctx context.Context, a model.Action) (*work, error) {
 	if a.Kind == "pod.restart" && !s.Config.Features.PodRestarts {
 		return nil, errors.New("pod restarts are disabled")
 	}
+	if (a.Kind == "node.cordon" || a.Kind == "node.uncordon") && !s.Config.Features.NodeCordon {
+		return nil, errors.New("node cordon is disabled")
+	}
 	w := &work{ev: s.newEvidence()}
 	w.prepared.Action = a
 	w.prepared.Summary = a.Kind + " " + a.Namespace + "/" + a.Name
 	if a.Kind != "pod.restart" {
 		w.prepared.Warnings = []string{"API dry-run does not prove controller reconciliation or available storage/compute capacity."}
 	}
-	if a.Kind == "profile.create" || a.Kind == "profile.quota.change" {
+	if a.Kind == "node.cordon" || a.Kind == "node.uncordon" {
+		// Nodes are cluster-scoped: never require or acquire a Profile scope.
+		w.prepared.Summary = a.Kind + " " + a.Name
+		if err := s.prepareNodeCordon(ctx, a, w); err != nil {
+			return nil, err
+		}
+	} else if a.Kind == "profile.create" || a.Kind == "profile.quota.change" {
 		if a.Namespace != "" && a.Namespace != a.Name {
 			return nil, errors.New("Profile namespace must match its name")
 		}
@@ -154,6 +167,11 @@ func (s *Service) dryRun(ctx context.Context, w *work) error {
 	case "pvc.expand":
 		b, _ := json.Marshal(conditional(string(w.pvc.UID), w.pvc.ResourceVersion, w.ops))
 		_, err := s.Typed.CoreV1().PersistentVolumeClaims(w.pvc.Namespace).Patch(ctx, w.pvc.Name, types.JSONPatchType, b, metav1.PatchOptions{DryRun: o.DryRun})
+		return safe(err)
+	case "node.cordon", "node.uncordon":
+		// The resourceVersion test makes the dry-run atomic with the observed
+		// heartbeat; Execute refreshes and retries it a bounded number of times.
+		_, err := s.Typed.CoreV1().Nodes().Patch(ctx, w.node.Name, types.JSONPatchType, nodeCordonPatch(w.node.UID, w.node.ResourceVersion, w.prepared.Action.Kind == "node.cordon"), metav1.PatchOptions{DryRun: o.DryRun})
 		return safe(err)
 	default:
 		if len(w.ops) == 0 {
@@ -336,6 +354,9 @@ func (s *Service) prepareProfile(ctx context.Context, a model.Action, w *work) e
 func (s *Service) Execute(ctx context.Context, p model.Prepared, cp func(string) error) error {
 	if p.Action.Kind == "pod.restart" {
 		return s.executePodRestart(ctx, p, cp)
+	}
+	if p.Action.Kind == "node.cordon" || p.Action.Kind == "node.uncordon" {
+		return s.executeNodeCordon(ctx, p, cp)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()

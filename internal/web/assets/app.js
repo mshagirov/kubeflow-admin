@@ -8,15 +8,18 @@
   const writes = document.body.dataset.writes === "true";
   const notebookWrites = meta("notebook-writes") === "true";
   const podRestartFeature = meta("pod-restarts") === "true" && writes && notebookWrites;
+  const nodeCordonFeature = meta("node-cordon") === "true" && writes;
   const notificationScope = meta("notification-scope");
   const logic = globalThis.DashboardLogic;
 
   const pageTitles = {
     overview: ["Overview", "A clear view of your Kubeflow workspace."],
     profiles: ["Profiles", "Manage ownership, namespaces and resource quotas."],
+    namespaces: ["Namespaces", "Observed namespaces and the resources they contain."],
     storage: ["Storage", "Provision and grow persistent storage with explicit safeguards."],
     notebooks: ["Notebooks", "Manage workloads and resources with observed-state verification."],
     pods: ["Pods", "Observed workloads, ownership and requested resources."],
+    nodes: ["Nodes", "Cluster node health, capacity context and cordon controls."],
     history: ["History", "Operations and audit records in one accountable view."]
   };
 
@@ -27,6 +30,8 @@
   let inventory = null, inventoryAt = 0, inventoryError = false, loading = false;
   let currentPlan = null, submitKey = null, submitInflight = false;
   let drawerOpener = null;
+  let overviewTableExpanded = false;
+  let errorTipSeq = 0;
   let rowCache = {};
   const historyCache = { operations: { rows: null, at: 0 }, audit: { rows: null, at: 0 } };
   const historyError = { operations: false, audit: false };
@@ -40,9 +45,11 @@
   const tableStates = {
     overview: logic.defaultTableState("name"),
     profiles: logic.defaultTableState("name"),
+    namespaces: logic.defaultTableState("name"),
     storage: logic.defaultTableState("name"),
     notebooks: logic.defaultTableState("name"),
     pods: logic.defaultTableState("name"),
+    nodes: logic.defaultTableState("name"),
     historyOperations: logic.defaultTableState("time", "desc"),
     historyAudit: logic.defaultTableState("time", "desc")
   };
@@ -143,7 +150,7 @@
   function badge(state) {
     const text = String(state || "Not reported");
     const rank = logic.severityValue(text);
-    const cls = rank === 0 ? "badge good" : rank === 1 ? "badge warn" : rank >= 2 ? "badge bad" : "badge";
+    const cls = rank === 0 ? "badge good" : rank === 3 ? "badge bad" : rank >= 1 ? "badge warn" : "badge";
     return el("span", text, cls);
   }
   function formatTime(value) {
@@ -199,6 +206,7 @@
       state: resource.state || "Not reported", desired: desired(resource), requested: resource.details?.requested || desired(resource),
       capacity: capacity(resource), condition: notebookCondition(resource), storageClass: resource.details?.storageClass || "",
       owner, ready: podReady(resource), restarts: podRestartCount(resource),
+      node: resource.details?.node || "",
       cpuRequest: podResourceDetail(resource, "cpuRequest", "requested.cpu"), memoryRequest: podResourceDetail(resource, "memoryRequest", "requested.memory"),
       cpuLimit: podResourceDetail(resource, "cpuLimit", "limit.cpu"), memoryLimit: podResourceDetail(resource, "memoryLimit", "limit.memory"), time: ""
     };
@@ -229,11 +237,61 @@
     return node;
   }
   function actorCell(record) {
-    const label = logic.actorLabel(record), id = logic.actorID(record);
-    const node = el("div", undefined, "actor-cell");
-    node.append(el("span", label));
-    if (id && id !== label) node.append(el("small", id));
+    return el("span", logic.actorLabel(record), "actor-label");
+  }
+  function namespaceNameNode(resource) {
+    const node = el("div", undefined, "resource-name");
+    const open = el("button", resource.name || "Unnamed", "link-button");
+    open.type = "button";
+    open.addEventListener("click", () => openNamespaceSummary(resource.name));
+    node.append(open);
+    node.append(el("small", [resource.kind, resource.namespace].filter(Boolean).join(" · ")));
     return node;
+  }
+  function operationStateCell(operation) {
+    const wrap = el("div", undefined, "state-cell");
+    wrap.append(badge(operation.state));
+    // The slot is always rendered at a fixed size so a failure indicator can
+    // never change row height or shift neighbouring columns.
+    const slot = el("span", undefined, "state-error-slot");
+    const error = String(operation.error || "").trim();
+    const failure = error || (operation.historyExpired ? "Detailed operation history expired; compact retry record retained." : "");
+    if (failure) {
+      const tipID = `err-tip-${operation.id || ++errorTipSeq}`;
+      const button = el("button", undefined, "error-dot");
+      button.type = "button";
+      button.setAttribute("aria-label", "Failure details: " + failure);
+      button.setAttribute("aria-describedby", tipID);
+      const tooltip = el("span", failure, "error-tooltip");
+      tooltip.id = tipID;
+      tooltip.setAttribute("role", "tooltip");
+      button.addEventListener("click", event => {
+        event?.stopPropagation?.();
+        button.classList.remove("dismissed");
+        $$(".error-dot.open").forEach(dot => { if (dot !== button) dot.classList.remove("open"); });
+        button.classList.toggle("open");
+      });
+      // Escape dismissal must survive hover and keyboard focus; clear the
+      // suppression when the pointer leaves or the dot is focused/clicked again.
+      ["mouseleave", "focus"].forEach(type => button.addEventListener(type, () => button.classList.remove("dismissed")));
+      slot.append(button, tooltip);
+    }
+    wrap.append(slot);
+    return wrap;
+  }
+  function nodeCordonButton(resource) {
+    const cordoned = resource.details?.unschedulable === "true";
+    const verb = cordoned ? "Uncordon" : "Cordon";
+    const button = el("button", verb, "secondary small");
+    button.type = "button";
+    button.disabled = !nodeCordonFeature;
+    button.setAttribute("aria-label", `${verb} node ${resource.name || ""}`);
+    if (!writes) button.title = "Changes are disabled by server policy.";
+    else if (meta("node-cordon") !== "true") button.title = "Node cordon and uncordon are disabled by server policy.";
+    else if (cordoned) button.title = "Prepare an uncordon plan: allow new Pods to be scheduled on this node again.";
+    else button.title = "Prepare a cordon plan: stop new Pods from being scheduled on this node without evicting running Pods.";
+    button.addEventListener("click", () => openNodeCordon(resource, cordoned ? "uncordon" : "cordon"));
+    return button;
   }
   function idCell(entries) {
     const node = el("div", undefined, "id-cell");
@@ -271,8 +329,12 @@
       columns: [{ key: "name", label: "Resource" }, { key: "desired", label: "Desired / requested", type: "mixed" }, { key: "state", label: "Observed", type: "severity" }, { key: "capacity", label: "Capacity / condition", type: "quantity" }]
     },
     profiles: {
-      label: "profile resources", empty: "No actual Profiles are observed in this scope. Associated namespaces appear only when a Profile with the same name exists.",
+      label: "profile resources", empty: "No actual Profiles are observed in this scope. Namespaces have their own page and are not listed here.",
       columns: [{ key: "name", label: "Resource" }, { key: "type", label: "Type" }, { key: "namespace", label: "Namespace" }, { key: "state", label: "Observed", type: "severity" }, { key: "desired", label: "Desired / requested", type: "mixed" }]
+    },
+    namespaces: {
+      label: "namespace resources", empty: "No matching Namespaces. Choose another namespace or refresh inventory.",
+      columns: [{ key: "name", label: "Resource" }, { key: "state", label: "Status", type: "severity" }, { key: "age", label: "Age", type: "time" }]
     },
     storage: {
       label: "storage resources", empty: "No matching storage resources. Choose another namespace or refresh inventory.",
@@ -288,12 +350,22 @@
         { key: "name", label: "Pod" }, { key: "ready", label: "Ready", type: "ready" }, { key: "restarts", label: "Restarts", type: "number" },
         { key: "cpuRequest", label: "CPU request", type: "quantity" }, { key: "memoryRequest", label: "Memory request", type: "quantity" },
         { key: "cpuLimit", label: "CPU limit", type: "quantity" }, { key: "memoryLimit", label: "Memory limit", type: "quantity" },
-        { key: "state", label: "State", type: "severity" }, { key: "owner", label: "Owner" }, { key: "actions", label: "Restart", sortable: false }
+        { key: "state", label: "State", type: "severity" }, { key: "node", label: "Node" }, { key: "owner", label: "Owner" }, { key: "actions", label: "Restart", sortable: false }
+      ]
+    },
+    nodes: {
+      label: "nodes", empty: "No matching Nodes. Refresh inventory to observe cluster nodes.",
+      columns: [
+        { key: "name", label: "Name" }, { key: "state", label: "Status", type: "severity" }, { key: "roles", label: "Roles" },
+        { key: "age", label: "Age", type: "time" }, { key: "version", label: "Version" },
+        { key: "internalIP", label: "Internal-IP" }, { key: "externalIP", label: "External-IP" },
+        { key: "osImage", label: "OS-Image" }, { key: "kernelVersion", label: "Kernel-Version" },
+        { key: "containerRuntime", label: "Container-Runtime" }, { key: "actions", label: "Cordon / Uncordon", sortable: false }
       ]
     },
     historyOperations: {
       label: "operation history", empty: "No operation records are loaded in this recent window.",
-      columns: [{ key: "time", label: "Time", type: "time" }, { key: "actor", label: "Actor" }, { key: "kind", label: "Kind" }, { key: "namespace", label: "Namespace" }, { key: "name", label: "Name" }, { key: "action", label: "Action" }, { key: "state", label: "State", type: "severity" }, { key: "step", label: "Step" }, { key: "detail", label: "Detail", sortable: false }, { key: "id", label: "IDs" }]
+      columns: [{ key: "time", label: "Time", type: "time" }, { key: "actor", label: "Actor" }, { key: "kind", label: "Kind" }, { key: "namespace", label: "Namespace" }, { key: "name", label: "Name" }, { key: "action", label: "Action" }, { key: "state", label: "State", type: "severity" }]
     },
     historyAudit: {
       label: "audit history", empty: "No audit records are loaded in this recent window.",
@@ -337,12 +409,20 @@
     const resources = inventory?.resources || [];
     const scoped = logic.scopedResources(resources, namespaceContext);
     if (stateKey === "overview") {
-      return scoped.filter(resource => ["Notebook", "PersistentVolumeClaim", "Pod", "ResourceQuota", "Event"].includes(resource.kind)).map(resource =>
+      return scoped.filter(resource => ["Notebook", "PersistentVolumeClaim", "PersistentVolume", "Pod", "Node", "ResourceQuota", "Event"].includes(resource.kind)).map(resource =>
         resourceRow(resource, () => [resourceNameNode(resource), desired(resource), badge(resource.state), capacity(resource)]));
     }
     if (stateKey === "profiles") {
       return logic.profileResources(resources, namespaceContext).map(resource =>
         resourceRow(resource, () => [resourceNameNode(resource), resource.kind || "—", resource.namespace || "—", badge(resource.state), desired(resource)]));
+    }
+    if (stateKey === "namespaces") {
+      return resources.filter(resource => resource.kind === "Namespace").map(resource => ({
+        namespace: resource.name || "",
+        search: [resource.name, resource.kind, resource.state, resource.details?.createdAt].filter(Boolean).join(" "),
+        sort: { name: resource.name || "", state: resource.state || "Not reported", age: resource.details?.createdAt || "" },
+        cellFactory: () => [namespaceNameNode(resource), badge(resource.state), logic.formatAge(resource.details?.createdAt)]
+      }));
     }
     if (stateKey === "storage") {
       return scoped.filter(resource => ["PersistentVolume", "PersistentVolumeClaim", "StorageClass"].includes(resource.kind)).map(resource =>
@@ -354,28 +434,43 @@
     }
     if (stateKey === "pods") {
       return scoped.filter(resource => resource.kind === "Pod").map(resource =>
-        resourceRow(resource, () => [resourceNameNode(resource), podReady(resource), podRestartCount(resource), podResourceDetail(resource, "cpuRequest", "requested.cpu"), podResourceDetail(resource, "memoryRequest", "requested.memory"), podResourceDetail(resource, "cpuLimit", "limit.cpu"), podResourceDetail(resource, "memoryLimit", "limit.memory"), badge(resource.state), resource.owner || resource.details?.owner || "Not reported", restartButton(resource)]));
+        resourceRow(resource, () => [resourceNameNode(resource), podReady(resource), podRestartCount(resource), podResourceDetail(resource, "cpuRequest", "requested.cpu"), podResourceDetail(resource, "memoryRequest", "requested.memory"), podResourceDetail(resource, "cpuLimit", "limit.cpu"), podResourceDetail(resource, "memoryLimit", "limit.memory"), badge(resource.state), resource.details?.node || "—", resource.owner || resource.details?.owner || "Not reported", restartButton(resource)]));
+    }
+    if (stateKey === "nodes") {
+      return resources.filter(resource => resource.kind === "Node").map(resource => {
+        const details = resource.details || {};
+        return {
+          namespace: "",
+          search: [resource.name, resource.state, details.roles, details.version, details.internalIP, details.externalIP, details.osImage, details.kernelVersion, details.containerRuntime, details.controlPlane === "true" ? "control-plane" : ""].filter(Boolean).join(" "),
+          sort: {
+            name: resource.name || "", state: resource.state || "Not reported", roles: details.roles || "",
+            age: details.createdAt || "", version: details.version || "", internalIP: details.internalIP || "",
+            externalIP: details.externalIP || "", osImage: details.osImage || "", kernelVersion: details.kernelVersion || "",
+            containerRuntime: details.containerRuntime || ""
+          },
+          cellFactory: () => [
+            resourceNameNode(resource), badge(resource.state), details.roles || "—", logic.formatAge(details.createdAt),
+            details.version || "—", details.internalIP || "—", details.externalIP || "—", details.osImage || "—",
+            details.kernelVersion || "—", details.containerRuntime || "—", nodeCordonButton(resource)
+          ]
+        };
+      });
     }
     if (stateKey === "historyOperations") {
       return (historyCache.operations.rows || []).map(operation => {
         const target = logic.parseTarget(operation.target);
         return {
           namespace: target.namespace || (target.kind === "profile" ? target.name : ""),
-          search: [operation.id, operation.planID, target.kind, target.namespace, target.name, operation.action, operation.state, operation.step, operation.error, logic.actorLabel(operation), logic.actorID(operation)].filter(Boolean).join(" "),
-          sort: { time: operation.updatedAt || operation.createdAt, actor: logic.actorLabel(operation), kind: target.kind, namespace: target.namespace, name: target.name, action: operation.action, state: operation.state, step: operation.step, id: operation.id || "" },
-          cellFactory: () => {
-            const detail = el("div", undefined, "history-detail");
-            if (operation.historyExpired) detail.append(badge("History expired"));
-            detail.append(el("span", operation.error || (operation.state === "succeeded" ? "Observed convergence verified" : "Not yet verified")));
-            return [formatTime(operation.updatedAt || operation.createdAt), actorCell(operation), target.kind || "—", target.namespace || "—", target.name || "—", operation.action || "—", badge(operation.state), operation.step || "—", detail, idCell([["Operation", operation.id], ["Plan", operation.planID]])];
-          }
+          search: [operation.id, operation.planID, target.kind, target.namespace, target.name, operation.action, operation.state, operation.step, operation.error, logic.actorLabel(operation)].filter(Boolean).join(" "),
+          sort: { time: operation.updatedAt || operation.createdAt, actor: logic.actorLabel(operation), kind: target.kind, namespace: target.namespace, name: target.name, action: operation.action, state: operation.state },
+          cellFactory: () => [formatTime(operation.updatedAt || operation.createdAt), actorCell(operation), target.kind || "—", target.namespace || "—", target.name || "—", operation.action || "—", operationStateCell(operation)]
         };
       });
     }
     if (stateKey === "historyAudit") {
       return logic.groupAudit(historyCache.audit.rows || []).map(group => ({
         namespace: group.namespace || (group.kind === "profile" ? group.name : ""),
-        search: [group.operationID, group.actorLabel, group.actorID, group.kind, group.namespace, group.name, group.action, group.result, group.reason, group.stages.map(stage => stage.id).join(" ")].filter(Boolean).join(" "),
+        search: [group.operationID, group.actorLabel, group.kind, group.namespace, group.name, group.action, group.result, group.reason, group.stages.map(stage => stage.id).join(" ")].filter(Boolean).join(" "),
         sort: { time: group.time, actor: group.actorLabel, kind: group.kind, namespace: group.namespace, name: group.name, action: group.action, result: group.result, reason: group.reason, id: group.operationID || group.id },
         cellFactory: () => {
           const detail = el("details", undefined, "stage-details");
@@ -433,6 +528,11 @@
   }
 
   // ---- Rendering -----------------------------------------------------------
+  // Cluster-scoped tables ignore the namespace filter. Their rows have no
+  // namespace, and one page-scope selection must not hide other items.
+  function clusterWideTable(stateKey) {
+    return stateKey === "profiles" || stateKey === "namespaces" || stateKey === "nodes";
+  }
   function buildControls(stateKey) {
     const def = tableDefs[stateKey], state = tableStates[stateKey];
     const controls = el("div", undefined, "table-controls");
@@ -444,6 +544,14 @@
     search.setAttribute("aria-label", "Search " + def.label);
     search.addEventListener("input", () => { const live = tableStates[stateKey]; live.search = search.value; live.page = 1; renderTable(stateKey); });
     searchLabel.append(search);
+    const count = el("span", undefined, "result-count");
+    count.dataset.count = "1";
+    count.setAttribute("role", "status");
+    count.setAttribute("aria-live", "polite");
+    if (clusterWideTable(stateKey)) {
+      controls.append(searchLabel, count);
+      return controls;
+    }
     const scopeLabel = el("label", undefined, "control-field");
     scopeLabel.append(document.createTextNode("Namespace"));
     const select = el("select");
@@ -451,10 +559,6 @@
     select.setAttribute("aria-label", "Namespace for " + def.label);
     select.addEventListener("change", () => setNamespace(select.value));
     scopeLabel.append(select);
-    const count = el("span", undefined, "result-count");
-    count.dataset.count = "1";
-    count.setAttribute("role", "status");
-    count.setAttribute("aria-live", "polite");
     controls.append(searchLabel, scopeLabel, count);
     return controls;
   }
@@ -487,7 +591,8 @@
       container.append(el("div", historyError[tab] ? "History is currently unavailable. Use Refresh to try again." : "Loading history from the server. History does not wait for an inventory scan.", "empty-state"));
       return;
     }
-    const scoped = tableRows(stateKey).filter(row => !namespaceContext || !row.namespace || row.namespace === namespaceContext);
+    const rows = tableRows(stateKey);
+    const scoped = clusterWideTable(stateKey) ? rows : rows.filter(row => !namespaceContext || !row.namespace || row.namespace === namespaceContext);
     const filtered = scoped.filter(row => logic.searchMatch(row.search, state.search));
     const sorted = logic.sortRows(filtered, state.sortKey, state.sortDir, (def.columns.find(column => column.key === state.sortKey) || {}).type || "text");
     const view = logic.paginate(sorted, state.page, perPage);
@@ -576,12 +681,51 @@
       return metric;
     }));
   }
+  function renderWorkspaceHealth() {
+    const summaryRoot = $("#workspace-health-summary");
+    const select = $("#overview-namespace");
+    if (select) {
+      const options = scopeNamespaces(), signature = options.join("\u0000");
+      if (signature !== select.dataset.options || !select.options.length) {
+        fillSelect(select, options, "All permitted namespaces");
+        select.dataset.options = signature;
+      }
+      select.value = options.includes(namespaceContext) ? namespaceContext : "";
+    }
+    if (!summaryRoot) return;
+    const summary = logic.workspaceHealthSummary(inventory?.resources || [], namespaceContext);
+    const cards = [["Pods", "Pods"], ["Notebooks", "Notebooks"], ["Nodes", "Nodes"], ["PersistentVolumeClaims", "PVCs"], ["PersistentVolumes", "PVs"], ["Events", "Events"]];
+    summaryRoot.replaceChildren(...cards.map(([key, label]) => {
+      const data = summary[key] || { total: 0, states: [] };
+      const card = el("article", undefined, "health-card");
+      const head = el("div", undefined, "health-card-head");
+      head.append(el("h3", label), el("strong", String(data.total)));
+      const states = el("ul", undefined, "health-states");
+      data.states.forEach(state => {
+        const item = el("li");
+        item.append(el("span", state.label), el("span", String(state.count), "health-count " + state.tone));
+        states.append(item);
+      });
+      card.append(head, states);
+      return card;
+    }));
+  }
+  function syncOverviewTable() {
+    const table = $("#overview-table"), button = $("#toggle-overview-table");
+    if (table) table.hidden = !overviewTableExpanded;
+    if (button) {
+      button.textContent = overviewTableExpanded ? "Hide detailed resource table" : "Show detailed resource table";
+      button.setAttribute("aria-expanded", overviewTableExpanded ? "true" : "false");
+    }
+  }
   function renderPage() {
-    if (page === "overview") { renderMetrics(); renderTable("overview"); }
+    if (page === "overview") { renderMetrics(); renderWorkspaceHealth(); syncOverviewTable(); if (overviewTableExpanded) renderTable("overview"); }
     else if (page === "profiles") renderTable("profiles");
+    else if (page === "namespaces") renderTable("namespaces");
     else if (page === "storage") renderTable("storage");
     else if (page === "notebooks") renderTable("notebooks");
     else if (page === "pods") renderTable("pods");
+    else if (page === "nodes") renderTable("nodes");
     else if (page === "history") renderHistory();
   }
   function renderHistory() {
@@ -754,6 +898,9 @@
     const target = new URL(link.href, location.href);
     if (target.origin !== location.origin) return;
     event.preventDefault();
+    // A scoped summary link to Overview should land on the full table rather
+    // than a collapsed dashboard, so Events and quota rows are immediately visible.
+    if (target.pathname === "/" && link.closest?.("#namespace-summary-drawer")) overviewTableExpanded = true;
     closeDrawers(false);
     namespaceContext = logic.queryNamespace(target.search);
     window.history.pushState(null, "", target.pathname + target.search);
@@ -842,6 +989,70 @@
     body.append(el("p", "Kubeflow pipeline runs are not integrated with this console. No pipeline count is shown and none is inferred from Pods.", "hint"));
     openDrawer(drawer);
   }
+  function openNamespaceSummary(name) {
+    const drawer = $("#namespace-summary-drawer");
+    $("#namespace-summary-title").textContent = name;
+    const body = $("#namespace-summary-body"); body.replaceChildren();
+    body.append(el("p", `Observed resources in namespace ${name}. Counts come only from this console's live observations.`));
+    const groups = logic.namespaceResources(inventory?.resources || [], name);
+    if (!groups.length) {
+      body.append(el("p", "No resources are currently observed in this namespace. An empty summary does not imply the namespace has no workloads; they may be outside this console's observation scope.", "hint"));
+    } else {
+      const list = el("ul", undefined, "summary-counts");
+      groups.forEach(group => {
+        const item = el("li");
+        if (group.href) {
+          const link = el("a", undefined, "summary-link");
+          link.href = logic.hrefFor(group.href, name);
+          link.dataset.scopedLink = "1";
+          link.append(el("strong", String(group.count)), el("span", group.label));
+          item.append(link);
+        } else {
+          const row = el("div", undefined, "summary-link static");
+          row.append(el("strong", String(group.count)), el("span", group.label));
+          item.append(row);
+        }
+        list.append(item);
+      });
+      body.append(el("h3", "Scoped views"), list);
+      groups.forEach(group => {
+        body.append(el("h3", `${group.label} (${group.count})`));
+        simpleTable(body, ["Name", "State"], group.items.slice(0, 50).map(resource => [resource.name || "Unnamed", badge(resource.state)]));
+        if (group.items.length > 50) body.append(el("p", `Showing first 50 of ${group.items.length} resources.`, "hint"));
+      });
+    }
+    openDrawer(drawer);
+  }
+  function openNodeCordon(resource, verb = "cordon") {
+    if (!nodeCordonFeature) return;
+    const form = $("#node-cordon-form");
+    const name = resource.name || "";
+    const uncordon = verb === "uncordon";
+    const kind = uncordon ? "node.uncordon" : "node.cordon";
+    form.elements.kind.value = kind;
+    form.elements.name.value = name;
+    form.elements.reason.value = "";
+    if (form.elements.force) form.elements.force.checked = false;
+    $("#node-cordon-title").textContent = `${uncordon ? "Uncordon" : "Cordon"} ${name}`;
+    $("#node-cordon-description").textContent = uncordon
+      ? `Uncordon node ${name}? This sets spec.unschedulable=false (same as kubectl uncordon) and removes SchedulingDisabled so new Pods can be scheduled onto this node again.`
+      : `Cordon node ${name}? This sets spec.unschedulable=true (same as kubectl cordon) and updates the node status to include SchedulingDisabled alongside its current readiness state. New Pods will not be scheduled onto this node; existing running Pods are not evicted.`;
+    const controlPlane = resource.details?.controlPlane === "true";
+    const notReady = String(resource.state || "").startsWith("NotReady");
+    const cordon = kind === "node.cordon";
+    let warningText = "";
+    if (cordon && controlPlane && notReady) {
+      warningText = "This node is both control-plane and NotReady. The server requires Force to cordon it.";
+    } else if (cordon && controlPlane) {
+      warningText = "This node carries a control-plane role. Cordoning it can affect control-plane availability; the server requires Force to cordon a control-plane node.";
+    } else if (cordon && notReady) {
+      warningText = "This node is currently NotReady. The server requires Force to cordon a NotReady node.";
+    }
+    const warning = $("#node-cordon-warning");
+    warning.hidden = !warningText;
+    warning.textContent = warningText;
+    openDrawer($("#node-cordon-drawer"));
+  }
   function openPodRestart(resource, support = podRestartSupport(resource)) {
     if (!podRestartFeature || !support.ok) return;
     const form = $("#pod-restart-form");
@@ -865,6 +1076,19 @@
         const first = nodes[0], last = nodes[nodes.length - 1];
         if (event.shiftKey && (document.activeElement === first || !drawer.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
         else if (!event.shiftKey && (document.activeElement === last || !drawer.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
+        return;
+      }
+    }
+    if (event.key === "Escape") {
+      const dots = $$(".error-dot.open");
+      const focused = document.activeElement?.classList?.contains("error-dot") ? document.activeElement : null;
+      if (dots.length || focused) {
+        event.preventDefault();
+        dots.forEach(dot => { dot.classList.remove("open"); dot.classList.add("dismissed"); });
+        if (focused) {
+          focused.classList.add("dismissed");
+          focused.blur();
+        }
         return;
       }
     }
@@ -946,6 +1170,7 @@
   function actionFrom(form) {
     return logic.buildAction(new FormData(form), {
       restart: !!$('[name="restart"]', form)?.checked,
+      force: !!$('[name="force"]', form)?.checked,
       replaceMounts: form.id === "notebook-form" && $("#replace-mounts").checked,
       mounts: $$(".mount-row").map(row => Object.fromEntries($$("[data-field]", row).map(input => [input.dataset.field, input.type === "checkbox" ? input.checked : input.value])))
     });
@@ -985,6 +1210,7 @@
       let disabled = !writes;
       if (form?.id === "notebook-form" && !notebookWrites) disabled = true;
       if (form?.id === "pod-restart-form" && !podRestartFeature) disabled = true;
+      if (form?.id === "node-cordon-form" && !nodeCordonFeature) disabled = true;
       button.disabled = disabled;
     });
   }
@@ -1037,6 +1263,12 @@
 
   // ---- Wiring --------------------------------------------------------------
   $("#refresh").addEventListener("click", () => refresh(true));
+  $("#overview-namespace").addEventListener("change", () => setNamespace($("#overview-namespace").value));
+  $("#toggle-overview-table").addEventListener("click", () => {
+    overviewTableExpanded = !overviewTableExpanded;
+    syncOverviewTable();
+    if (overviewTableExpanded) renderTable("overview");
+  });
   $("#storage-kind").addEventListener("change", storageFields);
   $("#notebook-kind").addEventListener("change", notebookFields);
   $("#profile-kind").addEventListener("change", profileFields);
@@ -1051,6 +1283,7 @@
   activatePage();
   if (!notebookWrites) notify("warning", "Notebook changes are disabled: the installed controller contract has not been confirmed by the operator.", "policy:notebook-controller");
   if (!meta("pod-restarts").startsWith("true")) notify("warning", "Pod restarts are disabled by server policy. Restart controls are unavailable until the feature and its optional permission are enabled.", "policy:pod-restarts");
+  if (meta("node-cordon") !== "true") notify("warning", "Node cordon and uncordon are disabled by server policy. Cordon controls are unavailable until the feature and its optional permission are enabled.", "policy:node-cordon");
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
     ensureActiveHistory();

@@ -21,6 +21,15 @@
       action.reason = String(action.reason || "").trim();
       delete action.owner;
     }
+    if (action.kind === "node.cordon" || action.kind === "node.uncordon") {
+      // Node actions are cluster-scoped and carry an explicit force bit.
+      // FormData materializes a checked checkbox as "on"; normalize it.
+      const formForce = action.force === true || action.force === "true" || action.force === "on";
+      action.reason = String(action.reason || "").trim();
+      action.force = !!options.force || formForce;
+      delete action.namespace;
+      delete action.owner;
+    }
     return action;
   }
   function scopedResources(resources, namespace) {
@@ -36,12 +45,12 @@
     kind: "Change", namespace: "Namespace", name: "Name", reason: "Reason", owner: "Owner identity", quota: "Quota targets",
     storageClass: "Storage class", size: "Requested capacity", accessMode: "Access mode", pvName: "PV name", template: "Approved template", subdirectory: "Relative NFS subdirectory",
     container: "Named container", image: "Image", cpuRequest: "CPU request", cpuLimit: "CPU limit", memoryRequest: "Memory request", memoryLimit: "Memory limit",
-    gpuPreset: "GPU preset", gpuCount: "GPU count", mounts: "Replacement PVC mounts", restart: "Restart after edit"
+    gpuPreset: "GPU preset", gpuCount: "GPU count", mounts: "Replacement PVC mounts", restart: "Restart after edit",
+    force: "Force"
   };
   function previewFields(plan) {
     const p = plan.prepared, action = p.action;
-    const fields = [["Plan ID", plan.id], ["Actor", plan.actorDisplay || plan.actor], ["Created", plan.createdAt], ["Expires", plan.expiresAt], ["Summary", p.summary], ["Target UID", p.targetUID], ["Resource version", p.resourceVersion]];
-    if (plan.actorDisplay && plan.actor && plan.actorDisplay !== plan.actor) fields.push(["Actor ID", plan.actor]);
+    const fields = [["Plan ID", plan.id], ["Actor", actorLabel(plan)], ["Created", plan.createdAt], ["Expires", plan.expiresAt], ["Summary", p.summary], ["Target UID", p.targetUID], ["Resource version", p.resourceVersion]];
     if (p.parentNotebook) fields.push(["Parent Notebook", p.parentNotebook]);
     // Only typed server-owned action fields are a change preview. Prepared.Data
     // is internal revalidation evidence, not a diff and never rendered here.
@@ -59,6 +68,12 @@
     if (action.kind === "pod.restart") {
       fields.push(["Restart method", "The server revalidates the live Pod UID and owner chain, then requests a disruption-budget-aware eviction. Only supported Notebook StatefulSet-managed Pods are accepted; unmanaged, static, mirror and terminating Pods are rejected."]);
       fields.push(["Force deletion", "Never used automatically. If eviction is rejected before mutation the server reports failure; ambiguous interruption remains needs-review."]);
+    }
+    if (action.kind === "node.cordon") {
+      fields.push(["Cordon effect", "Sets spec.unschedulable=true on the Node (the same effect as kubectl cordon) and adds SchedulingDisabled alongside the current readiness state. New Pods will not be scheduled onto this node; existing running Pods are not evicted."]);
+    }
+    if (action.kind === "node.uncordon") {
+      fields.push(["Uncordon effect", "Sets spec.unschedulable=false on the Node (the same effect as kubectl uncordon) and removes SchedulingDisabled so new Pods can be scheduled onto this node again."]);
     }
     return fields;
   }
@@ -101,6 +116,7 @@
     // Negative compound states ("Not ready", "Not active", "Unavailable",
     // "Incomplete", "Unhealthy") must not match positive substrings inside them.
     if (/fail|error|review|denied|conflict|unavailable|invalid|unknown|incomplete|unhealthy|lost|not\s*ready|not\s*active|not\s*running|unschedul/.test(text)) return 3;
+    if (/schedulingdisabled/.test(text)) return 2;
     if (/stopp|terminat|degrad|warn|expir|suspend/.test(text)) return 2;
     if (/pending|starting|queued|progress|apply|applying|creating|initial|accepted/.test(text)) return 1;
     if (/succeed|complete|ready|running|normal|active|bound|available|healthy|verified|synced/.test(text)) return 0;
@@ -191,14 +207,9 @@
   function actorLabel(record) {
     const display = safeActorText(record?.actorDisplay, 160);
     if (display) return display;
-    const actor = String(record?.actor ?? "").trim();
-    if (!actor) return "Unknown administrator";
-    const pipe = actor.lastIndexOf("|");
-    const subject = safeActorText(pipe >= 0 ? actor.slice(pipe + 1) : actor, 160);
-    return subject || safeActorText(actor, 160) || "Unknown administrator";
-  }
-  function actorID(record) {
-    return safeActorText(record?.actor, 320);
+    // Legacy records never expose the encoded issuer|subject key. The console
+    // shows one readable label and an honest fallback for older audit rows.
+    return "Legacy administrator";
   }
   function groupAudit(rows) {
     const groups = new Map();
@@ -220,7 +231,7 @@
       return {
         id: group.id, operationID: group.operationID, stages,
         time: latest.time, actor: latest.actor, actorDisplay: actorRecord.actorDisplay,
-        actorLabel: actorLabel(actorRecord), actorID: actorID(actorRecord),
+        actorLabel: actorLabel(actorRecord),
         kind: target.kind, namespace: target.namespace, name: target.name,
         action: actions.join(" · "),
         // Summary shows the latest observed stage outcome. Earlier acceptance
@@ -242,8 +253,6 @@
   function profileNames(resources) {
     return new Set((Array.isArray(resources) ? resources : []).filter(r => r.kind === "Profile" && r.name).map(r => r.name));
   }
-  // Profile association follows the Profile-name/namespace-name convention and
-  // only counts resources actually observed by the integration.
   function profileSummary(resources, profile) {
     const list = Array.isArray(resources) ? resources : [];
     const defs = [
@@ -254,12 +263,114 @@
     return defs.map(def => ({ ...def, count: list.filter(resource => resource.kind === def.kind && resource.namespace === profile).length }))
       .filter(entry => entry.count > 0);
   }
-  function profileResources(resources, namespace) {
-    const scoped = scopedResources(resources, namespace);
-    const profiles = profileNames(resources);
-    // Profiles is a Profile/Namespace browser, not a governance-resource dump.
-    return scoped.filter(resource => resource.kind === "Profile" ||
-      (resource.kind === "Namespace" && profiles.has(resource.name)));
+  function profileResources(resources) {
+    // Profiles are cluster-scoped: always show every observed Profile, even
+    // when a namespace filter is active on another page.
+    return (Array.isArray(resources) ? resources : []).filter(resource => resource.kind === "Profile");
+  }
+  const namespaceResourceDefs = [
+    { kind: "Notebook", label: "Notebooks", href: "/notebooks" },
+    { kind: "Pod", label: "Pods", href: "/pods" },
+    { kind: "PersistentVolumeClaim", label: "Persistent volume claims", href: "/storage" },
+    { kind: "StatefulSet", label: "StatefulSets", href: "/notebooks" },
+    { kind: "ResourceQuota", label: "Resource quotas", href: "/" },
+    { kind: "LimitRange", label: "Limit ranges", href: "" },
+    { kind: "RoleBinding", label: "Role bindings", href: "" },
+    { kind: "Event", label: "Events", href: "/" }
+  ];
+  function namespaceResources(resources, name) {
+    const target = String(name ?? "").trim();
+    if (!target) return [];
+    const list = Array.isArray(resources) ? resources : [];
+    // Only resources actually observed inside this namespace. The Namespace
+    // object itself is the summary target, not one of its contents.
+    return namespaceResourceDefs.map(def => {
+      const items = list.filter(resource => resource.kind === def.kind && resource.kind !== "Namespace" && resource.namespace === target);
+      return { kind: def.kind, label: def.label, count: items.length, href: def.href, items };
+    }).filter(group => group.count > 0);
+  }
+  function formatAge(createdAt, nowMs) {
+    const created = timeValue(createdAt);
+    const now = nowMs === undefined ? Date.now() : Number(nowMs);
+    if (created === null || !Number.isFinite(now)) return "—";
+    const seconds = Math.max(0, Math.floor((now - created) / 1000));
+    if (seconds < 60) return seconds + "s";
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return minutes + "m";
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return hours + "h";
+    return Math.floor(hours / 24) + "d";
+  }
+  function restartTotal(resource) {
+    const details = resource?.details || {};
+    if (details.restarts !== undefined && details.restarts !== "") {
+      const count = Number(details.restarts);
+      return Number.isFinite(count) ? count : 0;
+    }
+    return Object.keys(details).filter(key => key.startsWith("restarts."))
+      .reduce((sum, key) => sum + (Number(details[key]) || 0), 0);
+  }
+  function stateToneCount(defs, classify, kind, scoped) {
+    const resources = scoped.filter(resource => resource.kind === kind);
+    const counts = Object.fromEntries(defs.map(def => [def.label, 0]));
+    for (const resource of resources) counts[classify(resource)]++;
+    return { total: resources.length, states: defs.map(def => ({ label: def.label, count: counts[def.label], tone: def.tone })) };
+  }
+  // Dashboard summary for the active namespace scope. Every resource falls into
+  // exactly one displayed state so the card counts always add up to the total.
+  function workspaceHealthSummary(resources, namespace) {
+    const all = Array.isArray(resources) ? resources : [];
+    const scoped = scopedResources(all, namespace);
+    const healthText = resource => String(resource?.state ?? "").trim().toLowerCase();
+    return {
+      Notebooks: stateToneCount([
+        { label: "Running", tone: "good" }, { label: "Stopped", tone: "warn" },
+        { label: "Transitioning", tone: "warn" }, { label: "Errors", tone: "bad" }
+      ], resource => {
+        const text = healthText(resource), rank = severityValue(text);
+        if (rank === 3) return "Errors";
+        if (/stopp|terminat/.test(text)) return "Stopped";
+        if (rank === 1 || /pending|starting|creating|progress|applying|queued|initial|transition/.test(text)) return "Transitioning";
+        return rank === 0 ? "Running" : "Transitioning";
+      }, "Notebook", scoped),
+      Pods: stateToneCount([
+        { label: "Running", tone: "good" }, { label: "Warning", tone: "warn" }, { label: "Errors", tone: "bad" }
+      ], resource => {
+        const text = healthText(resource), ready = String(resource?.details?.ready ?? "").trim().toLowerCase();
+        if (severityValue(text) === 3 || /failed|crashloop|error|unknown|evicted/.test(text)) return "Errors";
+        if (/pending|containercreating|creating|terminating/.test(text) || (text === "running" && ready === "false") || restartTotal(resource) > 0) return "Warning";
+        return text === "running" ? "Running" : "Warning";
+      }, "Pod", scoped),
+      Nodes: stateToneCount([
+        { label: "Ready", tone: "good" }, { label: "Cordoned", tone: "warn" }, { label: "NotReady", tone: "bad" }
+      ], resource => {
+        const text = healthText(resource);
+        if (/notready|unknown/.test(text) || severityValue(text) === 3) return "NotReady";
+        if (/schedulingdisabled/.test(text)) return "Cordoned";
+        return text === "ready" ? "Ready" : "NotReady";
+      }, "Node", all),
+      PersistentVolumeClaims: stateToneCount([
+        { label: "Bound", tone: "good" }, { label: "Pending", tone: "warn" }, { label: "Errors", tone: "bad" }
+      ], resource => {
+        const text = healthText(resource), rank = severityValue(text);
+        if (/bound/.test(text)) return "Bound";
+        if (rank === 1 || /pending|waiting|creating/.test(text)) return "Pending";
+        return "Errors";
+      }, "PersistentVolumeClaim", scoped),
+      PersistentVolumes: stateToneCount([
+        { label: "Bound", tone: "good" }, { label: "Available", tone: "good" }, { label: "Other / Error", tone: "bad" }
+      ], resource => {
+        const text = healthText(resource);
+        if (/bound/.test(text)) return "Bound";
+        return text === "available" ? "Available" : "Other / Error";
+      }, "PersistentVolume", scoped),
+      Events: stateToneCount([
+        { label: "Normal", tone: "good" }, { label: "Warning", tone: "warn" }
+      ], resource => {
+        const text = healthText(resource);
+        return /warn|fail|error/.test(text) || severityValue(text) >= 2 ? "Warning" : "Normal";
+      }, "Event", scoped)
+    };
   }
 
   function routeFor(pathname, search) {
@@ -273,7 +384,7 @@
     }
     const clean = path.replace(/^\/+|\/+$/g, "");
     if (!clean) return { page: "overview", tab: null };
-    if (["overview", "profiles", "storage", "notebooks", "pods"].includes(clean)) return { page: clean, tab: null };
+    if (["overview", "profiles", "namespaces", "storage", "notebooks", "pods", "nodes"].includes(clean)) return { page: clean, tab: null };
     return { page: "overview", tab: null };
   }
   function queryNamespace(search) {
@@ -329,8 +440,9 @@
     buildAction, scopedResources, containerNames, previewFields,
     quantityValue, timeValue, severityValue, readyValue, naturalCompare, isMissing,
     sortRows, searchMatch, filterRows, paginate,
-    parseTarget, actorLabel, actorID, groupAudit,
+    parseTarget, actorLabel, groupAudit,
     namespaceOptions, profileNames, profileSummary, profileResources,
+    namespaceResources, formatAge, workspaceHealthSummary,
     routeFor, queryNamespace, hrefFor, historyHref, needsRefresh,
     notificationID, shouldRememberDismissals, dismissalStorageKey,
     defaultTableState, nextSort, withPage, viewRows

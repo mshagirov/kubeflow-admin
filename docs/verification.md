@@ -2,7 +2,39 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
-## Responsive UI / History / Pods work — 20 October 2026
+## Sidebar and security refresh — 21 October 2026
+
+- Removed the sidebar's status dot and `Administrative control plane` label;
+  retained the GitHub source link and added regression assertions.
+- Review corrected health summaries so missing Node readiness is not healthy
+  and `Unavailable` PVs are not counted as `Available`. Restored the unrelated
+  parent-lock assertion alongside the new Node target-lock tests.
+- Updated the digest-pinned builder and CI to Go 1.27.3 after the Go 1.27.2
+  source scan found GO-2026-6809 in `crypto/x509`.
+- All package race tests passed with Go 1.27.3; `govulncheck` then reported no
+  vulnerabilities with the patched toolchain.
+- `make check build` and OpenAPI validation passed. The existing auth/plan
+  cleanup timing test hit its 500ms budget during concurrent cold compilation;
+  it subsequently passed five consecutive uncached race runs, both at default
+  concurrency and with `GOMAXPROCS=2`. No production deadline was relaxed.
+- Real Chrome checks passed at 390px and 1280px, and the optional browser
+  regression suite passed against synthetic observations. No cluster was changed.
+- Pinned Trivy 0.76 scans found no HIGH/CRITICAL findings in source
+  (dependencies, secrets, configuration) or the rebuilt runtime image
+  (vulnerabilities, secrets). Local binaries, virtualenv, Git data, rendered
+  manifests and private site notes were excluded from the source scan.
+- Runtime smoke verified linux/amd64, UID/GID `65532:65532`, and fail-closed
+  startup without configuration with a read-only root and networking disabled.
+- The release retains `docker.io/muratshagirov/kubeflow-admin:0.4.0` and
+  linux/amd64. Reused tags must be deployed by the new registry digest, not by
+  restarting an `IfNotPresent` Pod against the unchanged tag.
+
+Refreshed image (provenance and SBOM included):
+
+- OCI index: `sha256:fbee42f74ed76eeb52900d6d2637431986514434de36f43f21df1e4f7c242ae8`.
+- linux/amd64 manifest: `sha256:2473514e032c22168cb0873c042263738f65d8a09af7ea1c278d91b2d8154f4a`.
+
+## Responsive UI / History / Pods / Nodes work — 20–21 October 2026
 
 **Local review image published; live cluster acceptance is still pending.** The
 older artifact and acceptance records below are historical, not evidence that
@@ -53,8 +85,44 @@ Published review image (20 October 2026):
   vulnerabilities and **0** secrets. `govulncheck` found no source vulnerabilities.
   These scans are point-in-time and must be repeated before any later promotion.
 
+Follow-up release (21 October 2026): Namespaces, Nodes, Workspace Health:
+
+- Added Namespace and Node projections, the Namespaces page/drawer, Pod Node
+  column, `kubectl get node -o wide`-style Nodes page, state summary cards, and
+  an opt-in `node.cordon` / `node.uncordon` workflow.
+- The cordon workflow patches only `spec.unschedulable` with UID and fresh
+  `resourceVersion` preconditions, bounded retries for kubelet heartbeat churn,
+  and a required reason. Force is required for control-plane and NotReady Nodes.
+  It never drains or evicts workloads and has no delete fallback.
+- History renders only readable Actor labels; historical records without a
+  display label show `Legacy administrator`. Operations drops Step/Detail/IDs,
+  and failure details are available from a fixed-slot red indicator.
+- `make check` passed race tests, vet, API parity/script tests and all eight
+  manifest variants, including the separate `node-cordon` overlay. The overlay
+  grants only `nodes/patch` and is not automatically included in `all-features`.
+- `go test -race -count=1 ./...` passed uncached. `govulncheck` reported no
+  vulnerabilities.
+- Real headless Chrome tested the revised UI at 390×844 and 1280×844 with
+  synthetic observations: all eight sidebar pages, cluster-wide Namespaces
+  despite a namespace query, Profiles-only rows, Pod Node column, full Nodes
+  columns, Cordon/Uncordon drawer copy and Force control, Workspace Health cards
+  and optional table, readable/legacy actors, failure-dot tooltip focus/Escape,
+  and no page-width overflow.
+
+Published follow-up image (before the sidebar and Go security refresh; historical):
+
+- `docker.io/muratshagirov/kubeflow-admin:0.4.0`, linux/amd64 only.
+- OCI index digest: `sha256:546710670f428345a4df37ca06c2d9ae70de9fff3bee54f1648aca093ab28588`.
+- linux/amd64 manifest: `sha256:b004713c81f454bee077495b5faa2b28eed717ef7203523b2849682a01b9b7ef`.
+- Pinned Trivy 0.76 `vuln,secret` HIGH/CRITICAL scan: **0 vulnerabilities, 0 secrets**.
+  Runtime user is `65532:65532`.
+- Node cordon remains disabled by default. Live node RBAC, control-plane
+  behavior, kubelet/heartbeat timing and real cluster acceptance remain operator
+  steps; fake clients and browser fixtures do not prove them.
+
 Before deployment: take and verify a compatible backup before the schema-3
-migration, pin the index digest above in the site overlay, and keep Pod restart
+migration, pin the freshly verified release index digest in the site overlay
+(not a historical digest above), and keep Pod restart
 disabled until the operator approves the separately scoped eviction permission and
 a disposable pilot. No unfenced force-delete workflow or fabricated
 pipeline/metrics integration is included. Live controller, OIDC, storage, network,

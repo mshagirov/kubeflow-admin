@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - rbac.yaml
+# Opt-in only; never included by all-features automatically. The base stays
+# read-only: a site must separately set writesEnabled plus nodeCordon after an
+# operator reviews the added cluster-scoped nodes patch permission. Unlike the
+# broader writes overlay, this does not grant Profile/Notebook/PVC mutations.
+# The ClusterRole is intentionally limited to nodes/patch: no delete, no update,
+# and no workload eviction.

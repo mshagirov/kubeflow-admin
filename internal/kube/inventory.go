@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,7 +38,11 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 		return out, safe(err)
 	}
 	for _, n := range ns.Items {
-		add("Namespace", "", n.Name, string(n.UID), string(n.Status.Phase), nil)
+		details := map[string]string{}
+		if !n.CreationTimestamp.IsZero() {
+			details["createdAt"] = n.CreationTimestamp.UTC().Format(time.RFC3339)
+		}
+		add("Namespace", "", n.Name, string(n.UID), string(n.Status.Phase), details)
 	}
 	nb, err := s.Dynamic.Resource(Notebooks).Namespace("").List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -204,10 +209,110 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 				d["allocatable."+string(k)] = q.String()
 			}
 		}
-		add("Node", "", v.Name, string(v.UID), "", d)
+		roles := nodeRoles(&v)
+		if len(roles) == 0 {
+			d["roles"] = "<none>"
+		} else {
+			d["roles"] = strings.Join(roles, ",")
+		}
+		if !v.CreationTimestamp.IsZero() {
+			d["createdAt"] = v.CreationTimestamp.UTC().Format(time.RFC3339)
+		}
+		d["version"] = v.Status.NodeInfo.KubeletVersion
+		d["internalIP"] = nodeAddress(&v, corev1.NodeInternalIP)
+		if d["internalIP"] == "" {
+			d["internalIP"] = "<none>"
+		}
+		d["externalIP"] = nodeAddress(&v, corev1.NodeExternalIP)
+		if d["externalIP"] == "" {
+			d["externalIP"] = "<none>"
+		}
+		d["osImage"] = v.Status.NodeInfo.OSImage
+		d["kernelVersion"] = v.Status.NodeInfo.KernelVersion
+		d["containerRuntime"] = v.Status.NodeInfo.ContainerRuntimeVersion
+		d["unschedulable"] = strconv.FormatBool(v.Spec.Unschedulable)
+		d["controlPlane"] = strconv.FormatBool(isControlPlaneNode(&v))
+		add("Node", "", v.Name, string(v.UID), nodeState(&v), d)
 	}
 	out.Warnings = []string{"Filesystem usage and storage-backend capacity are not available from Kubernetes inventory.", "Notebook CR dry-run does not validate controller-generated Pod admission or scheduling."}
 	return out, nil
+}
+
+// nodeReady reports the NodeReady condition exactly; a missing condition is not
+// readiness. nodeState mirrors `kubectl get nodes` for the inventory and the
+// cordon preview.
+func nodeReady(n *corev1.Node) bool {
+	for _, c := range n.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func nodeState(n *corev1.Node) string {
+	state := "Unknown"
+	for _, c := range n.Status.Conditions {
+		if c.Type != corev1.NodeReady {
+			continue
+		}
+		switch c.Status {
+		case corev1.ConditionTrue:
+			state = "Ready"
+		case corev1.ConditionFalse:
+			state = "NotReady"
+		}
+		break
+	}
+	if n.Spec.Unschedulable {
+		state += ",SchedulingDisabled"
+	}
+	return state
+}
+
+func nodeDesiredState(n *corev1.Node, unschedulable bool) string {
+	c := n.DeepCopy()
+	c.Spec.Unschedulable = unschedulable
+	return nodeState(c)
+}
+
+// nodeRoles extracts sorted role names from the conventional role labels.
+// Empty label values are still roles: `kubectl` renders the label key itself.
+func nodeRoles(n *corev1.Node) []string {
+	seen := map[string]bool{}
+	if role := n.Labels["kubernetes.io/role"]; role != "" {
+		seen[role] = true
+	}
+	for key := range n.Labels {
+		role, ok := strings.CutPrefix(key, "node-role.kubernetes.io/")
+		if ok && role != "" {
+			seen[role] = true
+		}
+	}
+	roles := make([]string, 0, len(seen))
+	for role := range seen {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	return roles
+}
+
+func isControlPlaneNode(n *corev1.Node) bool {
+	for _, role := range nodeRoles(n) {
+		if role == "control-plane" || role == "master" {
+			return true
+		}
+	}
+	return false
+}
+
+func nodeAddress(n *corev1.Node, kind corev1.NodeAddressType) string {
+	for _, a := range n.Status.Addresses {
+		if a.Type == kind {
+			return a.Address
+		}
+	}
+	return ""
 }
 
 func podControllerOwner(p *corev1.Pod) string {

@@ -348,10 +348,10 @@ components:
       properties:
         kind:
           type: string
-          enum: [profile.create, profile.quota.change, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, notebook.start, notebook.stop, notebook.edit, pod.restart]
+          enum: [profile.create, profile.quota.change, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, notebook.start, notebook.stop, notebook.edit, pod.restart, node.cordon, node.uncordon]
         namespace: {type: string}
         name: {type: string}
-        reason: {type: string, maxLength: 500, description: 'Administrator input only; required and nonblank for pod.restart'}
+        reason: {type: string, maxLength: 500, description: 'Administrator input only; required and nonblank for pod.restart, node.cordon, and node.uncordon'}
         owner: {type: string, description: 'Exact Kubeflow owner identity, not an LDAP account creation'}
         quota: {type: object, additionalProperties: {type: string}}
         storageClass: {type: string}
@@ -374,6 +374,7 @@ components:
           description: Omitted/null leaves mounts unchanged; empty array requests removal
           items: {$ref: '#/components/schemas/Mount'}
         restart: {type: boolean}
+        force: {type: boolean, description: 'Explicit force confirmation for node.cordon / node.uncordon (e.g. control-plane or NotReady nodes)'}
     Mount:
       type: object
       additionalProperties: false

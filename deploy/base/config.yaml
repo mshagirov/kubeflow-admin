@@ -44,6 +44,7 @@ features:
   staticStorage: false
   pvcExpansion: false
   podRestarts: false
+  nodeCordon: false
 history:
   retentionDays: 90
   maxAuditRecords: 50000

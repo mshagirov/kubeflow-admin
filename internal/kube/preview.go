@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -132,6 +133,11 @@ func (s *Service) previews(w *work) {
 		w.change("desired revision", nil, w.podSet.Status.UpdateRevision)
 		w.change("assigned Node", nil, w.podNode.Name)
 		w.change("disruption handling", nil, "policy/v1 eviction with UID/resourceVersion preconditions; PodDisruptionBudget enforced by the API")
+	case "node.cordon", "node.uncordon":
+		want := a.Kind == "node.cordon"
+		w.change("spec.unschedulable", strconv.FormatBool(w.node.Spec.Unschedulable), strconv.FormatBool(want))
+		w.change("status", nodeState(w.node), nodeDesiredState(w.node, want))
+		w.change("force", "false", strconv.FormatBool(a.Force))
 	}
 	sort.SliceStable(w.prepared.Changes, func(i, j int) bool { return w.prepared.Changes[i].Field < w.prepared.Changes[j].Field })
 }

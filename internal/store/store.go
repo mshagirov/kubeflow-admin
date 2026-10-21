@@ -558,6 +558,8 @@ func PrimaryTarget(a model.Action) string {
 	switch {
 	case a.Kind == "pod.restart":
 		return "pod:" + a.Namespace + "/" + a.Name
+	case a.Kind == "node.cordon" || a.Kind == "node.uncordon":
+		return "node:" + a.Name
 	case strings.HasPrefix(a.Kind, "notebook."):
 		return "notebook:" + a.Namespace + "/" + a.Name
 	case strings.HasPrefix(a.Kind, "profile."):

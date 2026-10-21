@@ -102,6 +102,7 @@ type Features struct {
 	StaticStorage bool `yaml:"staticStorage"`
 	PVCExpansion  bool `yaml:"pvcExpansion"`
 	PodRestarts   bool `yaml:"podRestarts"`
+	NodeCordon    bool `yaml:"nodeCordon"`
 }
 
 type History struct {

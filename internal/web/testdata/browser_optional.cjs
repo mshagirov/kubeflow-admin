@@ -91,10 +91,14 @@ function loadPlaywright() {
     const next = page.locator('[data-table="historyOperations"] [data-pager="next"]');
     await next.click();
     assert.equal(await page.evaluate(() => document.activeElement?.dataset?.pager), "next", "pager preserves keyboard focus");
-    for (const route of ["profiles", "storage", "notebooks", "pods", "overview"]) {
+    for (const route of ["profiles", "storage", "notebooks", "pods"]) {
       await page.locator(`nav a[data-page="${route}"]`).click();
       await page.locator(`[data-table="${route}"] tbody tr`).first().waitFor();
     }
+    await page.locator('nav a[data-page="overview"]').click();
+    await page.locator("#workspace-health-summary .health-card").first().waitFor();
+    await page.locator("#toggle-overview-table").click();
+    await page.locator('[data-table="overview"] tbody tr').first().waitFor();
     assert.equal(inventoryRequests, 1, "server observedAt skew never forces a re-scan on navigation");
     assert.deepEqual(pageErrors, []);
     await page.close();

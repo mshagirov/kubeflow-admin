@@ -62,6 +62,7 @@ Then: log in as an admin over HTTPS, confirm a non-admin is denied, compare inve
 - [Diagnostic logging and bounded file rotation](docs/logging.md)
 - [History windows, readable actors and bounded audit retention](docs/history.md)
 - [Pods page and separately authorized, disruption-budget-aware restart](docs/pods.md)
+- [Nodes, namespaces, cordon/uncordon and Workspace Health](docs/nodes.md)
 - [Responsive UI, bounded History and safe Pod restart delivery plan](docs/ui-history-plan.md)
 - [Approved NFS/CSI user-storage templates](docs/storage.md)
 - [Consolidated final plan and agent work packages](kubeflow-admin-webapp-plan-final.md)

@@ -75,6 +75,7 @@ type Action struct {
 	GPUCount      *int64            `json:"gpuCount,omitempty"`
 	Mounts        *[]Mount          `json:"mounts,omitempty"`
 	Restart       bool              `json:"restart,omitempty"`
+	Force         bool              `json:"force,omitempty"`
 }
 type Mount struct {
 	Name     string `json:"name"`

@@ -1366,9 +1366,16 @@ func TestPodRestartTargetsAndValidation(t *testing.T) {
 	// Other actions never gain a parent lock merely from carrying the field.
 	other := planFor("notebook.stop", "alice", "lab", "")
 	other.Prepared.ParentNotebook = "lab"
-	for _, target := range Targets(other) {
-		if strings.HasPrefix(target, "notebook:alice/lab") && target != "notebook:alice/lab" {
-			t.Fatal("unexpected parent lock", target)
+	if targets := Targets(other); len(targets) != 1 || targets[0] != "notebook:alice/lab" {
+		t.Fatal("unexpected parent lock", targets)
+	}
+	for _, kind := range []string{"node.cordon", "node.uncordon"} {
+		nodePlan := model.Plan{ID: "node-" + kind, Actor: "issuer|admin", ActorDisplay: "Alice", Prepared: model.Prepared{Action: model.Action{Kind: kind, Name: "worker-1", Reason: "maintenance"}}}
+		if got := PrimaryTarget(nodePlan.Prepared.Action); got != "node:worker-1" {
+			t.Fatal("node primary target", kind, got)
+		}
+		if targets := Targets(nodePlan); len(targets) != 1 || targets[0] != "node:worker-1" {
+			t.Fatal("node targets", kind, targets)
 		}
 	}
 }

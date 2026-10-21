@@ -32,6 +32,8 @@ ALLOWED = {
     ("node.k8s.io", "runtimeclasses"): {"get"},
     # Explicit optional pod-restart workflow uses PDB-aware eviction only.
     ("", "pods/eviction"): {"create"},
+    # Explicit optional node-cordon workflow sets spec.unschedulable via JSON patch.
+    ("", "nodes"): {"get", "list", "patch"},
 }
 EXPECTED_ROLES = {
     "kubeflow-admin-read": {key: {"get", "list"} for key in READ_RESOURCES},
@@ -44,6 +46,7 @@ EXPECTED_ROLES = {
     "kubeflow-admin-static-storage": {("", "persistentvolumes"): {"create", "patch"}},
     "kubeflow-admin-pvc-expansion": {("", "persistentvolumeclaims"): {"patch"}},
     "kubeflow-admin-pod-restarts": {("", "pods/eviction"): {"create"}},
+    "kubeflow-admin-node-cordon": {("", "nodes"): {"patch"}},
 }
 
 def check(path):
@@ -61,6 +64,8 @@ def check(path):
                     for resource in rule["resources"]:
                         if resource == "pods/eviction":
                             assert path.name == "pod-restarts", "eviction grant must stay separately opt-in"
+                        if resource == "nodes" and "patch" in rule["verbs"]:
+                            assert path.name == "node-cordon", "node cordon grant must stay separately opt-in"
                         actual.setdefault((group, resource), set()).update(rule["verbs"])
                         assert set(rule["verbs"]) <= ALLOWED.get((group, resource), set()), rule
                         if path.name in ("base", "local-storage"):

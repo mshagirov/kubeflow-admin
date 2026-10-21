@@ -137,6 +137,15 @@ assigned Node is terminating
 assigned Node is not Ready
 assigned Node is unschedulable
 assigned Node is unreachable or not ready
+node cordon is disabled
+a nonempty reason is required for node cordon
+Node has no stable UID
+Node is terminating
+Node namespace must be empty
+Node is already cordoned
+Node is already schedulable
+control-plane Node requires force to cordon
+NotReady Node requires force to cordon
 a positive Kubernetes quantity is required
 nonempty quota required; removing quotas is unsupported
 unsupported quota resource

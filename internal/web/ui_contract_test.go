@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,8 +15,9 @@ func TestDashboardRoutesAndFeatureProjection(t *testing.T) {
 	s, _, _ := fixture()
 	for _, enabled := range []bool{false, true} {
 		s.cfg.Features.PodRestarts = enabled
+		s.cfg.Features.NodeCordon = enabled
 		h := handler(s)
-		for _, path := range []string{"/", "/profiles", "/storage", "/notebooks", "/pods", "/history?tab=audit", "/operations", "/audit"} {
+		for _, path := range []string{"/", "/profiles", "/namespaces", "/storage", "/notebooks", "/pods", "/nodes", "/history?tab=audit", "/operations", "/audit"} {
 			response := request(h, "GET", path, "")
 			if response.Code != 200 {
 				t.Fatalf("feature=%v route=%s status=%d", enabled, path, response.Code)
@@ -81,6 +83,26 @@ func TestHistoryWindowMetadata(t *testing.T) {
 		w := request(handler(s), "GET", path, "")
 		if w.Code != 200 || w.Header().Get("X-History-Limit") != "1000" || w.Header().Get("X-History-Retention-Days") != "60" || w.Header().Get("X-History-Window") == "" {
 			t.Fatalf("missing bounded history contract: %s %v", path, w.Header())
+		}
+	}
+}
+
+func TestNodeCordonValidationMessagesAreAllowlisted(t *testing.T) {
+	for _, msg := range []string{
+		"node cordon is disabled",
+		"a nonempty reason is required for node cordon",
+		"Node has no stable UID",
+		"Node is terminating",
+		"Node namespace must be empty",
+		"Node is already cordoned",
+		"Node is already schedulable",
+		"control-plane Node requires force to cordon",
+		"NotReady Node requires force to cordon",
+	} {
+		w := httptest.NewRecorder()
+		backendFailure(w, errors.New(msg), true)
+		if w.Code != 422 || !strings.Contains(w.Body.String(), msg) {
+			t.Fatalf("message %q was not allowlisted as 422 validation_failed: %d %s", msg, w.Code, w.Body.String())
 		}
 	}
 }

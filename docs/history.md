@@ -7,8 +7,15 @@ work so old needs-review items cannot disappear behind recent successes.
 
 Audit summaries group stages of an operation; detailed stage events remain
 available in that group. A partial loaded window may not contain every stage.
+Operations shows Time, Actor, Resource kind/namespace/name, Action and State.
 Reason displays only the administrator's input, not concatenated operation IDs.
-Resource/action/operation identifiers have separate columns or details.
+Failure details appear on demand from the State column; a fixed indicator slot
+keeps rows aligned. Resource/action/operation identifiers have separate fields
+or are retained in audit stage details.
+
+The UI never renders the raw `issuer|subject` Actor ID. New records show the
+captured display label; historical records without one show
+`Legacy administrator`.
 
 ## Administrator display names
 
@@ -18,9 +25,10 @@ characters and bounded in length. The label is presentation only: authorization,
 actor-bound plans and idempotency still use the stable issuer/subject key.
 
 Labels on accepted operations are immutable through checkpoints and completion.
-Legacy records without a captured label are not relabeled from a current user's
-profile or decoded into an assumed identity. Group changes are not instant LDAP
-revocation: existing application sessions remain bounded by their short lifetime.
+Legacy records without a captured label are shown as `Legacy administrator`; the
+UI does not expose the encoded issuer/subject key or infer a name from it. Group
+changes are not instant LDAP revocation: existing application sessions remain
+bounded by their short lifetime.
 
 ## Retention configuration
 

@@ -1,0 +1,27 @@
+# Cluster-scoped Node cordon/uncordon is the only mutation this workflow
+# performs. It sets spec.unschedulable via a UID-conditional JSON patch and
+# deliberately does not grant nodes delete, nodes update, or pods/eviction; it
+# never drains workloads. Kubelet heartbeats change resourceVersion frequently,
+# so execution uses a fresh resourceVersion precondition with bounded retries
+# rather than treating a heartbeat as a user-visible conflict.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflow-admin-node-cordon
+rules:
+  - apiGroups: ['']
+    resources: [nodes]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeflow-admin-node-cordon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeflow-admin-node-cordon
+subjects:
+  - kind: ServiceAccount
+    name: kubeflow-admin
+    namespace: kubeflow-admin
