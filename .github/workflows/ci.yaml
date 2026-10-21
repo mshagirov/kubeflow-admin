@@ -53,7 +53,8 @@ jobs:
           cache: true
       - name: Scan reachable Go vulnerabilities
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          govulncheck ./...
+          # Keep the scanner's SSA parser compatible with the selected Go toolchain.
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
       - name: Scan source dependencies, secrets and manifest misconfiguration
         run: docker run --rm -v "$PWD:/src:ro" aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222 fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 /src

@@ -42,6 +42,14 @@ Verified before publication:
   mounts remain unchanged unless replacement is explicitly selected. No
   individual Notebook-details API or full editable-configuration prefill exists.
 
+The first GitHub CI run for `e42d56f` failed in the security job: the pinned
+`govulncheck v1.1.4` panicked in its bundled `x/tools v0.29.0` SSA builder with
+`unexpected expr: *ast.KeyValueExpr`. The passing local vulnerability scan used
+`govulncheck v1.9.0`, not that older CI pin. The follow-up CI fix pins `v1.9.0`
+and invokes its installed path explicitly; reachability scanning remains enabled
+and any error or finding still fails the job. Linux verification and replacement
+CI results are recorded when complete.
+
 Publication and live-cluster acceptance remain pending.
 
 ## Profile workflows and resource drawers — 21 October 2026
