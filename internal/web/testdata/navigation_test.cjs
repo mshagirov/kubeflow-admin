@@ -68,6 +68,8 @@ assert.ok(html.includes('role="tablist"') && html.includes('data-history-tab="op
 
 // Supervisors inject these; the browser must not make an extra /me round trip.
 assert.ok(html.includes('<meta name="notification-scope" content="{{.Identity.NotificationScope}}">'));
+assert.ok(html.includes('data-open-drawer="storage">New</button>'), "Storage page uses the requested New button label");
+assert.ok(html.includes('data-open-drawer="profile">New</button>'), "Profiles page uses the requested New button label");
 assert.ok(html.includes('<meta name="pod-restarts" content="{{.Config.Features.PodRestarts}}">'));
 assert.ok(html.includes('<meta name="node-cordon" content="{{.Config.Features.NodeCordon}}">'));
 assert.ok(app.includes("nodeCordonFeature") && app.includes('meta("node-cordon")'));
