@@ -311,8 +311,9 @@ async function openProfileDrawer(page, base) {
   await ensureProfilesPage(page, base);
   const control = await findVisible(page, [
     '[data-open-drawer="profile"]',
-    { role: "button", name: /manage profile/i }
+    { role: "button", name: "Add/Manage", exact: true }
   ], "the Profile management control");
+  assert.equal((await control.innerText()).trim(), "Add/Manage", "Profiles uses the requested Add/Manage button label");
   await control.click();
   const drawer = page.locator("#profile-drawer");
   await drawer.waitFor({ state: "visible", timeout: 10000 });
