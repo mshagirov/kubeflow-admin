@@ -20,6 +20,7 @@ new vm.Script(fs.readFileSync(path.join(root, "logic.js"), "utf8"), { filename: 
 // Sidebar order and legacy History entry points.
 const nav = html.match(/<nav aria-label="Main navigation">([\s\S]*?)<\/nav>/);
 assert.ok(nav, "main navigation is missing");
+assert.equal(html.includes('class="nav-label"'), false, "sidebar omits the WORKSPACE label");
 const links = [...nav[1].matchAll(/data-page="([^"]+)"[^>]*>([^<]+)</g)].map(match => [match[1], match[2]]);
 assert.deepEqual(links, [["overview", "Overview"], ["profiles", "Profiles"], ["storage", "Storage"], ["namespaces", "Namespaces"], ["notebooks", "Notebooks"], ["pods", "Pods"], ["nodes", "Nodes"], ["history", "History"]]);
 assert.ok(html.includes('href="/history" data-page="history"'));
@@ -70,6 +71,10 @@ assert.ok(html.includes('role="tablist"') && html.includes('data-history-tab="op
 assert.ok(html.includes('<meta name="notification-scope" content="{{.Identity.NotificationScope}}">'));
 assert.ok(html.includes('data-open-drawer="storage">New</button>'), "Storage page uses the requested New button label");
 assert.ok(html.includes('data-open-drawer="profile">New</button>'), "Profiles page uses the requested New button label");
+const profilesMarkup = html.slice(html.indexOf('<section id="profiles"'), html.indexOf('<section id="namespaces"'));
+assert.ok(profilesMarkup.includes('class="panel info-panel"'), "Profiles retains its information panel");
+assert.ok(profilesMarkup.indexOf('class="panel info-panel"') < profilesMarkup.indexOf('id="profiles-table"'), "Profile information panel precedes the Profiles table");
+assert.equal(profilesMarkup.includes('class="split"'), false, "Profiles uses a full-width vertical layout rather than side-by-side panels");
 assert.ok(html.includes('<meta name="pod-restarts" content="{{.Config.Features.PodRestarts}}">'));
 assert.ok(html.includes('<meta name="node-cordon" content="{{.Config.Features.NodeCordon}}">'));
 assert.ok(app.includes("nodeCordonFeature") && app.includes('meta("node-cordon")'));

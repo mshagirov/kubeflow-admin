@@ -2,6 +2,29 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
+## 0.4.3 — Profile and Notebook panel layout (22 October 2026)
+
+Release preparation; `0.4.3` and `latest` will be published together only after
+checks, runtime scans and source CI pass. Existing `0.4.2` remains unchanged.
+
+- Profiles: the Workspace ownership information panel precedes the Profiles table
+  in a full-width vertical layout instead of a side-by-side split.
+- Notebooks: the management button stays at the right edge of the panel heading,
+  vertically centered. Description and policy explanations wrap in the left grid
+  column; button gating, exact target selection and drawer behavior are unchanged.
+- Sidebar: removed the WORKSPACE nav-label element and its unused styles.
+- Personal review confirmed no backend, API, permission or feature-flag changes.
+  Regression coverage checks Profile panel order/full-width geometry and Notebook
+  action right/center alignment at narrow/wide viewports.
+
+Local verification passed: Node regressions, full serialized Go 1.27.3 race suite,
+vet/build, module verification, `govulncheck` (no vulnerabilities), source Trivy
+HIGH/CRITICAL vulnerability/secret/misconfiguration gates, API parity, seven Python
+tests, OpenAPI validation, shell syntax and eleven strict Kubernetes 1.32 manifest
+variants. Real-Chrome synthetic acceptance passed **32/32**, including the new
+panel geometry assertions, with no JavaScript errors or page overflow at
+390px/1280px. Publication and CI receipts follow below. No deployment performed.
+
 ## 0.4.2 refresh — responsive Nodes table (22 October 2026)
 
 **Latest alias:** `docker.io/muratshagirov/kubeflow-admin:latest` and `:0.4.2`

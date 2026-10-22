@@ -2233,6 +2233,29 @@ async function checkResponsive(context) {
       results.push(`${viewport.width}px ${route}: overflow ${overflow.document}/${overflow.body}px`);
       assert.ok(overflow.document <= 1, `${route} overflows the ${viewport.width}px viewport by ${overflow.document}px`);
       assert.ok(overflow.body <= 1, `${route} overflows the ${viewport.width}px viewport by ${overflow.body}px`);
+      if (route === "/profiles") {
+        const layout = await page.locator("#profiles").evaluate(section => {
+          const info = section.querySelector(".info-panel").getBoundingClientRect();
+          const table = section.querySelector("#profiles-table").closest(".panel").getBoundingClientRect();
+          return { infoBottom: info.bottom, tableTop: table.top, infoWidth: info.width, tableWidth: table.width, infoLeft: info.left, tableLeft: table.left };
+        });
+        assert.ok(layout.infoBottom <= layout.tableTop, "Profile information panel sits above the table");
+        assert.ok(Math.abs(layout.infoWidth - layout.tableWidth) <= 1 && Math.abs(layout.infoLeft - layout.tableLeft) <= 1, "Profile panels share the full available width");
+      }
+      if (route === "/notebooks") {
+        const alignment = await page.locator("#notebook-page-manage").evaluate(button => {
+          const heading = button.closest(".panel-heading"), rect = heading.getBoundingClientRect();
+          const action = button.getBoundingClientRect(), css = getComputedStyle(heading);
+          return {
+            right: rect.right - parseFloat(css.paddingRight) - parseFloat(css.borderRightWidth),
+            buttonRight: action.right,
+            center: rect.top + (rect.height + parseFloat(css.paddingTop) - parseFloat(css.paddingBottom)) / 2,
+            buttonCenter: action.top + action.height / 2
+          };
+        });
+        assert.ok(Math.abs(alignment.right - alignment.buttonRight) <= 1, "Manage notebook stays right-aligned inside the heading");
+        assert.ok(Math.abs(alignment.center - alignment.buttonCenter) <= 1, "Manage notebook stays vertically centered inside the heading");
+      }
       if (route === "/pods" || route === "/nodes") {
         const key = route.slice(1);
         const table = page.locator(`[data-table="${key}"]`);
