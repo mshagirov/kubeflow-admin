@@ -13,6 +13,7 @@ Publication of the refresh is pending; the original receipt below is historical.
   Overview now reads "CLUSTER AT A GLANCE" in both initial and navigated views.
   The Profiles page management button is labeled "New".
   The Storage page entry button is labeled "New"; the drawer remains unchanged.
+  Namespaces follows Storage in the sidebar navigation.
   The old 1560px minimum is replaced by an 800px narrow-view
   fallback; above 1200px the eight-column table uses the available width, smaller
   horizontal padding, explicit column proportions and wrapping. No columns,

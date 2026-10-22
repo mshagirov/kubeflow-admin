@@ -21,7 +21,7 @@ new vm.Script(fs.readFileSync(path.join(root, "logic.js"), "utf8"), { filename: 
 const nav = html.match(/<nav aria-label="Main navigation">([\s\S]*?)<\/nav>/);
 assert.ok(nav, "main navigation is missing");
 const links = [...nav[1].matchAll(/data-page="([^"]+)"[^>]*>([^<]+)</g)].map(match => [match[1], match[2]]);
-assert.deepEqual(links, [["overview", "Overview"], ["profiles", "Profiles"], ["namespaces", "Namespaces"], ["storage", "Storage"], ["notebooks", "Notebooks"], ["pods", "Pods"], ["nodes", "Nodes"], ["history", "History"]]);
+assert.deepEqual(links, [["overview", "Overview"], ["profiles", "Profiles"], ["storage", "Storage"], ["namespaces", "Namespaces"], ["notebooks", "Notebooks"], ["pods", "Pods"], ["nodes", "Nodes"], ["history", "History"]]);
 assert.ok(html.includes('href="/history" data-page="history"'));
 assert.ok(html.includes('class="source-link"') && html.includes('href="https://github.com/mshagirov/kubeflow-admin.git"') && html.includes('class="gh-icon"') && html.includes('rel="noopener noreferrer"'), "sidebar links to the public source repository");
 assert.ok(style.includes(".source-link") && style.includes(".gh-icon"));
