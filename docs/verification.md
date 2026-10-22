@@ -4,7 +4,7 @@ Records what has been **proven locally** and what still requires the operator's 
 
 ## 0.4.2 — Overview, notifications and simplified tables (22 October 2026)
 
-Release preparation; registry publication is not yet complete.
+Published and registry-verified as `docker.io/muratshagirov/kubeflow-admin:0.4.2`.
 
 - Overview now contains only Workspace Health: larger Nodes card beside Profiles,
   Notebooks, Pods / PVCs, PVs, Events in a three-column, two-row wide layout.
@@ -23,13 +23,42 @@ Release preparation; registry publication is not yet complete.
   row alignment and preservation of all seven removed fields in Resource Details.
 
 No new cluster deployment or live storage mutation was performed. `0.4.1` remains
-unchanged. Publication and CI receipts follow once verified.
+unchanged, verified by comparing its registry index before and after publication.
 
 Release-toolchain rerun: `GOTOOLCHAIN=go1.27.3` full serialized race tests and vet
 passed; `govulncheck` reported no vulnerabilities. An initial unpinned scan used
 the host's Go 1.27.2 and reported GO-2026-6809; the already digest-pinned release
 Dockerfile and CI use fixed Go 1.27.3. API parity, all five Python tests, OpenAPI
 validation and all eleven manifest variants passed.
+
+### Publication receipt
+
+- Source commit: `f70f0f9d1de2f59bcf4508ebc03b3fdf6ea4b4de`.
+- Source CI: [39730380234](https://github.com/mshagirov/kubeflow-admin/actions/runs/39730380234),
+  test and security jobs both passed.
+- Multi-platform index:
+  `sha256:9dd818736462bdfced3eb760388c4e63ba984e0b6c5a9833fac05fb6fc95fcdf`.
+- Linux AMD64 manifest:
+  `sha256:3c8f4e6274dd6377a2f5c6506dc80e63cbafc0d1e9bbeab4a7c010a286409a2d`.
+- Linux ARM64 manifest:
+  `sha256:1fface146da84020eb9e98af09322eb1b5659cb72cd7f4fff1df95816eb8451d`.
+- Registry platform manifests exactly match the offline-scanned artifacts.
+  SPDX SBOM and provenance attestations were verified for both platforms.
+- Digest-pinned Trivy 0.76.0 source and both runtime scans passed the
+  HIGH/CRITICAL vulnerability/secret gates; source manifest misconfiguration
+  scanning also passed. All eleven variants passed strict Kubernetes 1.32
+  schema validation with no skips.
+- Both runtime images have source/version labels, non-root UID/GID `65532:65532`
+  and byte-identical `/LICENSE`. Both failed closed without configuration in
+  network-disabled, read-only-root containers with all capabilities dropped.
+
+Immutable deployment image (site pin is an operator deployment step):
+
+```yaml
+image: docker.io/muratshagirov/kubeflow-admin@sha256:9dd818736462bdfced3eb760388c4e63ba984e0b6c5a9833fac05fb6fc95fcdf
+```
+
+Receipt-only documentation commits do not change the published binaries.
 
 ## 0.4.1 — storage, Notebook gates and Node scope (22 October 2026)
 
