@@ -2233,6 +2233,8 @@ async function checkResponsive(context) {
       assert.ok(overflow.document <= 1, `${route} overflows the ${viewport.width}px viewport by ${overflow.document}px`);
       assert.ok(overflow.body <= 1, `${route} overflows the ${viewport.width}px viewport by ${overflow.body}px`);
       if (route === "/") {
+        assert.equal(await page.locator("#page-eyebrow.eyebrow").textContent(), "Cluster at a Glance", "Overview retains the existing eyebrow class");
+        assert.equal(await page.locator("#page-subtitle").count(), 0, "Overview has no subtitle paragraph");
         assert.equal(await page.locator("#metrics").count(), 0, "Overview has no legacy metrics row");
         const cards = await page.locator("#workspace-health-summary .health-card").evaluateAll(nodes => nodes.map(node => {
           const rect = node.getBoundingClientRect();
@@ -2251,6 +2253,20 @@ async function checkResponsive(context) {
       }
     }
   }
+  // Exercise client-side navigation, not just direct page loads: subtitles
+  // must be recreated once outside Overview and removed again on return.
+  await page.locator('nav a[data-page="overview"]').click();
+  assert.equal(await page.locator("#page-subtitle").count(), 0);
+  await page.locator('nav a[data-page="profiles"]').click();
+  assert.equal(await page.locator("#page-subtitle").count(), 1);
+  assert.equal(await page.locator("#page-subtitle").textContent(), "Manage ownership, namespaces and resource quotas.");
+  assert.equal(await page.locator("#page-eyebrow").textContent(), "CLUSTER ADMINISTRATION");
+  await page.locator('nav a[data-page="overview"]').click();
+  assert.equal(await page.locator("#page-subtitle").count(), 0);
+  await page.goBack();
+  assert.equal(await page.locator("#page-subtitle").count(), 1);
+  await page.goForward();
+  assert.equal(await page.locator("#page-subtitle").count(), 0);
   console.log("      measured overflow: " + results.join(", "));
   assert.deepEqual(errors, [], "the console raised JavaScript errors: " + errors.join(" | "));
 }

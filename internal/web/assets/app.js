@@ -21,7 +21,7 @@
   const logic = globalThis.DashboardLogic;
 
   const pageTitles = {
-    overview: ["Overview", "Cluster at a Glance"],
+    overview: ["Overview", ""],
     profiles: ["Profiles", "Manage ownership, namespaces and resource quotas."],
     namespaces: ["Namespaces", "Observed namespaces and the resources they contain."],
     storage: ["Storage", "Provision and grow persistent storage with explicit safeguards."],
@@ -1152,7 +1152,18 @@
     applyPodFilters(location.search);
     applyResourceScope(location.search);
     $("#page-title").textContent = pageTitles[page]?.[0] || "Overview";
-    $("#page-subtitle").textContent = pageTitles[page]?.[1] || "";
+    $("#page-eyebrow").textContent = page === "overview" ? "Cluster at a Glance" : "CLUSTER ADMINISTRATION";
+    let subtitle = $("#page-subtitle");
+    if (page === "overview") {
+      subtitle?.remove();
+    } else {
+      if (!subtitle) {
+        subtitle = el("p");
+        subtitle.id = "page-subtitle";
+        $("#page-title").parentElement.append(subtitle);
+      }
+      subtitle.textContent = pageTitles[page]?.[1] || "";
+    }
     document.title = `${pageTitles[page]?.[0] || "Overview"} · Kubeflow Administration`;
     $$(".page").forEach(section => { section.hidden = section.id !== page; });
     $$("nav a").forEach(link => {

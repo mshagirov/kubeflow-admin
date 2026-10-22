@@ -349,13 +349,13 @@ func TestFooterSchemeRelativeImageIsNormalized(t *testing.T) {
 func TestOverviewExplanationPanelsAreRemoved(t *testing.T) {
 	s, _, _ := fixture()
 	body := request(handler(s), "GET", "/", "").Body.String()
-	for _, gone := range []string{"Review before you apply", "Observed, not assumed", "info-grid", `id="metrics"`} {
+	for _, gone := range []string{"Review before you apply", "Observed, not assumed", "info-grid", `id="metrics"`, `id="page-subtitle"`} {
 		if strings.Contains(body, gone) {
 			t.Fatalf("the removed Overview panel is still rendered: %q", gone)
 		}
 	}
 	// The Overview page itself keeps its observed content.
-	for _, kept := range []string{`id="overview" class="page"`, `id="workspace-health-summary"`, `id="overview-table" data-table="overview"`} {
+	for _, kept := range []string{`id="overview" class="page"`, `id="workspace-health-summary"`, `id="overview-table" data-table="overview"`, `id="page-eyebrow" class="eyebrow">Cluster at a Glance</div>`} {
 		if !strings.Contains(body, kept) {
 			t.Fatalf("the Overview page lost %q", kept)
 		}
