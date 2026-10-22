@@ -4,9 +4,9 @@ Records what has been **proven locally** and what still requires the operator's 
 
 ## 0.4.2 refresh — responsive Nodes table (22 October 2026)
 
-The operator authorized reusing `0.4.2` for this follow-up; the tag will change
-digest, while existing deployments pinned to the original digest stay unchanged.
-Publication of the refresh is pending; the original receipt below is historical.
+The operator authorized reusing `0.4.2` for this follow-up. The tag now points to
+the refreshed digest below; existing deployments pinned to the original digest
+stay unchanged. The original receipt in the following section is historical.
 
 - Personal review confirmed the changes affect only Nodes table CSS and its
   browser assertion, plus the requested uppercase Overview eyebrow and its tests.
@@ -24,8 +24,41 @@ Publication of the refresh is pending; the original receipt below is historical.
   or page overflow at 390px/1280px. A new assertion verifies the Nodes table itself
   has no horizontal scroll at the wide viewport, not just the surrounding page.
 
-No cluster deployment was performed. The refreshed immutable digest will be
-recorded after runtime scans, CI and registry verification.
+No cluster deployment was performed.
+
+### Refreshed publication receipt
+
+- Source commit: `143eba84bbcfa7cbef3cb4341fc06ec67611e4be` (includes all label,
+  navigation and table-fit follow-ups).
+- Source CI: [39733233969](https://github.com/mshagirov/kubeflow-admin/actions/runs/39733233969)
+  passed test and security jobs. Earlier superseded runs were cancelled by the
+  workflow concurrency policy as subsequent UI changes were pushed.
+- Final serialized Go 1.27.3 race suite, vet and vulnerability scan passed.
+  Final real-Chrome rerun passed **32/32**, with no JavaScript errors or overflow.
+  The preceding browser attempt reached its external timeout after responsive
+  measurements; it was not counted as a pass, and no production timeout changed.
+- Source and both runtime Trivy HIGH/CRITICAL vulnerability/secret gates passed;
+  source misconfiguration scanning, eleven strict manifest variants and OpenAPI
+  checks passed. Non-root identity, revision/version labels, byte-identical
+  `/LICENSE`, and read-only-root/network-disabled smoke checks passed on both
+  platforms.
+- Linux AMD64 manifest:
+  `sha256:81384c8ee88485f570c606ec5c9c91c4662e0dec914d5cb0d4ca33efdb901894`.
+- Linux ARM64 manifest:
+  `sha256:db083505ba52be3b839d0d65be11b3ed16fd6b99f2b4d5aa1dc53a2f29bad947`.
+- Registry platform manifests exactly match the offline-scanned images. SPDX
+  SBOM/provenance attestations were verified for both; `0.4.1` is unchanged.
+
+Current `0.4.2` immutable deployment image:
+
+```yaml
+image: docker.io/muratshagirov/kubeflow-admin@sha256:01761b157722b02f90a99a8262cfc1f4dec14c31f56649d8002acc42dfa2055e
+```
+
+This supersedes the original `0.4.2` tag digest
+`sha256:9dd818736462bdfced3eb760388c4e63ba984e0b6c5a9833fac05fb6fc95fcdf`.
+Update the site image pin explicitly to receive these changes. Receipt-only
+documentation commits do not change the published binaries.
 
 ## Original 0.4.2 — Overview, notifications and simplified tables (22 October 2026)
 
