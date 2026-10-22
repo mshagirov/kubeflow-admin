@@ -497,8 +497,6 @@
       label: "Pods", empty: "No matching Pods. Choose another namespace or refresh inventory.",
       columns: [
         { key: "name", label: "Pod" }, { key: "ready", label: "Ready", type: "ready" }, { key: "restarts", label: "Restarts", type: "number" },
-        { key: "cpuRequest", label: "CPU request", type: "quantity" }, { key: "memoryRequest", label: "Memory request", type: "quantity" },
-        { key: "cpuLimit", label: "CPU limit", type: "quantity" }, { key: "memoryLimit", label: "Memory limit", type: "quantity" },
         { key: "state", label: "State", type: "severity" }, { key: "node", label: "Node" }, { key: "owner", label: "Owner" }, { key: "actions", label: "Restart", sortable: false }
       ]
     },
@@ -508,8 +506,7 @@
         { key: "name", label: "Name" }, { key: "state", label: "Status", type: "severity" }, { key: "roles", label: "Roles" },
         { key: "age", label: "Age", type: "time" }, { key: "version", label: "Version" },
         { key: "internalIP", label: "Internal-IP" }, { key: "externalIP", label: "External-IP" },
-        { key: "osImage", label: "OS-Image" }, { key: "kernelVersion", label: "Kernel-Version" },
-        { key: "containerRuntime", label: "Container-Runtime" }, { key: "actions", label: "Cordon / Uncordon", sortable: false }
+        { key: "actions", label: "Cordon / Uncordon", sortable: false }
       ]
     },
     historyOperations: {
@@ -591,7 +588,7 @@
       // matcher is shared with the Node scoped count, so the count and the
       // destination cannot drift apart.
       return scoped.filter(resource => logic.podMatchesFilters(resource, podFilters)).map(resource =>
-        resourceRow(resource, () => [resourceNameNode(resource), podReady(resource), podRestartCount(resource), podResourceDetail(resource, "cpuRequest", "requested.cpu"), podResourceDetail(resource, "memoryRequest", "requested.memory"), podResourceDetail(resource, "cpuLimit", "limit.cpu"), podResourceDetail(resource, "memoryLimit", "limit.memory"), badge(resource.state), resource.details?.node || "—", resource.owner || resource.details?.owner || "Not reported", restartButton(resource)]));
+        resourceRow(resource, () => [resourceNameNode(resource), podReady(resource), podRestartCount(resource), badge(resource.state), resource.details?.node || "—", resource.owner || resource.details?.owner || "Not reported", restartButton(resource)]));
     }
     if (stateKey === "nodes") {
       return resources.filter(resource => resource.kind === "Node").map(resource => {
@@ -607,8 +604,7 @@
           },
           cellFactory: () => [
             resourceNameNode(resource), badge(resource.state), details.roles || "—", logic.formatAge(details.createdAt),
-            details.version || "—", details.internalIP || "—", details.externalIP || "—", details.osImage || "—",
-            details.kernelVersion || "—", details.containerRuntime || "—", nodeCordonButton(resource)
+            details.version || "—", details.internalIP || "—", details.externalIP || "—", nodeCordonButton(resource)
           ]
         };
       });

@@ -815,6 +815,10 @@ async function bootHarness(options = {}) {
   const podsContainer = appTest.get('[data-table="pods"]');
   const podHeaders = appTest.walk(podsContainer, node => node.tagName === "TH")
     .map(node => appTest.textOf(node).replace(/[↕▲▼]/g, "").trim()).filter(Boolean);
+  assert.deepEqual(podHeaders, ["Pod", "Ready", "Restarts", "State", "Node", "Owner", "Restart"], "Pods table omits resource requests and limits");
+  for (const row of appTest.walk(podsContainer, node => node.tagName === "TR" && node.children.some(cell => cell.tagName === "TD"))) {
+    assert.equal(row.children.length, podHeaders.length, "Pod cells align with the simplified columns");
+  }
   assert.ok(podHeaders.indexOf("Node") > podHeaders.indexOf("State"), "Node column follows State on the Pods table");
   assert.ok(appTest.textOf(podsContainer).includes("node-1"), "Pod rows show the observed node");
   const restartButtons = appTest.walk(podsContainer, node => node.tagName === "BUTTON" && node.textContent === "Restart");
@@ -901,7 +905,14 @@ async function bootHarness(options = {}) {
   const nodesContainer = appTest.get('[data-table="nodes"]');
   const nodesText = appTest.textOf(nodesContainer);
   assert.ok(nodesText.includes("node-1") && nodesText.includes("node-2") && nodesText.includes("node-3"), "Nodes always lists every cluster node");
-  assert.ok(nodesText.includes("Ready,SchedulingDisabled") && nodesText.includes("containerd://2.0"), "Nodes table shows wide node details");
+  assert.ok(nodesText.includes("Ready,SchedulingDisabled"), "Nodes table retains observed scheduling status");
+  assert.equal(nodesText.includes("containerd://2.0"), false, "runtime details are omitted only from the Nodes table");
+  const nodeHeaders = appTest.walk(nodesContainer, node => node.tagName === "TH")
+    .map(node => appTest.textOf(node).replace(/[↕▲▼]/g, "").trim()).filter(Boolean);
+  assert.deepEqual(nodeHeaders, ["Name", "Status", "Roles", "Age", "Version", "Internal-IP", "External-IP", "Cordon / Uncordon"]);
+  for (const row of appTest.walk(nodesContainer, node => node.tagName === "TR" && node.children.some(cell => cell.tagName === "TD"))) {
+    assert.equal(row.children.length, nodeHeaders.length, "Node cells align with the simplified columns");
+  }
   assert.equal(nodesContainer.querySelector("[data-namespace]"), null, "Nodes table has no namespace selector");
   assert.ok(appTest.walk(nodesContainer, node => node.tagName === "TH").map(node => node.textContent).includes("Cordon / Uncordon"));
   const uncordon = appTest.walk(nodesContainer, node => node.tagName === "BUTTON" && node.textContent === "Uncordon")[0];

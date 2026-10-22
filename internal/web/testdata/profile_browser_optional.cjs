@@ -2232,6 +2232,23 @@ async function checkResponsive(context) {
       results.push(`${viewport.width}px ${route}: overflow ${overflow.document}/${overflow.body}px`);
       assert.ok(overflow.document <= 1, `${route} overflows the ${viewport.width}px viewport by ${overflow.document}px`);
       assert.ok(overflow.body <= 1, `${route} overflows the ${viewport.width}px viewport by ${overflow.body}px`);
+      if (route === "/pods" || route === "/nodes") {
+        const key = route.slice(1);
+        const table = page.locator(`[data-table="${key}"]`);
+        const headers = await table.locator("th").allTextContents();
+        const expected = key === "pods"
+          ? ["Pod", "Ready", "Restarts", "State", "Node", "Owner", "Restart"]
+          : ["Name", "Status", "Roles", "Age", "Version", "Internal-IP", "External-IP", "Cordon / Uncordon"];
+        assert.deepEqual(headers.map(text => text.replace(/[↕▲▼]/g, "").trim()), expected, `${key} has only the simplified columns`);
+        const rowLengths = await table.locator("tbody tr").evaluateAll(rows => rows.map(row => row.children.length));
+        assert.ok(rowLengths.every(length => length === expected.length), `${key} cells match their headers`);
+        const details = await clickResourceName(page, key, key === "pods" ? "team-alpha-notebook-0-0" : "node-a");
+        const detailText = await details.innerText();
+        const preserved = key === "pods" ? ["cpuRequest", "memoryRequest", "cpuLimit", "memoryLimit"]
+          : ["osImage", "kernelVersion", "containerRuntime"];
+        for (const field of preserved) assert.ok(detailText.includes(field), `${key} Resource Details preserves ${field}`);
+        await page.keyboard.press("Escape");
+      }
       if (route === "/") {
         assert.equal(await page.locator("#page-eyebrow.eyebrow").textContent(), "Cluster at a Glance", "Overview retains the existing eyebrow class");
         assert.equal(await page.locator("#page-subtitle").count(), 0, "Overview has no subtitle paragraph");

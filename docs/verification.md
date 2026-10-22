@@ -2,6 +2,35 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
+## 0.4.2 — Overview, notifications and simplified tables (22 October 2026)
+
+Release preparation; registry publication is not yet complete.
+
+- Overview now contains only Workspace Health: larger Nodes card beside Profiles,
+  Notebooks, Pods / PVCs, PVs, Events in a three-column, two-row wide layout.
+  The eyebrow is "Cluster at a Glance" with no Overview subtitle; other pages
+  restore their subtitles, including through client navigation and Back/Forward.
+- Notifications default to one visible card with an expandable count. Errors
+  sort first, newest-first within each priority group; repeats stay deduplicated.
+  Existing dismissal persistence and info/success expiry are preserved.
+- Only the Pods table drops CPU/memory request/limit columns. Only the Nodes
+  table drops OS-Image, Kernel-Version and Container-Runtime. Resource Details,
+  backend projections, Node Pod scope, actions and permissions are unchanged.
+- Personal review, Node regressions, full serialized Go race suite, vet, build,
+  module verification and whitespace checks passed. Configured real-Chrome
+  synthetic acceptance passed **32/32**, with no skips, JavaScript errors or
+  horizontal overflow at 390px/1280px. Added assertions verify exact table headers,
+  row alignment and preservation of all seven removed fields in Resource Details.
+
+No new cluster deployment or live storage mutation was performed. `0.4.1` remains
+unchanged. Publication and CI receipts follow once verified.
+
+Release-toolchain rerun: `GOTOOLCHAIN=go1.27.3` full serialized race tests and vet
+passed; `govulncheck` reported no vulnerabilities. An initial unpinned scan used
+the host's Go 1.27.2 and reported GO-2026-6809; the already digest-pinned release
+Dockerfile and CI use fixed Go 1.27.3. API parity, all five Python tests, OpenAPI
+validation and all eleven manifest variants passed.
+
 ## 0.4.1 — storage, Notebook gates and Node scope (22 October 2026)
 
 This work is published as `0.4.1`, not in the historical `0.4.0` digest below. It adds name-only storage
