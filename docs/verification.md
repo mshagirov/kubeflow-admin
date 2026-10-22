@@ -4,8 +4,8 @@ Records what has been **proven locally** and what still requires the operator's 
 
 ## 0.4.3 — Profile and Notebook panel layout (22 October 2026)
 
-Release preparation; `0.4.3` and `latest` will be published together only after
-checks, runtime scans and source CI pass. Existing `0.4.2` remains unchanged.
+Published and registry-verified: `0.4.3` and `latest` resolve to the same image
+index below. Existing `0.4.2` remains unchanged.
 
 - Profiles: the Workspace ownership information panel precedes the Profiles table
   in a full-width vertical layout instead of a side-by-side split.
@@ -23,7 +23,44 @@ HIGH/CRITICAL vulnerability/secret/misconfiguration gates, API parity, seven Pyt
 tests, OpenAPI validation, shell syntax and eleven strict Kubernetes 1.32 manifest
 variants. Real-Chrome synthetic acceptance passed **32/32**, including the new
 panel geometry assertions, with no JavaScript errors or page overflow at
-390px/1280px. Publication and CI receipts follow below. No deployment performed.
+390px/1280px. No deployment performed.
+
+### Publication receipt
+
+- Source commit: `6009e5c154078ed037d68392982ff8723f90a470`.
+- Source CI: [39737209030](https://github.com/mshagirov/kubeflow-admin/actions/runs/39737209030)
+  passed test and security jobs before promotion.
+- Both offline runtime images passed Trivy HIGH/CRITICAL vulnerability/secret
+  scans. Non-root UID/GID `65532:65532`, source/version labels, byte-identical
+  `/LICENSE` and read-only-root/network-disabled smoke tests passed on both.
+- Linux AMD64 manifest:
+  `sha256:5d8463c6fa17892261cdb577304a2e9c1e73bd14e258fd77be9b1aab9cd17bfc`.
+- Linux ARM64 manifest:
+  `sha256:b81de1c43525b053d5f105eee5542d7820017caafe273d8dad990cb4bb29976c`.
+- Existing verified local artifacts were pushed without another build. Registry
+  platform manifests match the scanned artifacts, both platform SPDX/provenance
+  manifests were verified, and `0.4.3`/`latest` resolve to the exact same index.
+  The `0.4.2` registry index was compared before/after and is unchanged.
+
+```yaml
+image: docker.io/muratshagirov/kubeflow-admin@sha256:02fde5adfb666ab5058ef637d5f195b21c62f763f113b861a84a17d1517c834d
+```
+
+### Documentation-only audit
+
+Current UI guide, Nodes/Pods columns, Overview, notifications, storage gates,
+recovery, all-profile scope and live acceptance were checked against source.
+Contradictory unsupported-storage claims and duplicate checklist IDs were fixed;
+historical plans/receipts remain identified as historical. The learning guide was
+consolidated to **15 lessons**, retaining authentication, durability, safety,
+storage, CI/publication and operator deployment/recovery topics. README links and
+lesson count were updated. Local Markdown file links, code fences, checklist IDs,
+lesson numbering and whitespace checks passed.
+
+These docs/receipt changes require no image rebuild or separate CI run; the
+docs-only commit uses `[skip ci]`. They do not change the published source label
+or binaries. The application image promotion above belongs to the previously
+authorized UI release, not a new build for the documentation edits.
 
 ## 0.4.2 refresh — responsive Nodes table (22 October 2026)
 

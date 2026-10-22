@@ -2,11 +2,19 @@
 
 ## Nodes page
 
-The Nodes page is a projected `kubectl get node -o wide`-style view: name,
-readiness/scheduling status, roles, age, kubelet version, internal/external IP,
-OS image, kernel, container runtime and Cordon/Uncordon controls. Values come
-from the existing cluster-wide inventory read. They are observations, not a live
-health probe or capacity guarantee.
+The Nodes table shows Name, Status, Roles, Age, Version (kubelet), Internal-IP,
+External-IP and Cordon/Uncordon. OS image, kernel and container runtime remain
+available by selecting a Node name to open Resource Details, not as table columns.
+Above 1200px, the table fits its container with wrapping and tighter padding;
+smaller views retain a bounded horizontal scroll region. Values come from the
+existing cluster-wide inventory read, not a live health probe or capacity guarantee.
+
+Resource Details includes **Scoped view** above **Observed details**. Its count
+includes only observed Pods in phase `Running` assigned to that exact Node,
+across all namespaces. Clicking it opens `/pods?node=ENCODED_NAME&phase=Running`
+with visible filters, clearing unrelated namespace/search/resource-focus state.
+Zero-count links still work; Back/Forward and Clear filters restore the scope.
+The count is a snapshot, not a live or atomic proof of running workload health.
 
 `SchedulingDisabled` is appended to the readiness state when
 `spec.unschedulable` is true, for example `Ready,SchedulingDisabled`.
@@ -56,11 +64,21 @@ or prove that a namespace is empty.
 
 ## Workspace Health
 
-Overview keeps its existing metric cards and adds a Workspace Health summary:
-Pods, Notebooks, Nodes, PVCs, PVs and Events grouped into good/warning/error
-states. Nodes are cluster-scoped, so the Nodes card remains populated when a
-namespace filter is active. The full detailed resource table is optional and
-collapsed by default.
+Overview contains only the Workspace Health panel, with no separate metrics row.
+On wide screens, a larger Nodes card sits beside six cards in three columns and
+two rows: Profiles, Notebooks, Pods / PVCs, PVs, Events. The layout reflows on
+smaller screens. The namespace selector scopes the summaries; Nodes always remain
+cluster-wide. The full detailed resource table is optional and collapsed by default.
+
+| Resource | Summary categories |
+| --- | --- |
+| Nodes | Ready, Cordoned, NotReady |
+| Profiles | Unprotected, Protected (namespace-policy classification, not readiness) |
+| Notebooks | Running, Stopped, Transitioning, Errors |
+| Pods | Running, Warning, Errors |
+| PVCs | Bound, Pending, Errors |
+| PVs | Bound, Available, Other / Error |
+| Events | Normal, Warning |
 
 State categories are presentation summaries, not a compliance or availability
 verdict. For example, a Pod with restarts is counted as a warning even while it

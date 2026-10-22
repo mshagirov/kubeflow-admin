@@ -1,10 +1,15 @@
 # Pod inventory and controlled restart
 
-The Pods page lists projected, non-secret observations: namespace/name, phase,
-readiness, controller owner, restarts and resource requests/limits. These are
-not measured CPU/memory usage; live usage is unavailable without a separate
-metrics integration. Search/sort/namespace filtering operate on the inventory
-observation shown by its timestamp.
+The Pods table shows Pod, Ready, Restarts, State, Node, Owner and Restart.
+CPU/memory requests and limits remain in Resource Details (select a Pod name),
+not in the table. Those values are configuration, not measured CPU/memory usage;
+live usage is unavailable without a separate metrics integration.
+
+Search, sorting and namespace filtering operate on the timestamped inventory.
+URL-backed `node` and canonical `phase` filters additionally support Node scoped
+navigation; `/pods?node=ENCODED_NAME&phase=Running` shows exact-node Running Pods.
+Visible chips explain those filters. Clear filters removes node/phase as well as
+search/namespace/resource focus; Back/Forward rehydrates the URL scope.
 
 ## Supported restart boundary
 

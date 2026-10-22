@@ -1,9 +1,14 @@
-# UI workflow live acceptance — next release
+# UI workflow live acceptance — current source
 
 Operator-run checklist for the console's user-facing workflows: profile
 create/edit, PV/PVC create/reserve/expansion, notebook start/stop/edit
 (resources and storage), the summary-drilldown surfaces and the existing
 gated Pod-restart and Node-cordon workflows.
+
+Also covers separately gated Profile deletion and restricted PV/PVC edits and
+unused-only deletion. Match this checklist to the exact deployed digest; see
+[verification](verification.md) for publication status and [UI guide](ui.md) for
+current labels and layout. A pending source change is not a deployed capability.
 
 > **Operator-run only.** Every command in this document is a **placeholder** for
 > a context you select and review yourself. Nothing here was executed against a
@@ -24,7 +29,8 @@ Item identifiers are stable and unique per section: `PC` profile create,
 `PU` profile update, `PD` delete, `VC` PVC create, `VE` PVC expansion,
 `VS` static PV, `VR` PV reservation, `NB` notebook start, `NP` notebook stop,
 `NR` notebook resource edit, `NM` notebook mount edit, `PR` pod restart,
-`NC` node cordon, `UI` console surfaces, `MR` refusal matrix, `HY` hygiene.
+`NC` node cordon, `SY` storage editing, `SD` storage deletion, `UI` console
+surfaces, `MR` refusal matrix, `HY` hygiene.
 
 ## Restricted storage management follow-up
 
@@ -133,13 +139,15 @@ no overlay is stacked on top of another by accident.
 - [ ] **G4** `features.pvcExpansion: true` **plus** `deploy/overlays/pvc-expansion/` — required for PVC expansion.
 - [ ] **G5** `features.podRestarts: true` **plus** `deploy/overlays/pod-restarts/` (prefer a namespace-scoped Role for the pilot) — required for Pod restart.
 - [ ] **G6** `features.nodeCordon: true` **plus** `deploy/overlays/node-cordon/` — required for cordon/uncordon.
-- [ ] **G7** **Deletion opt-in (new in this release).** Both `features.writesEnabled` and `features.profileDeletion` must be true. Deletion is shipped disabled. The separate `deploy/overlays/profile-deletion/rbac.yaml` grants only `kubeflow.org/profiles` `delete` through `kubeflow-admin-profile-deletion`. Install and review the site's grant separately; no live acceptance is claimed here.
+- [ ] **G7** **Profile deletion opt-in.** Both `features.writesEnabled` and `features.profileDeletion` must be true. Deletion is shipped disabled. The separate `deploy/overlays/profile-deletion/rbac.yaml` grants only `kubeflow.org/profiles` `delete` through `kubeflow-admin-profile-deletion`. Install and review the site's grant separately; no live acceptance is claimed here.
   - Config key (settled): `features.profileDeletion` — default `false`
   - Overlay + role (settled): `deploy/overlays/profile-deletion/` → `kubeflow-admin-profile-deletion`
   - RBAC installed at the site: `________________________` *(operator step; the base must stay supplied once)*
 - [ ] **G8** With writes enabled but the deletion opt-in **off**, the Delete control is absent/disabled in the UI **and** a direct API attempt is refused server-side. Verify both.
 - [ ] **G9** Turning any gate off stops new actions; it does **not** revoke RBAC and does not undo completed mutations. Revoke optional bindings separately through the platform operator's reviewed procedure.
-- [ ] **G10** The delete permission is granted **only** to the `kubeflow.org/profiles` `delete` verb: no namespace, PV, PVC or Pod delete, and no finalizer update or patch. Narrow it further with `resourceNames` on the ClusterRole so only the disposable pilot Profile name can be deleted — `resourceNames` does restrict the name, but it restricts no field and does not bound the namespace cascade, which stays the job of admission policy and namespace protection.
+- [ ] **G10** The **Profile-deletion grant** includes only `kubeflow.org/profiles` `delete`: no namespace, PV, PVC or Pod delete, and no finalizer update or patch. Narrow it with `resourceNames` on the ClusterRole for the disposable pilot Profile. This restricts the name, not fields or the namespace cascade; admission policy and namespace protection remain necessary. Storage permissions, if separately enabled, are independent grants.
+- [ ] **G11** Restricted storage editing requires writes, `features.storageEditing` and the separately reviewed `deploy/overlays/storage-editing/rbac.yaml` patch grant. PVC request growth additionally requires `features.pvcExpansion` and compatible storage; label-only edits do not require expansion.
+- [ ] **G12** Unused-only storage deletion requires writes, `features.storageDeletion` and the independently reviewed `deploy/overlays/storage-deletion/rbac.yaml` delete grant. These are not enabled by Profile-deletion RBAC, static-storage RBAC or a broad feature bundle.
 
 ### 1.5 Notebook controller contract (independent verification)
 
@@ -172,7 +180,7 @@ operation state.
 - [ ] **PC6** After **Refresh**, the Profile appears on the Profiles page, its namespace appears on the Namespaces page, and the namespace is owned by the Profile with the owner annotation matching.
 - [ ] **PC7** Verify with your own read-only tooling that the created Profile's `spec.owner` is exactly the string you entered, and that the namespace's owner annotation matches.
 
-### 2.2 Profile update (quota editing) — new in this release
+### 2.2 Profile update (quota editing)
 
 The UI uses `profile.update`. The deprecated `profile.quota.change` alias now
 requires the same unchanged owner and configuration digest; unguarded requests
@@ -193,15 +201,18 @@ the current owner back unchanged together with a `baseConfigDigest`.
 - [ ] **PU10** **Existing raw device quota key.** If the Profile already declares a bare device key such as `nvidia.com/gpu`, the plan warns that Kubernetes accepts the key but standard Kubernetes does not enforce it as a device request quota, that enforcement uses `requests.<device>`, and that editing retains the key without migrating or activating the limit. Confirm the warning appears even when only the CPU or memory alias changes, and that the preview neither invents a `requests.<device>` key nor renames the declared one. The warning is information: it is not an approval to migrate, and it does not claim the original GPU value is re-enforced.
 - [ ] **PU11** **GPU enforcement evidence (operator-only).** `ResourceQuota.status.hard`, including the Profile controller's copy of `spec.resourceQuotaSpec.hard`, only restates declarations and is **not** proof that a device limit is enforced. Measure enforcement through `status.used` for `requests.<device>` after an admitted Pod requests it, or with a disposable admission test that asks for more than the declared limit and expects the API server to refuse it. Run these only against an isolated disposable namespace in an approved window, never against a production namespace, never exporting Secrets or full manifests. Do not treat the console's convergence check as enforcement evidence. Migrating a bare device key to `requests.<device>` is a separate, explicitly authorized operator change, never part of a console quota edit.
 
-### 2.3 Profile delete — new, gated, typed confirmation
+### 2.3 Profile delete — gated, typed confirmation
 
 The typed action kind is `profile.delete`. There is **no** namespace-delete
-action and **no** arbitrary delete endpoint: only this typed kind is reachable,
-there is no HTTP `DELETE` route, and the request is refused by the API unless
-the separate deletion opt-in is enabled.
+action and **no** arbitrary delete endpoint. `profile.delete` is the only action
+that directly deletes a Profile; unused-only storage deletion has separate typed
+actions and gates. There is no HTTP `DELETE` route, and requests require the
+corresponding opt-in.
 
-Read this section twice. Deletion is irreversible and the console has **no**
-recovery, undo or forced-cleanup path.
+Read this section twice. Deletion is irreversible: no undo, automatic recovery or
+forced cleanup. A narrow stopped-app Profile-deletion reconciliation tool can
+record an independently verified outcome without writing to Kubernetes; see
+[operations](operations.md#offline-reconciliation-of-a-profile-deletion).
 
 - [ ] **PD1** With the deletion opt-in **off** (G7/G8), no delete control is offered, and a direct API attempt is refused with a policy error before any plan is created.
 - [ ] **PD2** With the opt-in **on**, deleting requires **two** distinct steps: the standard plan confirmation (with the exact target listed) **and** a typed confirmation of the exact target name, sent as the `confirmName` field. The comparison is raw and exact — no trimming, no case folding. A wrong name, a partial name, or a different case must not be accepted. A non-empty **reason** is also required.
@@ -219,7 +230,7 @@ recovery, undo or forced-cleanup path.
 
 ### 2.4 PVC create (dynamic)
 
-- [ ] **VC1** Choose only a class from the approved `storage.allowedStorageClasses` list; the console rejects any other class. Choose the class explicitly — the console does not create a PV for you and does not pick a class for you.
+- [ ] **VC1** Choose only a class from the approved `storage.allowedStorageClasses` list; the console rejects any other class. Choose it explicitly. The app creates only the PVC in this workflow; the StorageClass's external provisioner creates the PV when provisioning occurs.
 - [ ] **VC2** The console creates a claim from typed inputs (size, class, access mode), not a free-form creation manifest. The separate restricted YAML editor for existing PVs/PVCs accepts no arbitrary volume source or secret reference.
 - [ ] **VC3** A claim name that already exists in that namespace is refused (conflict) before any mutation.
 - [ ] **VC4** The plan warns about the StorageClass reclaim policy and, for `WaitForFirstConsumer`, states that the claim will stay `Pending` until a consuming Pod is scheduled.
@@ -314,21 +325,25 @@ recovery, undo or forced-cleanup path.
 - [ ] **UI6** **Safe details only.** No drawer, plan preview, history row or notification may reveal: Secret values, the OIDC client secret, kubeconfig paths, the database path, environment values of running Pods, full Pod/Notebook manifests, CSI volume handles or driver attributes, NFS server addresses and export paths, or session tokens. The storage surface exposes template **names** and classes only.
 - [ ] **UI7** **Resource names and Notebook-only listing.** The Notebooks table lists only Kubeflow Notebook custom resources, not Pods or StatefulSets. Notebook, Pod and Node names open Resource Details, with no separate Details button on those pages. Storage names continue opening their details. Each drawer must identify the exact kind, namespace and name, including when names collide.
 - [ ] **UI8** **Manage the selected Notebook.** From a Notebook's Resource Details, choose **Manage Notebook**. Its management drawer must select that exact namespace and Notebook and the known container when unambiguous. Blank edit fields preserve the existing resource/image configuration; mounts are preserved unless replacement is explicitly selected. The inventory does not supply full editable container or mount configuration, so blank fields must not be mistaken for the actual deployed values. Changing the Notebook/namespace/container must clear another target's typed edits, mounts and restart flags. Check disabled write/controller gates, UID-change refusal and visible focus restoration. This app manages existing Notebooks; create the disposable pilot Notebook through the normal Kubeflow workflow first.
-- [ ] **UI7** **Fail-safe surfaces.** Policy banners appear when writes, notebook changes, Pod restarts or Node cordon are disabled. The deletion capability is projected to the browser only when the deletion opt-in **and** writes are both enabled, so the delete control is absent in every other configuration and the API refuses the request as well. The screen fits at 390 px and 1280 px with no horizontal page overflow, and long tables scroll inside their own region.
-- [ ] **UI8** **Inventory freshness.** The `ObservedAt` timestamp updates on Refresh and shows a warning when the fetch fails; switching pages inside the freshness window must not trigger an extra cluster read.
+- [ ] **UI10** **Fail-safe surfaces.** Policy explanations identify disabled writes, Notebook controller contract, Pod restarts and Node cordon. Profile Delete is offered only with writes and its deletion gate; PV/PVC Edit/Delete stay visible but disabled with an explanation when gated off. APIs independently refuse gated actions. At 390 px and 1280 px, pages do not overflow horizontally; smaller-view tables scroll within their own region. The Nodes table itself fits its wide-screen container.
+- [ ] **UI11** **Inventory freshness.** The `ObservedAt` timestamp updates on Refresh and shows a warning when the fetch fails; switching pages inside the freshness window must not trigger an extra cluster read.
+- [ ] **UI12** **Overview.** No separate metrics row: Workspace Health contains Nodes plus Profiles, Notebooks, Pods, PVCs, PVs and Events. Nodes is larger and spans both rows beside the other cards' three-column/two-row wide layout. Verify namespace scoping and optional detailed-table expansion; Profiles policy labels are not readiness evidence.
+- [ ] **UI13** **Notebook heading.** Manage notebook stays at the right edge and vertically centered at narrow/wide widths, including when the visible policy message wraps. It remains disabled with the exact missing gate explained where appropriate.
+- [ ] **UI14** **Profiles layout.** Workspace ownership appears above the full-width Profiles table. Profiles and Storage entry buttons read New; existing-resource actions remain in their drawers. The sidebar has no WORKSPACE label and lists Storage before Namespaces.
+- [ ] **UI15** **Notifications.** One card is visible by default. Expand/collapse preserves all current notices; errors lead, newest-first within error/non-error groups. Repeats stay deduplicated. Verify dismiss/focus behavior, ten-second info/success expiry and that dismissal never acknowledges mutation warnings.
 
 ## 3. Explicitly unsupported — do not attempt, and expect a refusal
 
 | Not available in this release | Why it matters |
 | --- | --- |
-| Arbitrary PV update (editing a PV's spec, backend, capacity, class, access modes or reclaim policy) | PVs are registered or reserved, never edited. There is no "edit PV" workflow |
-| Direct PV/PVC deletion | Separately opt-in, unused-only, identity-guarded and confirmed. Referenced PVCs and bound/reserved PVs are refused; reclaim policy can still destroy unused PVC backing data |
+| Arbitrary PV spec/backend/capacity/class/access-mode update | Restricted PV Edit permits only console-owned labels and Retain/Delete reclaim policy on approved, unclaimed Available PVs; hidden fields cannot be edited |
+| In-use PVC deletion or bound/reserved/referenced PV deletion | Direct PV/PVC Delete exists, but is separately gated, unused-only, identity-guarded and confirmed. Even unused PVC deletion can destroy backing data under Delete reclaim policy |
 | Forced cleanup, force-delete, finalizer removal, "delete everything" | No forced cleanup exists in any form. Cleanup is an operator-run procedure with its own reviewed data/reclaim plan |
 | Shrinking a PVC | Expansion is upward-only and irreversible |
 | Changing a claim's class, access mode or volume mode | These are immutable in practice and are not exposed |
 | Free-form manifest / raw YAML / arbitrary Kubernetes proxy | Unsupported. Existing PV/PVC editing uses a restricted safe YAML projection, never a full manifest or arbitrary patch |
 | Adopting an existing namespace or relabelling a Profile | Existing namespaces are refused, not adopted |
-| Any delete endpoint other than the typed, separately gated `profile.delete` kind | There is no namespace-delete action, no generic delete route and no Kubernetes proxy; the console exposes one narrow typed kind |
+| Arbitrary resource deletion or namespace deletion | Only typed, separately gated `profile.delete`, `pv.delete` and `pvc.delete` workflows exist; there is no HTTP DELETE route or Kubernetes proxy |
 | Removing a quota key | Removal is unsupported; existing keys must be resubmitted |
 | Transferring Profile ownership, migrating an owner, or a custom owner controller | Ownership is immutable in the installed Profile controller; `profile.update` edits quotas only and refuses an owner change as an unsupported contract |
 | Editing a Notebook's non-container fields (volumes other than PVC mounts, service account, security context, init containers) | Only the listed container fields and PVC mounts are editable |

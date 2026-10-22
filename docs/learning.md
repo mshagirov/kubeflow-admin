@@ -1,555 +1,366 @@
-# Learning plan — reimplement, test and deploy Kubeflow Admin by hand
+# Learning plan — 15 lessons to implement, test and deploy Kubeflow Admin
 
-This plan breaks the project into ordered lessons. Each lesson is written so you
-can implement the behaviour yourself, test it, and verify it by hand before
-moving on. This repository's working code is the reference solution:
-implement first, then compare.
+Use the current code as a reference solution: implement a bounded slice yourself,
+test it, then compare. Related topics from the former 22-lesson plan are combined
+below; storage safety, authentication, operations and deployment are not omitted.
+This guide describes current source, not a claim that a particular cluster or
+unpublished release has passed live acceptance.
 
-## How to use this plan
+## How to use the plan
 
-- Take one lesson at a time; finish its **Done when** checks before continuing.
-- After every lesson, run the regression gate:
+- Finish each lesson's **Done when** checks before moving on. Run the tests for
+  the packages you have implemented; once the build/manifests exist, use the
+  complete regression gate:
   ```sh
-  make test vet build && make manifests
+  GOTOOLCHAIN=go1.27.3 make test vet build manifests
   ```
-- Keep every experiment disposable: scratch cluster, temporary namespaces,
-  throwaway volumes. Never point a learning environment at production.
-- Start read-only. The app ships with all feature flags off; keep them off
-  until the deployment lessons are complete.
-- Replace every `REPLACE_*` and `*.example.invalid` placeholder. Never commit
-  real hostnames, IPs, storage class names, user identities, certificates or
-  secrets. Keep a personal inventory file **locally** (it is git-ignored) —
-  the public repository stays generic.
-- When a lesson says "verify by hand", actually do it: observe the failure
-  case, not only the success case.
+- Use fake APIs/local TLS issuers first. Cluster exercises are operator-run only,
+  explicitly context-selected and limited to disposable namespaces and storage.
+  A local kind/minikube cluster alone does not supply a Kubeflow Notebook/Profile
+  controller, CSI backend, trusted HTTPS or OIDC integration.
+- Start read-only. Never point learning code at production, widen RBAC to make a
+  test pass, force cleanup or remove finalizers. Rejected unsafe actions are valid
+  test results. Accepted operations are not proof of completed changes.
+- Keep real site config, identity data, credentials, certificates, databases and
+  discovery output outside Git. Review every example placeholder before use.
+- Docs-only corrections need no image rebuild/deployment or CI run. Do not apply
+  that exception to executable code, tests, config, dependencies or workflows.
 
-## Requirements (lesson 0)
+## Prerequisites (not an additional lesson)
 
-### Software — required
-
-| Tool | Purpose |
+| Tool/environment | Purpose |
 | --- | --- |
-| Go 1.26+ (the module minimum; the container pins a newer patch) | build and test |
-| Kustomize 5 | render manifests |
-| Python 3 + PyYAML (`scripts/requirements.txt` works) | manifest checker |
-| Docker with buildx | image build; also runs the local OIDC provider and scanners |
-| `kubectl` | cluster lessons |
-| Git, `curl`, `openssl`, a web browser | version control, by-hand verification, local certificates |
+| Reviewed Go 1.27.3 toolchain | Current release builds/checks; module minimum Go 1.26 is not a security recommendation |
+| Python 3, Kustomize 5, kubeconform | API/manifest checks and strict Kubernetes schema validation |
+| Docker with Buildx | Multi-platform builds and local test/scanner containers |
+| Node.js; Playwright and Chrome for browser acceptance | Logic/navigation regressions and real rendering checks |
+| Git, curl, OpenSSL; kubectl for selected cluster exercises | Source review, HTTPS checks, operator-only observations |
+| gh and a GitHub account when exercising CI | Source verification before promotion |
+
+Install pinned Python tooling without changing the system environment:
 
-### Software — recommended
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r scripts/requirements.txt
+source .venv/bin/activate
+```
+
+Use the scanner versions/digests reviewed in `.github/workflows/ci.yaml`, not an
+unreviewed `@latest` scanner. `govulncheck` must use the release toolchain; an
+older host Go installation can report a vulnerability absent from the pinned
+container build. Docker image scans independently check the actual runtime.
+
+A development machine needs enough memory/disk for Docker, caches and fixtures;
+16 GB RAM is more comfortable than 8 GB. A disposable two-node environment is
+needed only for shared-filesystem lock verification. No GPU is required to test
+preset validation; actual GPU scheduling remains a separate operator test.
+The base deployment requests 100m CPU/128Mi memory, limits 1 CPU/512Mi and uses a
+5Gi database claim. Those are manifest settings, not measured production sizing.
 
-- `gh` and a GitHub account (only for lesson 15's CI)
-- Trivy (the container image is fine) and `govulncheck`
-  (`go run golang.org/x/vuln/cmd/govulncheck@latest ./...`) for scans
-- `sqlite3` CLI to inspect databases by hand
-- kind or minikube for the scratch cluster (lessons 6–15)
-- A local Dex container as the OIDC provider for lessons 8 and 18
+Read [deployment](deployment.md), [database](database.md), [UI guide](ui.md) and
+[OpenAPI](../api/openapi.yaml). They supplement the lessons, not replace tests.
 
-### Hardware
+## Lesson 1 — Strict configuration and build discipline
 
-| Environment | Minimum | Notes |
-| --- | --- | --- |
-| Developer machine | 4 cores, 8 GB RAM, ~5 GB free disk | 16 GB comfortable with Docker Desktop plus a local cluster; macOS, Linux or Windows + WSL2 |
-| Scratch cluster | 1 node, 2 vCPU, 4 GB RAM, ~10 GB disk | enough for the app and a disposable notebook |
-| Two-node cluster | 2 nodes | only lesson 17's cross-node lock test; the local-storage option avoids it |
+**Goal:** a compiling `kubeflow-admin` module that rejects unsafe configuration.
+
+**Implement:** the `cmd/` and `internal/` structure; strict single-document YAML
+decoding; config structs matching `internal/config/config.go`; safe defaults and
+validation for HTTPS origin, OIDC/admin authorization, timeouts, session lifetime,
+database, policy, storage, Notebook presets, history, logging and optional footer.
+Keep all write flags and the Notebook controller-contract gate false by default.
+Reject unknown fields, URI/in-memory database paths and unsafe combinations.
+Add repeatable test/vet/build targets and `gofmt` checks. Build without CGO or VCS
+stamping, using trimmed paths and the reviewed Go patch.
+
+**Test/verify:** invalid origins/paths, unknown keys, extra YAML documents and
+out-of-range values fail before the service starts. Inspect build flags and
+cross-compile a Linux binary; a warm module cache is not an offline guarantee.
 
-No GPU is required anywhere in the plan; GPU handling is configured and
-validated, never exercised. Multi-architecture images build through emulation —
-no special hardware.
+**Done when:** config tests and build pass, and invalid input never starts an
+insecure fallback service.
 
-### Deployed footprint (what the cluster must host)
+## Lesson 2 — Private SQLite records and journal policy
 
-- 1 replica: requests `100m` CPU / `128Mi` memory, limits `1` CPU / `512Mi`
-- a 5 Gi ReadWriteOnce volume for SQLite
-- image ~72 MB compressed; egress to the OIDC issuer and the Kubernetes API
+**Goal:** durable local records, private files and explicit filesystem limits.
 
-### Not required
+**Implement:** pure-Go SQLite; private directory/regular-file checks, `O_NOFOLLOW`,
+`umask 0077`; JSON record operations including atomic single-use `Take`. Apply
+connection pragmas to every connection, not only the first one. WAL/FULL is the
+local/block-storage default; DELETE/EXTRA is the reviewed BeeGFS option with
+`allowUnverifiedFilesystem: true`. Use the actual statfs policy table: rejected
+filesystems do not become acceptable merely by setting the opt-in. Development
+overlayfs is unverified, not evidence of persistent storage.
+
+**Test/verify:** close/reopen preservation, concurrent `Take`, symlink/permission
+refusals, connection replacement and journal migration. Check `integrity_check`
+with trusted SQLite tooling on a stopped disposable copy.
 
-A real identity provider, paid services, managed databases, a GPU, or an
-internet-facing cluster: a local OIDC provider, a locally trusted certificate
-and a hosts-file entry are enough for every lesson.
+**Done when:** all filesystem-policy cases are tested and you can distinguish a
+configured durability mode from proven backend durability. See [database](database.md).
 
-Read `README.md`, `docs/deployment.md`, `docs/database.md` and `api/openapi.yaml`
-once now. You will re-derive most of their content in the lessons.
+## Lesson 3 — One writer, ownership and storage durability
 
----
+**Goal:** one process owns one database; deployment cannot silently bypass it.
 
-# Part 1 — Foundations
+**Implement:** nonblocking exclusive lifetime `flock` on the private lock file,
+typed lock failure, idempotent Close and one worker lease. Supply `-check-db` and
+bounded hold behavior matching the CLI. Run one replica with Recreate, not HPA.
+An advisory lock is not a substitute for node fencing or correct remote fsync.
+
+**Test/verify:** second opens in-process and in a child process fail; reopening
+after Close/process exit succeeds. For a disposable shared-filesystem claim,
+use [the ownership-check procedure](database.md): verify cross-node lock refusal,
+crash/reopen integrity, global locks and remote-fsync behavior. Never run these
+experiments against the live app database.
 
-## Lesson 1 — Module skeleton and strict configuration
+**Done when:** the backend passes the reviewed tests or you choose local/block
+storage with its explicit node-outage and backup tradeoffs.
 
-**Goal:** a compiling module named `kubeflow-admin` with a configuration loader
-that refuses to run on ambiguous or unsafe input.
+## Lesson 4 — Read-only Kubernetes inventory
 
-**Implement**
-- `go mod init kubeflow-admin`; directories `cmd/kubeflow-admin`, `internal/...`.
-- `internal/config`: struct for server, auth, kubernetes, policy, storage,
-  notebooks, database and features; YAML strict decoding (unknown fields are
-  errors); defaults (listen port, timeouts, session length); `Validate()` that
-  rejects HTTP origins, URL paths, placeholder admin groups and out-of-range
-  session lifetimes.
-- Refuse `:memory:`, `file:` URIs and empty database paths.
+**Goal:** truthful cross-profile observations for authorized administrators.
 
-**Write tests:** defaults applied; unknown field rejected; multiple YAML
-documents rejected; every unsafe value in `Validate()` rejected.
+**Implement:** in-cluster clients or an explicit kubeconfig, bounded requests and
+typed/projected inventory. Include Nodes, Namespaces, Profiles, Notebooks, Pods,
+StatefulSets, PVs/PVCs, StorageClasses, quotas, LimitRanges, RoleBindings and
+Events according to the shipped read RBAC. Fetch Pods/StatefulSets in bulk and
+derive Notebook lifecycle using exact UID ownership. Do not expose full manifests,
+environment values, Secret data or storage backend handles/paths.
+
+**Test/verify:** list failures, stale/unknown states, same-name objects of different
+kinds/namespaces, owner UID mismatch and bulk request counts. Mutation namespace
+policy is not a claim that the administrator can read only their own namespace.
+Compare selected metadata with kubectl only in a chosen disposable environment.
 
-**Verify by hand:** feed the loader a deliberately wrong file (unknown key,
-`http://` origin, 60-minute session) and confirm each one aborts with a clear
-message before any network or file work happens.
+**Done when:** observations work with base read RBAC and cannot be mistaken for
+atomic mutation evidence, live utilization or controller success.
 
-**Done when:** `make test vet` passes and `cmd/kubeflow-admin` can load a
-minimal valid config file and exit, printing a validation error for a bad one.
+## Lesson 5 — OIDC login, PKCE and browser binding
 
-## Lesson 2 — Build discipline
+**Goal:** authorization-code login without a development-authentication bypass.
 
-**Goal:** one-command repeatable build and test.
+**Implement:** discovery/JWKS, PKCE S256, state, nonce and single-use server-side
+attempts bound to the initiating browser. Verify issuer/signature/audience,
+multi-audience authorized party, expiry and applicable token-hash checks. Use
+Secure/HttpOnly/SameSite cookies and the current host-cookie rules. Keep provider
+secrets in a read-only file, never config, logs or browser storage.
 
-**Implement:** a `Makefile` with `test` (race detector), `vet`, `build` (static,
-`CGO_ENABLED=0`, `-trimpath`, no VCS stamping), `manifests` and `check` targets.
-Add an `.editorconfig`-style formatting step (`gofmt -l`) to your routine.
+**Test/verify:** local TLS issuer fixtures reject wrong signature, issuer,
+audience, nonce, expiry, replayed state and another browser's callback. Exercise
+admin/non-admin identities with a disposable registered local OIDC client.
 
-**Verify by hand:** builds succeed from a clean checkout with no network
-(module cache warm); the binary runs on linux/amd64 —
-`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/kubeflow-admin`.
+**Done when:** login failures are closed, bounded and reproducible without a
+real directory lookup or password-handling feature.
 
-**Done when:** `make check` is green and you understand every flag in the build.
+## Lesson 6 — Sessions, authorization and HTTP hardening
 
----
+**Goal:** short-lived server-side sessions and a small protected attack surface.
 
-# Part 2 — Durable state
+**Implement:** hash opaque session IDs, cap expiry by provider/configured lifetime
+and the 15-minute ceiling, validate durable session/local authorization per
+request and at mutation checkpoints, and revoke on logout. Do not expose the
+session key in JSON. Add same-origin/CSRF checks, bounded bodies, login limiting,
+strict headers and safe exact-authored error mapping. Public probes/login/callback,
+signed-out and static routes differ from authenticated UI/API routes.
 
-## Lesson 3 — SQLite record store
+**Test/verify:** expired/forged/revoked sessions, missing CSRF, cross-origin POST,
+oversize input, unknown routes and credential redaction. Config is startup-loaded;
+editing a file alone is not a live policy reload. Upstream group changes are not
+instantly re-queried: document the short session/provider boundary honestly.
+Optional footer HTML is sanitized with a strict allowlist, not rendered raw.
 
-**Goal:** a small key/value store on SQLite with private files and durable
-writes.
+**Done when:** every unsafe request and checkpoint requires current local
+authorization; logout reaches the public signed-out page without a login loop.
 
-**Implement**
-- Open the database with `modernc.org/sqlite` (pure Go).
-- Create the directory `0700`; create/verify the database and lock files as
-  private regular files (`0600`, `O_NOFOLLOW`).
-- Table `records(bucket,key,value,updated)`; `Put`, `Get`, `Take` (single-use
-  read that deletes atomically), plus operation/audit support tables you will
-  need later.
-- Apply pragmas to **every** connection via the connection string
-  (`busy_timeout`, `synchronous`, `foreign_keys`); use immediate transactions.
+## Lesson 7 — Typed previews and fresh conditional mutations
 
-**Write tests:** data survives close/reopen; `Take` succeeds exactly once;
-concurrent claims hit a unique constraint instead of corrupting state.
+**Goal:** reviewed plans, never arbitrary manifests or a Kubernetes proxy.
 
-**Verify by hand:** after a run, `ls -l` the directory: directory `0700`,
-files `0600`. `sqlite3` the file and confirm `PRAGMA journal_mode` and
-`PRAGMA integrity_check` answer as expected.
+**Implement:** server-owned actor-bound plans with five-minute expiry, canonical
+targets and bounded typed inputs. Validate policy, images, GPU presets, mounts,
+classes and quotas; dry-run before confirmation. Execute fresh UID/resourceVersion
+checks and conditional writes appropriate to each action. Preserve client-go's
+no-automatic-write-replay safeguard, including Retry-After responses.
 
-**Done when:** tests pass and the failure modes you tried (bad path, existing
-directory with world permissions) stop the app with a clear message.
+**Test/verify:** stale/replaced objects, changed dependencies, expired plans,
+unknown fields and hidden-field preservation. A strict restricted PV/PVC YAML
+projection is supported; full resource manifests are not. Create, patch, normal
+Pod eviction and the three separately gated delete actions have different
+preconditions; do not reduce all writes to one generic patch/delete helper.
 
-## Lesson 4 — One writer, guaranteed
+**Done when:** preview changes nothing and every mutation revalidates the exact
+reviewed target. Dry-run remains validation, not a guarantee of later admission.
+
+## Lesson 8 — Durable operations, locks and bounded audit history
 
-**Goal:** two processes must never own the database.
+**Goal:** accepted work stays accountable across crashes without blind replay.
 
-**Implement:** a non-blocking exclusive `flock` on `<db>.lock` held for the
-lifetime of the process; a typed sentinel error (e.g. `ErrLocked`); release on
-idempotent `Close`.
+**Implement:** durable pre-write checkpoints, immutable acceptance evidence,
+idempotency claims, canonical target locks and one sequential worker. Exclusive
+namespace fences for Profile/PVC deletion block app mutations in both directions;
+static create/reserve also conflict through the shared PV target. Startup marks
+incomplete work needs-review and retains locks. Integrity checks fail closed.
+Bound presentation History by age/rows/bytes while preserving safety evidence,
+active locks and idempotency tombstones. File-log rotation is separate.
 
-**Write tests:** second open in the same process fails; a child process (test
-binary re-exec) fails; after `Close`, a new open succeeds.
+**Test/verify:** duplicate submit, target collisions, namespace fences, checkpoint
+failure, ambiguous 429/5xx/transport results, restart recovery, bounded cleanup
+and shutdown accounting. Inject failures in fixtures, not a production writer.
 
-**Verify by hand:** start the app twice against the same database directory;
-the second must exit immediately with the ownership error. Kill the first with
-`kill -9`; the next start must succeed.
+**Done when:** no Kubernetes mutation precedes its durable checkpoint and no
+History cleanup can erase a safety lock. See [history](history.md).
 
-**Done when:** you can explain why an advisory lock written by the application
-is still not enough on a shared filesystem (lesson 17 returns to this).
+## Lesson 9 — Profile and existing-Notebook management
 
-## Lesson 5 — Journal modes and the filesystem policy
+**Goal:** useful edits without ownership transfers or cross-target mistakes.
 
-**Goal:** WAL by default on local disks; controlled support for one reviewed
-network filesystem; everything else fails closed.
+**Implement:** DNS-label Profile creation, duplicate Profile/namespace refusal,
+email syntax without invented IdP-registration verification. Quota updates echo
+the exact unchanged owner and identity-bound configuration digest. Preserve
+unmanaged keys/types and existing aliases/raw device keys; do not auto-migrate
+device accounting. Manage existing Notebooks only: start/stop and named-container
+edits behind writes plus verified controller contract. Blank fields preserve;
+mount replacement is explicit, protected paths stay protected.
 
-**Implement**
-- `database.journalMode`: `wal` (default) or `delete`; reject anything else.
-- `database.allowUnverifiedFilesystem` (default false): an explicit operator
-  acknowledgement required for storage the app cannot prove local.
-- Filesystem check by `statfs` magic: accept known local filesystems; always
-  reject NFS/SMB/CIFS/FUSE/tmpfs/ramfs/Lustre/CephFS/GPFS/OCFS2; for the
-  configured network filesystem (BeeGFS) require `delete` **and** the opt-in;
-  unknown filesystems require the opt-in too.
-- `synchronous=FULL` for WAL, `synchronous=EXTRA` for DELETE; `umask 0077` at
-  startup so journal/`-shm` files are private.
-- Log a structured warning whenever the database runs on unverified storage.
+**Test/verify:** zero quotas, unsupported owner changes, quota evidence drift,
+wrong target/container UID, stop/start convergence, quota/LimitRange refusals,
+GPU presets and same-namespace PVC mounts. Changing target clears previous edits.
+Notebook initial creation uses the normal Kubeflow workflow, not this console.
 
-**Write tests:** policy table tests (every magic, both journals, both opt-in
-values); migration between journal modes preserves data; pragmas survive
-connection replacement; a `-check-db` style mode that opens the store, prints
-journal mode, and exits 0/3 for owner/stolen states.
+**Done when:** before/after previews show only approved deltas, and synthetic
+tests are not presented as proof of the installed controller's behavior.
 
-**Verify by hand:** run against a temp directory and against a mounted network
-path if you have one; observe the exact refusal messages.
+## Lesson 10 — Storage, gated deletion and scheduling controls
+
+**Goal:** narrow storage/workload actions with explicit irreversible boundaries.
 
-**Done when:** the policy table is fully covered by tests and the app refuses
-network storage unless the operator opted in.
+**Implement:** dynamic PVC creation; approved prepared NFS/CSI static registration
+and PV reservation; CSI-compatible upward-only PVC expansion. Restricted Edit
+allows console labels, Available/unclaimed PV reclaim policy and gated PVC growth.
+Omitted/null labels preserve; explicit `{}` clears only console labels. Delete
+requires separate gates/RBAC, exact confirmation/reason, fresh identity and unused
+checks including stopped Notebook references. Profile Delete waits for its owned
+namespace too. Pod restart is a PDB-aware normal eviction of a supported Notebook
+StatefulSet Pod; Node cordon patches scheduling only, never drains workloads.
 
----
+**Test/verify:** references/malformed observations fail closed; wrong class/owner,
+replacement UID, bound-PV drift, shrink/no-op, PDB rejection and ambiguous writes
+never force/replay. Verify namespace fences and data-loss warnings. Storage
+unused checks do not atomically fence external workloads or binders.
 
-# Part 3 — The Kubernetes read model
+**Done when:** each capability has its own tested gates and exact permissions;
+there is no forced deletion, finalizer removal or generic cleanup. See
+[storage](storage.md), [Pods](pods.md), [Nodes](nodes.md) and [acceptance](ui-workflow-acceptance.md).
+
+## Lesson 11 — API, current dashboard and browser regressions
 
-## Lesson 6 — Typed inventory
-
-**Goal:** read-only views of the cluster with a minimal permission surface.
-
-**Implement**
-- Kubernetes client from in-cluster config (fallback: an explicit kubeconfig
-  path); request timeouts; no exec, no proxy, no secret reads.
-- Inventory: namespaces, profiles, notebooks, persistent volumes and claims,
-  storage classes, resource quotas, limit ranges, pods, events, stateful sets,
-  role bindings — `get`/`list` only.
-- Redact or omit anything not needed by the UI (no container environment, no
-  secret references).
-
-**Write tests:** fake clientset — scope rules (a user may only see objects in
-their profile namespaces), pagination/timeout behaviour, error mapping.
-
-**Verify by hand:** against your scratch cluster, compare each inventory page
-with `kubectl get` output; they must agree.
-
-**Done when:** the app renders an inventory with a read-only ServiceAccount
-and no additional verbs.
-
-## Lesson 7 — Plans, validation and conditional patches
-
-**Goal:** every mutation is a typed, validated plan; execution is conditional.
-
-**Implement**
-- Plan model: actor, target, action, parameters, expiry, ID.
-- Validation per action: allowed images, GPU presets, workspace-mount
-  protection, storage class allowlist, namespace allowlist, path boundaries.
-- Execution: JSON patch carrying `metadata.uid`/`metadata.resourceVersion`
-  preconditions, so stale plans fail instead of overwriting new state.
-- Never generate raw YAML for users; never delete resources; never write to
-  workloads directly.
-
-**Write tests:** container/volume preservation when editing notebooks; rejected
-mutations (protected mounts, disallowed images, forbidden namespaces); stale
-`resourceVersion` produces a clean conflict.
-
-**Verify by hand:** prepare a plan, change the object with `kubectl`, submit the
-plan; it must fail with a conflict and change nothing.
-
-**Done when:** every write path in your code goes through plan → validate →
-conditional patch.
-
----
-
-# Part 4 — Security core
-
-## Lesson 8 — OIDC login with PKCE
-
-**Goal:** authorization-code flow with PKCE and single-use browser binding.
-
-**Implement:** discovery + JWKS; `state`, `nonce`, PKCE S256; the attempt is
-stored server-side keyed by a hash of `state` and consumed exactly once; the
-callback verifies issuer, signature, audience (and `azp` for multi-audience
-tokens), nonce, expiry and `at_hash` when present. Secure cookies:
-`__Host-` prefix where possible, `Secure`, `HttpOnly`, `SameSite=Lax`.
-
-**Write tests:** a fake TLS issuer; wrong signature/audience/expiry/nonce/
-issuer rejected; replayed `state` rejected; a login attempt issued for one
-browser cannot complete in another.
-
-**Verify by hand:** run a local Dex (container) with a test client, sign in,
-and confirm login success and rejection of a second non-admin account.
-
-**Done when:** the whole flow is reproducible locally without touching a real
-identity provider.
-
-## Lesson 9 — Sessions and authorization
-
-**Goal:** short-lived, server-side, revocable sessions with per-request
-re-validation.
-
-**Implement:** opaque random session IDs; store only a hash; expiry bounded by
-both the configured session minutes and the ID-token expiry (and never more
-than a hard ceiling such as 15 minutes); validate issuer and subject on every
-request; re-check the admin group/subject allowlist so removing an admin takes
-effect immediately; logout revokes; authentication cleanup touches only auth
-records. A separate bounded-history janitor implements audit retention (up to
-90 days and the configured row/byte budgets), preserving durable safety evidence
-and idempotency independently of the visible History window.
-
-**Write tests:** expired/forged/revoked sessions rejected; policy change
-disables a live session; cleanup runs at most once per minute.
-
-**Verify by hand:** log in, then edit the configured admin group; the next
-request must stop working and force a fresh login.
-
-**Done when:** authorization happens against durable state on every request,
-not against a cookie claim.
-
-## Lesson 10 — Web hardening
-
-**Goal:** a small attack surface around the authenticated routes.
-
-**Implement:** per-request CSRF token derived from the session and checked for
-every unsafe method; same-origin enforcement (`Sec-Fetch-Site`, `Origin`,
-`Referer`); login rate limiting; strict security headers (`CSP default-src
-'none'` with only `self` allowances, `X-Content-Type-Options: nosniff`,
-`X-Frame-Options: DENY`, `Cache-Control: no-store`); error responses that never
-echo internals; body size limits.
-
-**Write tests:** missing/incorrect CSRF → 403; cross-origin POST → 403; huge
-body rejected; unknown routes 404 without stack traces.
-
-**Verify by hand:** `curl` the API without a session (401), with a session but
-no CSRF header (403), with both (success). Inspect headers with
-`curl -I`.
-
-**Done when:** you can demonstrate each protection failing closed.
-
----
-
-# Part 5 — Operations, audit and the UI
-
-## Lesson 11 — Durable operations and audit
-
-**Goal:** multi-step changes survive crashes with a truthful record.
-
-**Implement**
-- Durable checkpoints written **before** every Kubernetes write.
-- Idempotency keys; one active operation per target (enforced by a unique
-  index, not by memory).
-- Recovery: on startup, incomplete operations become "needs review" instead of
-  blind replay; locks stay held until an operator resolves them.
-- Append-only audit entries: actor, plan, target, result, timestamps.
-
-**Write tests:** duplicated submissions return the same operation; concurrent
-operations on one target collide cleanly; a simulated crash mid-operation
-leaves a reviewable record; shutdown accounts for every accepted operation.
-
-**Verify by hand:** during a long operation, `kill -9` the app; restart and
-confirm the UI reports the operation as needing review and nothing was replayed.
-
-**Done when:** there is no code path that writes to Kubernetes without a prior
-durable checkpoint.
-
-## Lesson 12 — HTTP API and dashboard
-
-**Goal:** the API in `api/openapi.yaml` plus a single embedded page.
-
-**Implement:** router with public (`/healthz`, `/readyz`, `/auth/login`,
-`/auth/callback`) and protected (everything else) groups; JSON endpoints for
-inventory, plans, operations, audit; assets embedded with `html/template`
-(auto-escaping); a page that renders preview → confirm → result using only
-same-origin requests.
-
-**Write tests:** an integration test through real handlers with a fake issuer
-and fake Kubernetes API — anonymous 401, login, ready, page render, missing
-CSRF 403, plan → submit → observed success, logout invalidation.
-
-**Verify by hand:** click through the whole flow in a browser; confirm every
-mutation first shows a reviewable preview.
-
-**Done when:** the browser flow and the integration test cover the same paths.
-
----
-
-# Part 6 — Ship it
-
-## Lesson 13 — The container image
-
-**Goal:** a minimal, reproducible, non-root image that contains no site data.
-
-**Implement:** multi-stage build; digest-pinned builder and distroless runtime;
-`CGO_ENABLED=0`, `-trimpath`, stripped symbols; run as UID/GID 65532; a
-`.dockerignore` allow-list that admits only `go.mod`, `go.sum`, `cmd/`,
-`internal/`.
-
-**Verify by hand:** export the image filesystem and list it — only the binary
-and base-OS files may appear. Run `strings` on the binary for any known
-sensitive word. Scan with Trivy (`vuln,secret`) and confirm zero findings.
-Run the image with no config: it must fail closed, not start.
-
-**Done when:** the image passes all three checks and you could hand it to a
-stranger without leaking your environment.
-
-## Lesson 14 — Manifests
-
-**Goal:** base + overlays that render deterministically and fail safe.
-
-**Implement:** Kustomize base (namespace, ServiceAccount, read-only ClusterRole,
-Deployment with `replicas: 1`, `Recreate`, hardened `securityContext`, probes,
-resources, NetworkPolicy restricted to the ingress workload) and overlays for
-writes, static storage, PVC expansion and local storage. Keep generated config
-in a ConfigMap; keep the OIDC client secret in a Secret mounted read-only.
-
-**Write tests:** extend `scripts/check-manifests.py` — render every variant and
-assert: the shipped config stays read-only, RBAC verbs stay within the
-allowlist, Pod hardening fields are present, single replica/`Recreate`, and
-journal-mode values are valid. Keep `scripts/check-api-parity.py` green so every
-registered `/api/` route and the structured error envelope stay documented in
-`api/openapi.yaml`.
-
-**Verify by hand:** render each overlay and grep the result for `REPLACE_`
-and `.invalid`; the base must not be deployable until replaced.
-
-**Done when:** `make manifests` covers every overlay and would catch a
-regression to a mutable default.
-
-## Lesson 15 — CI
-
-**Goal:** a pipeline that reruns everything you did by hand.
-
-**Implement:** GitHub Actions with SHA-pinned actions, least-privilege
-`permissions: contents: read`; jobs: (a) test/vet/build + manifest checks +
-multi-arch image build (no push), (b) vulnerability scans (`govulncheck`,
-Trivy pinned by digest) and secret scan. Install Python tooling with
-`--require-hashes` from a compiled `requirements.txt`.
-
-**Verify by hand:** run each job's commands locally; deliberately introduce a
-failing case (e.g. an un-allowed RBAC verb) and confirm the checker fails.
-
-**Done when:** CI would block the exact regressions this repo's history went
-through.
-
----
-
-# Part 7 — Deploy by hand
-
-## Lesson 16 — Discover the cluster (read-only)
-
-**Goal:** know exactly what you are deploying onto.
-
-**Implement:** use `scripts/discover.sh <context> > discovery.txt` (kept local,
-git-ignored) or equivalent read-only `kubectl` queries to record: Kubernetes
-and distribution versions, Profile/Notebook API versions and controller
-versions, the ingress gateway type, the StorageClasses your database and user
-volumes may use, namespace list, and RBAC you can obtain.
-
-**Verify by hand:** every fact in your inventory comes from a command you can
-re-run; nothing is assumed.
-
-**Done when:** you can answer "which storage class will hold the database, and
-what does its backend guarantee?" without guessing.
-
-## Lesson 17 — Choose and verify database storage
-
-**Goal:** a database location whose durability and locking you trust.
-
-**Implement:** decide between
-1. **Local/block storage** (node-local PV): WAL, best behaviour, app pinned to
-   one node; or
-2. **A reviewed network storage class** with DELETE journaling and the explicit
-   `allowUnverifiedFilesystem` opt-in.
-
-**Verify by hand (required for option 2):**
-- run `deploy/examples/db-ownership-check.yaml` (disposable RWX claim, two
-  nodes): the attempt pod must exit **3**; anything else means locks do not
-  propagate — use option 1.
-- crash test on a disposable database: write continuously, `kill -9`, reopen,
-  `PRAGMA integrity_check` must be `ok`.
-- confirm with the storage operator that global file locks and remote fsync
-  are effective for the CSI mounts (settings live on nodes, not in the class).
-
-**Done when:** both tests pass on the backend you intend to use, or you chose
-option 1.
-
-## Lesson 18 — Identity and HTTPS
-
-**Goal:** a real login over a dedicated HTTPS origin.
-
-**Implement:** register a confidential OIDC client (code flow + PKCE) with the
-exact callback `https://REPLACE_WITH_ADMIN_HOST/auth/callback`; create the
-client-secret Secret from a file (never shell history); create the HTTPS route
-using `deploy/examples/istio-https.yaml` as a template (or your own ingress);
-DNS and certificate must exist before login can work.
-
-**Verify by hand:** `curl -sI https://REPLACE_WITH_ADMIN_HOST/healthz` returns
-200 over a trusted certificate; sign-in works; a non-admin account is refused.
-
-**Done when:** the anonymous request is 401, the non-admin 403, the admin gets
-the dashboard — all from outside the cluster.
-
-## Lesson 19 — Read-only rollout
-
-**Goal:** the app in the cluster observing, but unable to change anything.
-
-**Implement:** `deploy/site/` overlay generated from `deploy/base` with your
-real host, issuer, group/subject and the image pinned by digest; keep all
-features false and `controllerContractConfirmed: false`; render and review;
-apply; watch rollout.
-
-**Verify by hand:** compare each inventory page with `kubectl`; test logout,
-session expiry and a second browser; confirm the pod's ServiceAccount cannot
-create anything (`kubectl auth can-i --as=system:serviceaccount:...`).
-
-**Done when:** inventory matches `kubectl` exactly and no write verb is
-available to the deployed identity.
-
-## Lesson 20 — Enable writes for one pilot namespace
-
-**Goal:** mutation capability without blast radius.
-
-**Implement:** apply the writes RBAC overlay and set
-`allowedNamespaces: [REPLACE_WITH_PILOT_NAMESPACE]`; keep static storage and
-expansion disabled; confirm `controllerContractConfirmed` only after testing a
-notebook stop/start on a disposable notebook.
-
-**Verify by hand:** stop a pilot notebook → observe the annotation the
-controller expects; start it again; edit the image or resources and confirm
-convergence; check quota headroom; confirm a plan for a non-pilot namespace is
-refused.
-
-**Done when:** you can describe, from observation, exactly what each write
-does, and rollback means disabling flags/RBAC, not deleting anything.
-
-## Lesson 21 — Operations: backup, recovery, incidents
-
-**Goal:** be able to lose the node and recover by your own procedure.
-
-**Implement:** a backup of the **stopped** database directory including any
-`-journal`/`-wal`/`-shm` files, checksummed and stored off-node; a written
-restore procedure; a plan for "needs review" operations and for sessions after
-an incident.
-
-**Verify by hand:** perform a restore drill into a scratch namespace and log
-in with the restored database. Deliberately corrupt a disposable copy and
-confirm your procedure detects it.
-
-**Done when:** you have executed the restore once by hand, not only written it
-down.
-
-## Lesson 22 — Final acceptance and retest
-
-**Goal:** a reproducible final pass over everything.
-
-**Verify by hand, in one sitting:**
-1. `make check` on a fresh clone; the manifest checker renders every overlay.
-2. Rebuild the image; verify: no extra files, zero Trivy findings, fails
-   closed without config.
-3. Re-run the two database tests (ownership, crash recovery) on the chosen
-   storage.
-4. Re-run the deployment checks: login, non-admin refusal, inventory parity,
-   read-only identity, pilot write, logout.
-5. Confirm every non-obvious behaviour above has a test in the repository —
-   and that no test requires a real cluster.
-
-**Done when:** a colleague can repeat the whole plan from this document alone.
-
----
-
-## What this plan cannot prove
-
-Local tests and scratch clusters cannot validate a specific cluster's Istio
-policies, CSI provisioning, admission webhooks, identity-provider claim
-mapping or production load. Those remain operator acceptance items; the app
-should stay read-only until each is observed working, and every mutation
-should remain behind a preview-and-confirm step.
-
-## Optional stretch lessons
-
-- Sign the image (cosign) and enable immutable tags in the registry.
-- Add metrics (Prometheus) behind authentication, keeping audit data private.
-- Study client-server databases (PostgreSQL) as an alternative for the
-  durable store; list everything that would change (backup, auth surface,
-  an extra workload) before writing code.
-- Add a third reviewer scenario: two admins racing the same notebook, to
-  observe idempotency and target locking in the audit trail.
+**Goal:** the implemented OpenAPI contract and accessible, truthful navigation.
+
+**Implement:** embedded same-origin UI and safe API handlers; preview → explicit
+confirmation → durable result. Follow [the current UI guide](ui.md): Workspace
+Health only, simplified Pods/Nodes tables with full safe Resource Details,
+Profile information above its table, stable right-centered Notebook action,
+Node-to-Running-Pods URL filters, visible filter reset and Back/Forward behavior.
+Use compact expandable notifications: errors first, newest-first within groups,
+deduplication, safe dismissal IDs and preserved preview warnings.
+
+**Test/verify:** handler auth/CSRF/error boundaries, Node logic/navigation harnesses
+and configured real-Chrome synthetic fixtures. Check 390px/1280px overflow, table
+cell/header alignment, button geometry, focus, disabled gates, late responses and
+cross-target form clearing. A missing browser dependency is a skip, not a pass.
+
+**Done when:** regression tests and actual browser rendering agree; observations,
+accepted operations and workflow convergence are visibly distinct.
+
+## Lesson 12 — Images, security gates, CI and publication
+
+**Goal:** scan and publish exactly the reviewed non-root multi-platform release.
+
+**Implement:** digest-pinned Go 1.27.3 builder/distroless runtime, CGO-disabled
+trimmed build, UID/GID 65532 and `/LICENSE`. Keep .dockerignore's explicit source/
+LICENSE allowlist; no site config, databases or credentials in images. CI uses
+SHA-pinned actions, contents-read permission, test/vet/build/manifests, no-push
+multi-architecture compilation and reviewed Go/Trivy scans.
+
+**Test/verify:** full race suite, API parity, strict schemas, source vulnerability/
+secret/misconfiguration checks, both runtime scans, revision labels/license and
+read-only-root/network-disabled smoke tests. Confirm successful source CI, then
+promote the scanned platform artifacts with provenance/SPDX SBOM. `make image-push
+IMAGE=repository:VERSION` publishes VERSION and latest from one build; it does
+not itself enforce the prior verification gates. Check both tags resolve to the
+verified index and platforms match scanned artifacts. Do not rebuild historical
+versions as latest by accident. Pin deployment digests, not mutable tags.
+
+**Done when:** publication has a reproducible receipt for source, checks and both
+platforms; docs-only receipts can use `[skip ci]` without changing binaries.
+
+## Lesson 13 — Discovery, manifests and read-only rollout
+
+**Goal:** deploy the configured reader with no accidental mutation privileges.
+
+**Implement:** context-selected read-only discovery; one-base site Kustomization,
+single Recreate replica, hardened Pod, probes, ingress NetworkPolicy, durable
+database and a read-only OIDC Secret mount. Choose/verify DB storage from lessons
+2–3. Review each optional RBAC overlay independently; permissions do not set
+flags. Keep every flag/controller-contract gate false for the first rollout.
+
+**Test/verify:** seven Python helper tests/API parity, all rendered variants and
+strict Kubernetes schemas. Replace placeholders in local site files only; pin
+the verified image index. Review render/diff/server dry-run, then apply only in
+the approved disposable context. Readiness does not prove full RBAC, login or
+controller/storage compatibility. Inspect exact ServiceAccount capabilities,
+not merely `can-i create` without a resource.
+
+**Done when:** read-only inventory matches selected observations, optional write
+bindings are absent/revoked, and one base supplies no duplicate resources.
+
+## Lesson 14 — HTTPS, identity and disposable live workflow acceptance
+
+**Goal:** a trusted login path and independently verified, narrow write pilot.
+
+**Implement:** a dedicated HTTPS origin/certificate, exact OIDC client callback,
+registered disposable owner identity and local secret file. Use the reviewed
+ingress example without weakening a shared gateway. Confirm installed Profile/
+Notebook controller ownership, annotations and convergence before enabling writes.
+Restrict the pilot namespace, then add only the required reviewed RBAC/flags.
+
+**Test/verify:** trusted TLS, non-admin denial, logout/expiry, observed inventory,
+fresh preview and one confirmed disposable operation at a time. Follow
+[the complete acceptance checklist](ui-workflow-acceptance.md) for Profile,
+Notebook, storage, Pod and Node actions. Observe real UID/lifecycle, mounted data,
+CSI/filesystem outcomes and quota enforcement independently. Stopping a Notebook
+does not remove its PVC references. Test deletion only with a reviewed data/reclaim
+plan; Retain is not a backup/wipe and Delete may destroy backing data.
+
+**Done when:** evidence records both successful/refused cases and every unproven
+integration. Turning flags off/revoking bindings is not rollback of prior writes.
+
+## Lesson 15 — Backups, incident recovery and final handover
+
+**Goal:** recover deliberately without discarding safety evidence or user data.
+
+**Implement:** stopped-directory backup of the complete database/journal set,
+checksums, encryption, off-node retention and rehearsed restore on a disposable
+copy. Record release/config/schema and actual cluster state. Preserve needs-review
+locks; never replay a stale DB as Kubernetes rollback. Only Profile deletion has
+the narrow stopped-app reconciliation tool; storage has no generic unlock or
+force cleanup. Bound private file logging separately from database History.
+
+**Test/verify:** restore/integrity drills, node-loss procedure, compatible schema,
+session/plan handling, corrupted-copy refusal and no second writer. Rerun release
+checks and selected operator acceptance from a fresh documented environment.
+Keep observation records private; [verification](verification.md) distinguishes
+local/synthetic proof from live acceptance.
+
+**Done when:** a colleague can repeat the safe build/deploy/backup procedure and
+explain every remaining risk without guessing. See [backup](backup.md),
+[database](database.md), [operations](operations.md) and [logging](logging.md).
+
+## Limits and optional exercises
+
+No local suite certifies a site's admission webhooks, CSI behavior, filesystem
+locking/fsync, IdP claims, gateway policies, GPU placement or production load.
+Keep unverified features off. Optional separate exercises include image signing,
+an authenticated metrics integration or evaluating a client-server database;
+these are not implemented capabilities or additional required lessons.

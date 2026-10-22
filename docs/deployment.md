@@ -48,6 +48,31 @@ Configure `deploy/site/config.yaml` strictly against `internal/config/config.go`
 
 Profile ownership is **immutable** in the installed Profile controller: it refuses an owner change and guards the existing namespace before reconciling quota or role bindings (see the upstream owner-immutability issue). The console therefore edits **quotas only** in `profile.update`. The pre-filled owner is shown read-only, and any request whose owner differs from the current one is refused as an unsupported contract rather than applied as a broken write.
 
+For reviewed all-profile administration, `policy.allowedNamespaces: []` removes
+the allowlist restriction; built-in protections (including `kube-*`) and
+`policy.protectedNamespaces` still apply. The namespace policy is independent of
+RBAC: a namespaced pilot Role cannot authorize Notebook mutations elsewhere.
+Use only the reviewed cluster-wide write grant when widening scope, with separate
+Profile/storage deletion and storage-editing grants as required. There is no
+need for `cluster-admin`, and destructive testing remains disposable-only.
+
+| Capability | Configuration gates (all require writes) | Additional RBAC |
+| --- | --- | --- |
+| Profile create/quota update, dynamic PVC create | `features.writesEnabled` | `writes` overlay |
+| Existing Notebook start/stop/edit | Writes + `notebooks.controllerContractConfirmed` after verification | `writes` overlay |
+| Static PV registration/reservation | `features.staticStorage`, approved prepared template | `static-storage` overlay |
+| PVC expansion | `features.pvcExpansion`, compatible bound CSI storage | `pvc-expansion` overlay for the standalone expansion action |
+| Restricted PV/PVC Edit | `features.storageEditing`; request growth additionally needs `pvcExpansion` | `storage-editing` overlay |
+| Unused-only PV/PVC Delete | `features.storageDeletion` | `storage-deletion` overlay |
+| Profile Delete | `features.profileDeletion` | `profile-deletion` overlay |
+| Pod restart | `features.podRestarts` + verified Notebook contract | `pod-restarts` overlay or pilot-scoped eviction grant |
+| Node cordon/uncordon | `features.nodeCordon` | `node-cordon` overlay |
+
+Overlay names above identify permission sets, not bases to stack together. Copy
+their reviewed RBAC files into the site overlay and include the base exactly once.
+Flags grant no permissions by themselves; grants do not enable flags. Review
+[storage limits](storage.md), [Pods](pods.md) and [Nodes](nodes.md) before opt-in.
+
 New Profiles (`profile.create`) require an **email-formatted** owner value, and the check is syntax only — the console performs **no** identity-provider or LDAP registration lookup, so a well-formed address may still be unregistered. Existing Profiles whose owner is a configured username keep working: `profile.update` accepts them **while the owner is left unmodified**, so there is no universal email-format rejection on update. Owner transfer, owner migration and custom owner controllers are a separate future workflow; do not delete or rewrite existing data to satisfy the email rule.
 
 Profile creation refuses an observed existing Profile or namespace and checks
@@ -129,6 +154,13 @@ include both `-t repository:VERSION` and `-t repository:latest`. Promote `latest
 only with the reviewed current release, not when rebuilding historical versions.
 Verify that both registry tags resolve to the recorded release index digest.
 Tags are mutable; continue pinning the immutable digest in deployment overlays.
+
+Documentation-only corrections need no new image or deployment and, by operator
+policy, no CI run. They can be committed/pushed with `[skip ci]` in the commit
+message. Do not use that exemption for source, tests, dependency, configuration,
+workflow or build/publishing-script changes. Application releases still require
+the full checks/scans and successful source CI before promotion; a later docs-only
+receipt commit does not change their binaries or image source label.
 
 Buildx publishes `linux/amd64,linux/arm64` (cluster currently amd64), provenance and SBOM. Use a Buildx `docker-container` builder for multi-platform publication (`docker buildx create --driver docker-container --use` if needed). Docker uses digest-pinned Go 1.27.3 (module minimum remains 1.26), pure-Go SQLite, `CGO_ENABLED=0`, read-only module resolution, trimmed paths, no VCS/build ID; runtime is digest-pinned distroless static nonroot with CA roots and UID/GID 65532. Identical pinned inputs produce reproducible binary inputs; registry attestations/image metadata can differ between builds. Maintain the toolchain/image digests for security updates, scan before promotion, and configure registry pull credentials externally if needed. `make image` builds/loads only the local host architecture. Do not commit rendered site manifests/discovery output.
 

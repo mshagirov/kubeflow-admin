@@ -46,6 +46,16 @@ their original timestamp; on fetch failure a warning says they may be stale.
 Inventory is not saved in localStorage/sessionStorage. Operation and audit
 requests do not wait for inventory to finish loading.
 
+Notifications use a compact stack: one card is visible by default, with a count
+button to expand/collapse the rest. Errors are first; within the error and
+non-error groups, newest arrival is first. Repeated visible notices are
+deduplicated and update recency. Info/success notices expire after ten seconds;
+errors/warnings remain until dismissed. Only eligible inventory/policy dismissal
+identifiers are remembered for the current session, never inventory or message
+contents. An action error is not persistently suppressed by dismissing its toast.
+Collapsed or dismissed notifications do not acknowledge preview warnings, prove
+convergence or replace History and operator inspection.
+
 After updating the image, reload normally: static assets use `no-cache` with ETag
 revalidation, so a release should not remain stale for an hour. If a proxy or
 browser extension overrides that, clear its cache. In browser Network tools,
@@ -85,15 +95,16 @@ kubectl --context YOUR_CONTEXT -n kubeflow-admin rollout status deployment/kubef
 - Start recovery with new writes disabled and optional mutation RBAC revoked by the operator where practical. Record actual cluster state first: a restored DB is older than Kubernetes and cannot roll it back. Never replay completed or ambiguous operations solely because the database says they are pending.
 - Stop the app; preserve a forensic copy of the damaged/current directory. Restore to compatible storage for the configured journal mode with UID/GID 65532 and restrictive permissions, using the backed-up complete SQLite file set. Do not mix files from different snapshots. Validate integrity and compatible application/schema versions before starting one instance.
 - On node replacement, provision a new safe directory/disk and new local PV with the replacement node's affinity; explicitly migrate/rebind through an operator-reviewed PV/PVC plan. Do not edit bound immutable fields, remove finalizers, repoint the old path blindly or assume Retain makes reuse safe. No generic delete/recreate shortcut is prescribed.
-- Incomplete operations recover as `needs-review`; no automatic replay. Fresh-read actual Profile/Notebook/PV/PVC UIDs and desired/observed state with independent authorized tooling. A notebook may be left stopped, a PV reserved or a PVC already created. Preserve those resources. Acknowledging an incident does **not** release retained locks, so a fresh preview cannot bypass them. Only Profile deletion has the narrow offline reconciliation procedure below; there is no general resume, unlock or rollback endpoint.
+- Incomplete operations recover as `needs-review`; no automatic replay. Fresh-read actual Profile/Notebook/PV/PVC UIDs and desired/observed state with independent authorized tooling. A notebook may be left stopped, a PV reserved, a PVC created/resizing, or a storage edit/deletion already applied. A changed PV reclaim policy may now allow later data deletion. Inspect the reviewed UID and accepted before/after changes, not a replacement under the same name. Preserve remaining resources; never shrink, retry blindly, remove finalizers or force cleanup. Storage edits/deletes retain their target locks; unresolved PVC deletion also fences its namespace. Acknowledging an incident does **not** release retained locks, so a fresh preview cannot bypass them. Only Profile deletion has the narrow offline reconciliation procedure below; there is no general resume, unlock or rollback endpoint.
 - Review restored sessions/login attempts and plans as sensitive stale state. Invalidate them using a tested site-approved database/session procedure or wait for the bounded session and plan lifetime in a write-disabled state; rotate upstream client credentials if exposure is suspected. Local logout is not upstream LDAP/Dex logout. Group revocation follows the provider and short (at most 15-minute) local authorization lifetime; do not promise immediate upstream revocation.
 - Before upgrade, take and test a consistent backup, inspect dependency/security scan findings, pin the image digest and review config/schema changes. Recreate incurs downtime. Restoring the prior image alone is not safe if DB/config schema changed; test downgrade compatibility or restore a matching backup while reconciling newer Kubernetes changes manually. Never autoscale for availability.
 
-Do not downgrade to an older binary while any Profile deletion is unresolved:
-older releases do not enforce its namespace fence or understand its recovery
-checkpoint contract, even if they can open the SQLite schema. Resolve those
-operations with this release's reviewed procedure first; never restore an old
-DB snapshot as a shortcut to discard a pending deletion or its locks.
+Do not downgrade while a Profile or storage mutation is unresolved unless
+compatibility of its action, checkpoint and target/namespace fences has been
+explicitly reviewed. Older binaries may not understand these safety contracts,
+even if they can open the SQLite schema. Only Profile deletion has the narrow
+reconciliation tool below; there is no corresponding generic storage unlock.
+Never restore an old DB snapshot to discard a pending mutation or its locks.
 
 ### Offline reconciliation of a Profile deletion
 

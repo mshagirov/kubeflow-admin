@@ -4,6 +4,14 @@ These snippets belong under `storage` in the site `config.yaml`. They are **disa
 
 Replace every placeholder with values verified against your own cluster. No real server, host, path, class or volume handle from any specific deployment should be committed here.
 
+In the UI, **Storage → New** opens the existing management drawer. Choose
+**Create dynamic PVC** to let an approved StorageClass's provisioner create a PV,
+or **Create from approved NFS / CSI template** for explicit static registration.
+The latter requires writes, `features.staticStorage`, the reviewed static-storage
+RBAC and an approved template below. The app does not allocate a backend disk or
+create an export directory. Existing PV/PVC names open Resource Details with
+separately gated restricted Edit and unused-only Delete actions.
+
 ## Existing NFS backend
 
 Configure a **new approved prepared user's root**, not a shared root containing other users' data. Preserve whatever mount options your NFS server requires (the example uses NFSv3, which is not a universal default):
@@ -115,6 +123,13 @@ conditional write after the durable checkpoint. A stale UID/resourceVersion
 requires a new review. Deletion succeeds only after disappearance is observed;
 finalizers or an uncertain API result may require operator review, not a retry.
 Incomplete operations are not automatically replayed and retain their locks.
+
+PVC deletion requires an explicit, approved StorageClass even while Pending. It
+also refuses controller-owned claims and mismatched bound-PV reservations; a
+Bound unused claim needs its exact PV claim-reference identity. Label-only PVC
+editing is namespace/Profile-scoped but does not require an expansion-capable
+class. An unresolved PVC deletion holds an exclusive namespace fence against
+other app mutations; this does not constrain external writers or controllers.
 
 An unused-resource check is **not atomic** with workload creation, a binder or
 external administrator. Run one app writer, coordinate a maintenance window,

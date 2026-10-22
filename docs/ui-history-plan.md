@@ -1,5 +1,11 @@
 # Responsive administration and bounded history — delivery plan
 
+> Historical delivery plan, not the current UI/API contract. Later releases added
+> Namespaces/Nodes navigation, simplified Pod/Node columns, consolidated Workspace
+> Health, compact notification stacks, gated storage Edit/Delete and updated panel
+> layouts/labels. Use [the current UI guide](ui.md), [live acceptance](ui-workflow-acceptance.md),
+> [History](history.md) and [OpenAPI](../api/openapi.yaml) for implemented behavior.
+
 ## Scope and boundaries
 
 This release improves navigation, tables, feedback, resource inspection and

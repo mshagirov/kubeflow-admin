@@ -2,11 +2,16 @@
 
 A single Go service for OIDC-authorized Kubeflow administrators: cross-profile inventory, typed previews, durable operations and bounded audit history. No arbitrary manifests, Kubernetes proxy, Secret reads, exec, impersonation or unrestricted resource deletion. Existing PV/PVC editing uses a separately enabled restricted YAML projection; direct storage deletion is separately enabled and unused-only. The separately enabled Pod restart workflow uses normal eviction of supported controller-owned Pods, never forced deletion. The separately enabled Profile deletion workflow deletes a reviewed Profile and waits for normal cleanup of its owned namespace; it never bypasses finalizers and can destroy PVC-backed data. Profile quota editing keeps the owner read-only because the upstream controller does not support owner transfers.
 
-**Start read-only.** Deployment requires a dedicated HTTPS host, issuer/client registration, exact administrator group/subject, image and durable database storage. The base uses the default StorageClass with WAL for local disks; verified BeeGFS additionally needs `journalMode: delete` and `allowUnverifiedFilesystem: true`. See [database requirements](docs/database.md). A node-local PV option is also supplied; no cluster changes have been performed.
+**Start read-only.** Deployment requires a dedicated HTTPS host, issuer/client registration, exact administrator group/subject, image and durable database storage. The base uses the default StorageClass with WAL for local disks; verified BeeGFS additionally needs `journalMode: delete` and `allowUnverifiedFilesystem: true`. See [database requirements](docs/database.md). A node-local PV option is also supplied; deployment remains an explicit operator action.
 
 ## Local checks
 
-Install a supported Go toolchain (module requires Go 1.26+; the pinned container toolchain is newer), Kustomize 5, Python 3 and PyYAML (`python3 -m pip install PyYAML` in a virtual environment).
+Use the reviewed Go 1.27.3 release toolchain (the module's Go 1.26 minimum is not a security-version recommendation), Kustomize 5 and Python 3. Install the pinned manifest/OpenAPI tooling in a virtual environment:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r scripts/requirements.txt
+```
 
 If using the repository's `.venv`, activate it first (`source .venv/bin/activate`), so `make` uses the Python interpreter that has PyYAML installed.
 
@@ -54,8 +59,9 @@ Then: log in as an admin over HTTPS, confirm a non-admin is denied, compare inve
 
 ## Deployment and operations
 
-- [Learning: 22 hands-on lessons to reimplement, test and deploy this app](docs/learning.md)
+- [Learning: 15 hands-on lessons to reimplement, test and deploy this app](docs/learning.md)
 - [Configure, build, deploy and stage writes](docs/deployment.md)
+- [Current UI: pages, layouts, notifications and action boundaries](docs/ui.md)
 - [Disposable-pilot acceptance checks for profile, storage and notebook workflows](docs/ui-workflow-acceptance.md)
 - [Local evidence vs live acceptance](docs/verification.md)
 - [Backups, recovery and safety boundaries](docs/operations.md)

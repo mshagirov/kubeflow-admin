@@ -26,6 +26,13 @@ PVC deletion refuses observed Pod/Notebook references. No force/finalizer
 cleanup or replay is permitted. Separate observations do not atomically fence
 external workloads/binders; admission and operator coordination remain necessary.
 
+`pvc.delete` acceptance also takes an exclusive `namespace:<name>` fence against
+other app mutations, retained on needs-review alongside the PVC target lock.
+Bound-PV and namespace/Profile dependencies contribute digested evidence; raw
+backend source fields are neither persisted nor exposed. Explicit YAML
+`metadata.labels: {}` removes console labels, omitted/null preserves them, and
+unrelated labels remain untouched.
+
 Additional store APIs: `CleanupAuth(context.Context,time.Time) error`, `CleanupPlans(context.Context,time.Time) error`, `CheckIntegrity(context.Context) error`, `Checkpoint(context.Context,model.Operation,model.Audit) error`, `Finish(context.Context,model.Operation,model.Audit) error`, `IncompleteOperations(context.Context)([]model.Operation,error)`, `OperationForKey(ctx,actor,key,planID)(model.Operation,error)`, `AcquireWorker() bool`, `ReleaseWorker()`. `PrimaryTarget(model.Action) string` and `Targets(model.Plan) []string` derive lock identities from the server-owned action; only static create/reserve actions acquire a secondary PV lock. Manager previews periodically clean expired or malformed plans, never operations, audit or idempotency claims. Startup integrity failures are typed `ErrIntegrity`/`IntegrityError`, fail closed and never synthesize audit or release locks. `Open` uses WAL/FULL; `OpenWithJournal(path,"delete",allowUnverified)` uses DELETE/EXTRA and requires the explicit opt-in for BeeGFS or unrecognized filesystems (see database.md). overlayfs is accepted for development but reported unverified, not proven persistent. NFS/SMB/FUSE/tmpfs/Lustre/CephFS/GPFS/OCFS2 are always rejected. Open holds a private `.lock` file with nonblocking exclusive flock until idempotent Close; the process sets `umask 0077`. A needs-review outcome preserves all PVC/PV/object locks. Do not manually edit lock rows. Separate bounded History retention may prune presentation audit events and terminal operation rows; immutable acceptance evidence, claims and idempotency tombstones are retained (see history.md).
 
 All packages must propagate errors. No development auth bypass, no wildcard RBAC, no user manifests/raw Kubernetes proxy, no sensitive logs/diffs. HTTP failures must be safe. Live deployment/testing remains user's responsibility; local fake-client tests are not evidence of controller/storage convergence.
