@@ -4,9 +4,9 @@ Records what has been **proven locally** and what still requires the operator's 
 
 ## 0.4.4 — template-driven storage provisioning (22 October 2026)
 
-**Release candidate:** source/browser verification is complete; source CI,
-runtime-image scanning and publication are pending at this source revision.
-No deployment or live storage mutation has been performed.
+**Published and registry-verified:** `0.4.4` and `latest` resolve to the same
+multi-platform index below. Existing `0.4.3` is unchanged. No deployment or live
+storage mutation has been performed.
 
 - Separate unclaimed NFS/BeeGFS PV registration and template-bound PVC creation;
   independent template-controlled capacities/requests and access modes. New NFS
@@ -48,6 +48,38 @@ remain in [storage](storage.md), [deployment](deployment.md) and
 [live acceptance](ui-workflow-acceptance.md). The learning guide remains exactly
 15 lessons. New features remain disabled by default; installed admission/mount
 behavior still needs the disposable operator-run acceptance checklist.
+
+### Publication receipt
+
+- Source commit: `a50742b4a13cd8c98f6feb4ced71589e803781e5`.
+- Source CI: [39796210788](https://github.com/mshagirov/kubeflow-admin/actions/runs/39796210788)
+  passed both test and security jobs before publication.
+- The exact staged source tree was archived and passed pinned Trivy 0.76.0
+  HIGH/CRITICAL dependency, secret and misconfiguration gates; its tree was
+  checked against the committed source before the release build.
+- Built once offline from archived committed source with Go 1.27.3, SPDX SBOM and
+  provenance. Both AMD64/ARM64 runtime artifacts passed HIGH/CRITICAL
+  vulnerability/secret scans, non-root UID/GID `65532:65532`, correct source/version
+  labels and byte-identical `/LICENSE` checks. Attestations contain no workstation
+  or private temporary-directory paths. Both architectures failed closed without
+  configuration under network-disabled, read-only-root, dropped-capability,
+  no-new-privileges smoke tests.
+- Linux AMD64 manifest:
+  `sha256:e9bd3f5573d6923874f0962950c5cd481b7010199bb02b803b4a2559da58a1e5`.
+- Linux ARM64 manifest:
+  `sha256:eb6481b6805b9cbf1457eecfb3c26233ec81368bb18e0738755237fc63eb96c2`.
+- Pushed the already-scanned OCI artifacts without rebuilding. Registry index
+  and both platform digests exactly match the offline artifact; SPDX/provenance
+  attestations were verified for both. `0.4.4` and `latest` match, and the previous
+  `0.4.3` index was compared before/after and is unchanged.
+
+```yaml
+image: docker.io/muratshagirov/kubeflow-admin@sha256:6ffb6676ef6a385fec2a6aa79f865e474cbe51db761cf7872063a40abe746caa
+```
+
+This receipt is a documentation-only follow-up: no new image build, CI run or
+deployment is required. The published image source label remains the source
+commit above; this receipt commit uses `[skip ci]`.
 
 ## 0.4.3 — Profile and Notebook panel layout (22 October 2026)
 
