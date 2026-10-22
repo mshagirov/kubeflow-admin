@@ -14,6 +14,29 @@ info:
     not arbitrary PV/PVC manifests. Unused-only PV/PVC deletion never removes
     finalizers or forces deletion; an unused observation is not an atomic fence
     against external workloads or binders.
+    Template-based static provisioning adds a standalone PV registration action
+    (`pv.create.static`) and a PVC action bound to a selected existing PV
+    (`pvc.create.bound`). Capacity, access modes, reclaim policy, volume mode,
+    mount options and driver details are resolved from server-owned registration
+    templates; the browser cannot override them. Only these new registration
+    actions use read-only template capacities/access modes: the legacy combined
+    `storage.create.static`, `pv.reserve-and-claim` and `pvc.create.dynamic`
+    contracts intentionally keep their existing typed browser inputs and are not
+    silently reinterpreted.
+    Optional PodDefault work exists only inside a reviewed PVC creation or PVC
+    cleanup plan. There is no standalone PodDefault page, editor or mutation
+    endpoint. For dynamic PVC creation the optional PodDefault is attempted only
+    after the PVC object exists; a WaitForFirstConsumer claim may still be
+    Pending, so Bound is not required first and PodDefault acceptance is not
+    binding, provisioning or mount readiness. An existing PodDefault may be
+    overwritten only after an explicit acknowledgement and a fresh
+    UID/resourceVersion check. PVC deletion reviews at most 32 related
+    PodDefaults, warns about shared/external configuration and never deletes
+    other PVCs. A PodDefault failure after PVC creation is reported without
+    rolling back the PVC; cleanup never recreates a PodDefault. Partial PodDefault
+    outcomes require manual operator review with authorized kubectl; there is no
+    app repair, replay or unlock endpoint, and the PVC must never be deleted as
+    rollback.
     The separately gated pod.restart action performs normal PDB-aware eviction
     of a validated Notebook-managed Pod only; no forced deletion is supported.
     The separately gated profile.delete action requests deletion of one existing
@@ -435,8 +458,45 @@ components:
             document. pv.delete and pvc.delete require storageDeletion plus
             writes, current identity, reason and exact confirmName. Referenced
             PVCs and bound/reserved PVs are refused; no forced cleanup exists.
-          enum: [profile.create, profile.quota.change, profile.update, profile.delete, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pvc.expand, pv.edit, pvc.edit, pv.delete, pvc.delete, notebook.start, notebook.stop, notebook.edit, pod.restart, node.cordon, node.uncordon]
-        namespace: {type: string}
+            pv.create.static creates one standalone PV from an approved
+            registration template and never creates a PVC or claimRef.
+            pvc.create.bound creates one PVC in the selected namespace and binds
+            it to the selected Available, unclaimed PV. Both resolve capacity,
+            access modes, reclaim policy, volume mode, mount options and driver
+            details from the server-owned template. This read-only template
+            behavior is limited to the two new registration kinds. The legacy
+            combined storage.create.static and pv.reserve-and-claim contracts
+            intentionally keep their existing typed size/accessMode inputs, and
+            pvc.create.dynamic keeps its existing size/accessMode contract; they
+            are not reinterpreted as registration templates.
+            pvc.create.dynamic and pvc.create.bound may optionally request one
+            PodDefault when features.podDefaults is enabled. The PodDefault is
+            written only after the PVC object exists. For dynamic creation a
+            WaitForFirstConsumer claim may still be Pending at that point; Bound
+            is not required first, and PodDefault acceptance is not binding,
+            provisioning or mount readiness. An existing PodDefault name requires
+            podDefault.overwrite plus a fresh reviewed UID/resourceVersion; an
+            overwrite is never silent. pvc.delete may include related
+            namespace-local PodDefaults only when confirmPodDefaultCleanup is
+            true; at most 32 are reviewed. Referenced pods and Notebook templates,
+            including stopped Notebooks, block the deletion before cleanup.
+            Shared/external-managed PodDefaults are removed only after explicit
+            acknowledgement; other PVCs are never deleted. A failure after the
+            PVC/PV step or after some PodDefault deletions is reported as a
+            partial outcome with no automatic PVC rollback and no PodDefault
+            recreation. Resolve a partial PodDefault step only by manual operator
+            review with authorized kubectl; there is no standalone app repair,
+            replay or unlock endpoint.
+          enum: [profile.create, profile.quota.change, profile.update, profile.delete, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pv.create.static, pvc.create.bound, pvc.expand, pv.edit, pvc.edit, pv.delete, pvc.delete, notebook.start, notebook.stop, notebook.edit, pod.restart, node.cordon, node.uncordon]
+        namespace:
+          type: string
+          description: >-
+            Namespace for namespace-scoped actions. It is required for
+            pvc.create.dynamic, pvc.create.bound, pvc.expand, pv.reserve-and-claim,
+            storage.create.static, pv.edit/pvc.edit, and pv.delete/pvc.delete
+            where applicable. It must be empty for the cluster-scoped
+            pv.create.static action. Profile actions may omit it or set it to the
+            Profile name.
         name:
           type: string
           description: >-
@@ -444,7 +504,10 @@ components:
             of at most 63 characters and must be unique at creation time: an
             existing Profile or Namespace with that name is refused and never
             adopted. For profile.update and profile.delete it is the exact
-            existing Profile name.
+            existing Profile name. For pv.create.static it is the new
+            cluster-scoped PV name; for pvc.create.bound it is the new PVC name
+            in the selected namespace. Duplicate names are refused, never
+            adopted or overwritten.
         reason:
           type: string
           maxLength: 500
@@ -486,10 +549,17 @@ components:
         quota: {type: object, additionalProperties: {type: string}}
         targetUID:
           type: string
-          description: Required current UID from storage-document for pv.edit, pvc.edit, pv.delete and pvc.delete
+          description: >-
+            Required current UID for pv.edit, pvc.edit, pv.delete and pvc.delete.
+            pvc.create.bound also requires the selected PV's current UID so the
+            plan cannot bind to a replacement or concurrently changed volume.
         targetResourceVersion:
           type: string
-          description: Required current resourceVersion from storage-document; stale edits/deletes must be reviewed again
+          description: >-
+            Required current resourceVersion for pv.edit, pvc.edit, pv.delete and
+            pvc.delete. pvc.create.bound also requires the selected PV's current
+            resourceVersion; stale edits, deletes or binding targets must be
+            reviewed again.
         storageYAML:
           type: string
           maxLength: 32768
@@ -502,12 +572,91 @@ components:
             the existing expansion feature and driver/class checks. Unknown
             fields, duplicate keys, aliases, identity/status/finalizer edits,
             shrinkage and no-op edits are refused. This is not a full manifest editor.
-        storageClass: {type: string}
-        size: {type: string, description: Kubernetes storage quantity}
-        accessMode: {type: string}
-        pvName: {type: string}
-        template: {type: string, description: Approved server-configured static template name}
-        subdirectory: {type: string}
+        storageClass:
+          type: string
+          description: >-
+            Explicit approved StorageClass. Required for pv.create.static and
+            pvc.create.bound and must match the selected registration template
+            and, for pvc.create.bound, the selected PV. A named approved static
+            StorageClass is valid when it matches the template/PV; an empty
+            class is not forced. Legacy combined/static and reservation actions
+            keep their existing StorageClass rules.
+        size: {type: string, description: 'Existing typed browser input for pvc.create.dynamic, storage.create.static and pv.reserve-and-claim; pv.create.static and pvc.create.bound use the template value and refuse a browser override'}
+        accessMode: {type: string, description: 'Existing typed browser input for pvc.create.dynamic, storage.create.static and pv.reserve-and-claim; pv.create.static and pvc.create.bound use the template value and refuse a browser override'}
+        pvName: {type: string, description: 'Selected existing cluster-scoped PV for pvc.create.bound or pv.reserve-and-claim'}
+        template:
+          type: string
+          description: >-
+            Approved server-configured template name. pv.create.static and
+            pvc.create.bound use a registration template; storage.create.static
+            keeps using the legacy NFS/CSI template list. No driver, handle,
+            server, class or arbitrary attributes may be supplied by the browser.
+        subdirectory: {type: string, description: 'Legacy storage.create.static relative NFS subdirectory; new pv.create.static uses nfsPath or beeGFSPath instead'}
+        nfsPath:
+          type: string
+          maxLength: 4096
+          description: >-
+            Full canonical absolute NFS path for pv.create.static with an NFS
+            registration template. For registration templates the approved root
+            itself or a descendant is accepted; legacy NFS templates keep their
+            strict-descendant rule. Traversal, control characters, ambiguous
+            encodings and paths outside every approved root are refused. This
+            does not prove server-side symlink, export or permission safety. It
+            is rejected for pvc.create.bound and legacy actions.
+        beeGFSPath:
+          type: string
+          maxLength: 128
+          description: >-
+            Canonical nonempty relative BeeGFS suffix for pv.create.static with a
+            BeeGFS registration template, for example
+            example.user/kf-shared-volume. The fixed scheme, authority and /home
+            prefix come from the template. The joined final handle must be at
+            most 128 bytes for CSI contract compatibility. Leading
+            slash, scheme, authority, query, fragment, credentials, dot segments
+            and encoded traversal are refused; the suffix cannot escape or change
+            the fixed prefix. It is rejected for pvc.create.bound and legacy
+            actions.
+        directoryUID:
+          type: string
+          maxLength: 10
+          pattern: '^[1-9][0-9]{0,9}$'
+          description: >-
+            Required nonzero canonical decimal UID for pvc.create.bound with an
+            NFS registration template where the approved
+            k8s-sigs.io/nfs-directory-uid annotation is enabled. The accepted
+            range is 1 through 4294967294, with the upper bound enforced by the server. The annotation is intent-only
+            metadata: it neither proves nor changes directory ownership. The
+            actual directory, export and ownership must be prepared externally
+            by the storage operator, and workload UID/GID permissions remain an
+            operator responsibility. It is not accepted as a pv.create.static
+            field.
+        directoryGID:
+          type: string
+          maxLength: 10
+          pattern: '^[1-9][0-9]{0,9}$'
+          description: >-
+            Required nonzero canonical decimal GID for pvc.create.bound with an
+            NFS registration template where the approved
+            k8s-sigs.io/nfs-directory-gid annotation is enabled. The accepted
+            range is 1 through 4294967294, with the upper bound enforced by the server. The annotation is intent-only
+            metadata: it neither proves nor changes directory ownership. The
+            actual directory, export and ownership must be prepared externally
+            by the storage operator, and workload UID/GID permissions remain an
+            operator responsibility. It is not accepted as a pv.create.static
+            field.
+        podDefault:
+          $ref: '#/components/schemas/PodDefaultRequest'
+        confirmPodDefaultCleanup:
+          type: boolean
+          description: >-
+            For pvc.delete only: explicit acknowledgement that the reviewed
+            related PodDefaults may be removed. Required when the reviewed
+            cleanup set is non-empty. At most 32 related PodDefaults are
+            reviewed; a larger set is refused rather than truncated. Shared or
+            externally managed PodDefaults are removed only after their warning
+            is acknowledged. PodDefault deletion uses Orphan propagation so
+            unreviewed dependents are not cascade-deleted. Other PVCs are never deleted, and a partial cleanup
+            never triggers PVC rollback or PodDefault recreation.
         container: {type: string}
         image: {type: string}
         cpuRequest: {type: string}
@@ -523,6 +672,48 @@ components:
           items: {$ref: '#/components/schemas/Mount'}
         restart: {type: boolean}
         force: {type: boolean, description: 'Explicit force confirmation for node.cordon / node.uncordon (e.g. control-plane or NotReady nodes)'}
+    PodDefaultRequest:
+      type: object
+      additionalProperties: false
+      required: [name, mountPath, overwrite]
+      description: >-
+        Optional dedicated PodDefault substep of pvc.create.dynamic or
+        pvc.create.bound when features.podDefaults is enabled. It is never a
+        standalone mutation request. The PodDefault is written only after the PVC
+        object exists. For dynamic creation the claim may still be Pending under
+        WaitForFirstConsumer; Bound is not required first, and PodDefault
+        acceptance is not binding, provisioning or mount readiness. The object
+        has one PVC volume and mount in the PVC namespace, an independent
+        selector derived from the final name, and provenance annotations; no
+        Secret, environment, container, service or unrelated PVC content is
+        accepted.
+      properties:
+        name:
+          type: string
+          maxLength: 52
+          description: >-
+            Final PodDefault name, suggesting the template default but editable
+            subject to Kubernetes name validation. The limit is 52 bytes because
+            the upstream admission webhook derives a poddefault-<name>
+            annotation segment, which must fit the 63-character segment bound.
+            The namespace and claimName are fixed to the PVC being created. An
+            existing name is refused unless overwrite is explicitly true.
+        mountPath:
+          type: string
+          maxLength: 4096
+          description: >-
+            Final absolute mount path, suggesting the template default but
+            editable subject to approved-path validation. It cannot replace
+            protected root/home paths or inject a subPath.
+        overwrite:
+          type: boolean
+          description: >-
+            Explicit acknowledgement to replace the dedicated spec of an
+            existing non-terminating PodDefault after a fresh UID/resourceVersion
+            review. The plan warns about selector changes and removal of other
+            PVC references, environment or injected settings without exposing
+            secret-bearing values. Unrelated metadata, ownerReferences and
+            finalizers are preserved; a replacement object is never patched.
     Mount:
       type: object
       additionalProperties: false
@@ -552,8 +743,12 @@ components:
       required: [field, before, after]
       properties:
         field: {type: string}
-        before: {type: string, description: Redacted allowed-field value before the change}
-        after: {type: string, description: Redacted allowed-field value after the change}
+        before:
+          type: string
+          description: Approved before-value; private plan previews may contain reviewed non-secret entered paths, while durable audit/acceptance values are redacted or digested.
+        after:
+          type: string
+          description: Approved after-value; private plan previews may contain reviewed non-secret entered paths, while durable audit/acceptance values are redacted or digested.
     Plan:
       type: object
       required: [id, actor, createdAt, expiresAt, prepared]
@@ -577,10 +772,34 @@ components:
         action: {type: string}
         state: {type: string, description: Durable state; incomplete recovery becomes needs-review; an offline reconciliation of an uncertain profile.delete derives a terminal state and records it in the audit}
         step: {type: string}
-        error: {type: string}
+        error: {type: string, description: 'Safe failure/recovery guidance. A partial PodDefault outcome requires manual operator review with authorized kubectl; there is no app repair, replay or unlock endpoint, and the PVC is never deleted as rollback.'}
         profileDeleteCheckpointed: {type: boolean, description: 'True once the durable checkpoint that precedes the single Profile delete request was persisted, so a delete request may have been issued. Always present, and never cleared.'}
+        mutationReceipts:
+          type: array
+          maxItems: 128
+          items: {$ref: '#/components/schemas/MutationReceipt'}
+          description: >-
+            Append-only observed mutation/verification facts, persisted before
+            subsequent writes and retained independently of transient plans.
+            These are actual known outcomes, not planned changes. Missing
+            receipts do not prove that an ambiguous request made no change.
         createdAt: {type: string, format: date-time}
         updatedAt: {type: string, format: date-time}
+    MutationReceipt:
+      type: object
+      additionalProperties: false
+      required: [kind, name, uid, resourceVersion, outcome]
+      description: >-
+        Safe resource identity and an observed API outcome, never a manifest,
+        backend path/handle or injected setting. Creation acceptance alone does
+        not prove binding, provisioning, admission or mount readiness.
+      properties:
+        kind: {type: string, enum: [PersistentVolume, PersistentVolumeClaim, PodDefault]}
+        namespace: {type: string}
+        name: {type: string}
+        uid: {type: string}
+        resourceVersion: {type: string}
+        outcome: {type: string, enum: [created, reserved, overwritten, deleted, available, bound]}
     Audit:
       type: object
       required: [id, actor, action, target, result, time]
@@ -595,6 +814,45 @@ components:
         reason: {type: string}
         changes: {type: array, items: {$ref: '#/components/schemas/Change'}}
         time: {type: string, format: date-time}
+    StorageRegistrationTemplate:
+      type: object
+      additionalProperties: false
+      required: [name, kind, storageClass, pvCapacity, pvAccessModes, pvcRequest, pvcAccessModes, reclaimPolicy, volumeMode]
+      description: >-
+        Browser-safe projection of one approved NFS or BeeGFS registration
+        template. It carries only fixed read-only storage values and PodDefault
+        suggestions, never an existing PV's backend handle, Secret reference,
+        credential, unmanaged driver attribute or arbitrary label.
+      properties:
+        name: {type: string}
+        kind: {type: string, enum: [nfs, beegfs]}
+        storageClass: {type: string}
+        pvCapacity: {type: string, description: Read-only PV capacity from the template}
+        pvAccessModes:
+          type: array
+          items: {type: string}
+        pvcRequest: {type: string, description: Independent read-only PVC storage request}
+        pvcAccessModes:
+          type: array
+          items: {type: string}
+        reclaimPolicy: {type: string, enum: [Retain]}
+        volumeMode: {type: string, enum: [Filesystem]}
+        nfsServer: {type: string, description: Present for NFS templates only}
+        nfsRoots:
+          type: array
+          items: {type: string}
+          description: Approved absolute NFS roots for pv.create.static path validation; never an arbitrary existing PV path
+        nfsMountOptions:
+          type: array
+          items: {type: string}
+        requireDirectoryUIDGID: {type: boolean, description: Present for NFS templates that require the approved directory UID/GID annotations}
+        beegfsDriver: {type: string, description: Present for BeeGFS templates; fixed reviewed driver only}
+        beegfsPrefix: {type: string, description: 'Fixed scheme, authority and path prefix for a BeeGFS template; the joined final handle including the entered suffix is limited to 128 bytes'}
+        podDefaultName:
+          type: string
+          maxLength: 52
+          description: Optional suggested name; the final reviewed name remains capped at 52 bytes
+        podDefaultMountPathPrefix: {type: string}
     Resource:
       type: object
       required: [kind, name]
@@ -622,3 +880,11 @@ components:
         observedAt: {type: string, format: date-time}
         resources: {type: array, items: {$ref: '#/components/schemas/Resource'}}
         warnings: {type: array, items: {type: string}}
+        storageTemplates:
+          type: array
+          description: >-
+            Approved registration-template projection, present only when writes
+            and static storage are both enabled. This is the same safe data used
+            by the storage forms; it is not a Kubernetes object list and never
+            exposes an existing PV's backend details.
+          items: {$ref: '#/components/schemas/StorageRegistrationTemplate'}

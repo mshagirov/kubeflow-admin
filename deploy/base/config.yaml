@@ -29,6 +29,9 @@ storage:
   allowedStorageClasses: [REPLACE_WITH_APPROVED_CLASS]
   nfsTemplates: []
   csiTemplates: []
+  # Separate PV registration / template-bound PVC workflow. Empty until the
+  # operator reviews backend boundaries and independent PV/PVC defaults.
+  registrationTemplates: []
 notebooks:
   controllerContractConfirmed: false
   gpuPresets: []
@@ -55,6 +58,9 @@ features:
   # Each needs writesEnabled and its own reviewed RBAC grant.
   storageEditing: false
   storageDeletion: false
+  # Optional PVC-associated PodDefaults only; requires its separate RBAC grant.
+  # Read access still detects references when mutation is disabled.
+  podDefaults: false
 ui:
   # Optional footer of the console. Empty by default: the console renders no
   # footer at all. The value may be plain text or a small amount of HTML for

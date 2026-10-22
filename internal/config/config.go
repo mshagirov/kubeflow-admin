@@ -65,6 +65,51 @@ type Storage struct {
 	AllowedStorageClasses []string      `yaml:"allowedStorageClasses"`
 	NFSTemplates          []NFSTemplate `yaml:"nfsTemplates"`
 	CSITemplates          []CSITemplate `yaml:"csiTemplates"`
+	// RegistrationTemplates is the versioned, typed template-driven static
+	// provisioning contract. It is deliberately separate from the legacy
+	// NFSTemplates/CSITemplates lists: deployed legacy templates keep their
+	// existing PV+PVC behavior and their strict NFS descendant rule.
+	RegistrationTemplates []RegistrationTemplate `yaml:"registrationTemplates"`
+}
+
+// RegistrationTemplate is one operator-approved NFS or BeeGFS registration
+// template. All PV and PVC storage values are fixed server-side; the browser
+// selects a template and supplies only an approved path/suffix plus the
+// required NFS directory IDs where applicable. ReclaimPolicy and VolumeMode are
+// accepted in the document for explicitness but only supported values are valid.
+type RegistrationTemplate struct {
+	Name         string `yaml:"name"`
+	Kind         string `yaml:"backend"` // "nfs" or "beegfs"
+	StorageClass string `yaml:"storageClass"`
+
+	// PersistentVolume values.
+	Capacity      string   `yaml:"pvCapacity"`
+	AccessModes   []string `yaml:"pvAccessModes"`
+	ReclaimPolicy string   `yaml:"reclaimPolicy"`
+	VolumeMode    string   `yaml:"volumeMode"`
+
+	// Independent PersistentVolumeClaim values. The request must not exceed
+	// the PV capacity and every claim access mode must be supported by the PV.
+	PVCRequest     string   `yaml:"pvcRequest"`
+	PVCAccessModes []string `yaml:"pvcAccessModes"`
+
+	// NFS source and approved path roots. The approved root itself and its
+	// descendants are accepted for registration templates. Legacy templates
+	// continue to require a strict descendant.
+	NFSServer              string   `yaml:"nfsServer"`
+	NFSRoots               []string `yaml:"nfsRoots"`
+	MountOptions           []string `yaml:"nfsMountOptions"`
+	RequireDirectoryUIDGID bool     `yaml:"requireDirectoryUIDGID"`
+
+	// BeeGFS source. The driver and URL prefix are fixed by the operator; the
+	// browser supplies only a relative suffix.
+	BeeGFSDriver string `yaml:"beegfsDriver"`
+	BeeGFSPrefix string `yaml:"beegfsPrefix"`
+
+	// Optional PodDefault suggestion. The namespace and claimName are always
+	// derived from the reviewed PVC, never from configuration.
+	PodDefaultName            string `yaml:"podDefaultName"`
+	PodDefaultMountPathPrefix string `yaml:"podDefaultMountPathPrefix"`
 }
 
 // A CSI import is a fixed, operator-approved existing volume, never a free-form handle.
@@ -124,6 +169,14 @@ type Features struct {
 	// PersistentVolume or PersistentVolumeClaim. It is a separate destructive
 	// opt-in and is never implied by WritesEnabled or StorageEditing.
 	StorageDeletion bool `yaml:"storageDeletion"`
+	// PodDefaults is the separate, false-by-default opt-in for the optional
+	// dedicated PodDefault substep of a PVC creation and for removing reviewed
+	// PodDefault dependencies during an unused-only PVC deletion. It is never
+	// implied by WritesEnabled, StaticStorage or a storage editing option.
+	// Read-only PodDefault reference detection is not gated by this flag: a PVC
+	// deletion must still fail closed when references exist but cleanup is
+	// disabled.
+	PodDefaults bool `yaml:"podDefaults"`
 }
 
 // UI holds the console presentation settings a site may set. It carries no
@@ -270,8 +323,8 @@ func (c Config) Validate() error {
 	if c.Kubernetes.RequestTimeoutSeconds < 1 || c.Kubernetes.RequestTimeoutSeconds > 60 {
 		return fmt.Errorf("request timeout must be 1..60 seconds")
 	}
-	if (c.Features.StorageEditing || c.Features.StorageDeletion) && !c.Features.WritesEnabled {
-		return fmt.Errorf("storageEditing and storageDeletion require features.writesEnabled")
+	if (c.Features.StorageEditing || c.Features.StorageDeletion || c.Features.PodDefaults) && !c.Features.WritesEnabled {
+		return fmt.Errorf("storageEditing, storageDeletion and podDefaults require features.writesEnabled")
 	}
 	// The footer is a bounded branding block: plain text or a small amount
 	// of sanitized HTML. The bound is counted in runes (Unicode code
@@ -290,6 +343,12 @@ func (c Config) Validate() error {
 	for _, t := range c.Storage.CSITemplates {
 		if t.Name == "" || names[t.Name] || t.Driver == "" || t.VolumeHandle == "" || len(t.AccessModes) == 0 {
 			return fmt.Errorf("invalid or duplicate CSI storage template")
+		}
+		names[t.Name] = true
+	}
+	for _, t := range c.Storage.RegistrationTemplates {
+		if err := validateRegistrationTemplate(t, c.Storage.AllowedStorageClasses, names); err != nil {
+			return err
 		}
 		names[t.Name] = true
 	}

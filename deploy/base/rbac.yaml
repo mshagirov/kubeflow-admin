@@ -4,7 +4,7 @@ metadata:
   name: kubeflow-admin-read
 rules:
   - apiGroups: [kubeflow.org]
-    resources: [profiles, notebooks]
+    resources: [profiles, notebooks, poddefaults]
     verbs: [get, list]
   - apiGroups: ['']
     resources: [namespaces, persistentvolumes, persistentvolumeclaims, pods, events, resourcequotas, limitranges, nodes]

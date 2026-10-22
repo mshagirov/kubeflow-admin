@@ -63,9 +63,53 @@ type resource struct {
 }
 
 type inventory struct {
-	ObservedAt time.Time  `json:"observedAt"`
-	Resources  []resource `json:"resources"`
-	Warnings   []string   `json:"warnings,omitempty"`
+	ObservedAt       time.Time                     `json:"observedAt"`
+	Resources        []resource                    `json:"resources"`
+	Warnings         []string                      `json:"warnings,omitempty"`
+	StorageTemplates []storageRegistrationTemplate `json:"storageTemplates,omitempty"`
+}
+
+// storageRegistrationTemplate is the synthetic, non-secret registration
+// template projection. It mirrors the real model.StorageRegistrationTemplate
+// shape the console consumes from inventory.
+type storageRegistrationTemplate struct {
+	Name                      string   `json:"name"`
+	Kind                      string   `json:"kind"`
+	StorageClass              string   `json:"storageClass"`
+	PVCapacity                string   `json:"pvCapacity"`
+	PVAccessModes             []string `json:"pvAccessModes"`
+	PVCRequest                string   `json:"pvcRequest"`
+	PVCAccessModes            []string `json:"pvcAccessModes"`
+	ReclaimPolicy             string   `json:"reclaimPolicy"`
+	VolumeMode                string   `json:"volumeMode"`
+	NFSServer                 string   `json:"nfsServer,omitempty"`
+	NFSRoots                  []string `json:"nfsRoots,omitempty"`
+	NFSMountOptions           []string `json:"nfsMountOptions,omitempty"`
+	RequireDirectoryUIDGID    bool     `json:"requireDirectoryUIDGID,omitempty"`
+	BeeGFSDriver              string   `json:"beegfsDriver,omitempty"`
+	BeeGFSPrefix              string   `json:"beegfsPrefix,omitempty"`
+	PodDefaultName            string   `json:"podDefaultName,omitempty"`
+	PodDefaultMountPathPrefix string   `json:"podDefaultMountPathPrefix,omitempty"`
+}
+
+var syntheticStorageTemplates = []storageRegistrationTemplate{
+	{
+		Name: "nfs-template", Kind: "nfs", StorageClass: "nfs-csi",
+		PVCapacity: "2400Gi", PVAccessModes: []string{"ReadWriteMany"},
+		PVCRequest: "10Gi", PVCAccessModes: []string{"ReadWriteMany"},
+		ReclaimPolicy: "Retain", VolumeMode: "Filesystem",
+		NFSServer: "nfs.example.test", NFSRoots: []string{"/exports/kubeflow"},
+		NFSMountOptions: []string{"nfsvers=3"}, RequireDirectoryUIDGID: true,
+		PodDefaultName: "mount-toast", PodDefaultMountPathPrefix: "/home/jovyan",
+	},
+	{
+		Name: "beegfs-template", Kind: "beegfs", StorageClass: "beegfs-csi",
+		PVCapacity: "500Gi", PVAccessModes: []string{"ReadWriteMany"},
+		PVCRequest: "10Gi", PVCAccessModes: []string{"ReadWriteMany"},
+		ReclaimPolicy: "Retain", VolumeMode: "Filesystem",
+		BeeGFSDriver: "beegfs.csi.netapp.com", BeeGFSPrefix: "beegfs://beegfs.example.test/home",
+		PodDefaultName: "mount-hpc-home", PodDefaultMountPathPrefix: "/home/jovyan",
+	},
 }
 
 // identity is the synthetic administrator of the fixture. It is not a real
@@ -319,8 +363,36 @@ func observations() []resource {
 			},
 		},
 		{
+			Kind: "PersistentVolume", Name: "nfs-registered", State: "Available", UID: "uid-pv-nfs-registered",
+			Details: map[string]string{"capacity": "2400Gi", "storageClass": "nfs-csi", "reclaimPolicy": "Retain", "volumeMode": "Filesystem", "accessModes": "ReadWriteMany", "resourceVersion": "77", "registrationTemplate": "nfs-template"},
+		},
+		{
+			Kind: "PersistentVolume", Name: "beegfs-registered", State: "Available", UID: "uid-pv-beegfs-registered",
+			Details: map[string]string{"capacity": "500Gi", "storageClass": "beegfs-csi", "reclaimPolicy": "Retain", "volumeMode": "Filesystem", "accessModes": "ReadWriteMany", "resourceVersion": "78", "registrationTemplate": "beegfs-template"},
+		},
+		{
+			Kind: "PersistentVolume", Name: "nfs-wrong-class", State: "Available", UID: "uid-pv-nfs-wrong-class",
+			Details: map[string]string{"capacity": "2400Gi", "storageClass": "standard", "reclaimPolicy": "Retain", "volumeMode": "Filesystem", "accessModes": "ReadWriteMany", "resourceVersion": "79"},
+		},
+		{
 			Kind: "StorageClass", Name: "standard", State: "Active",
 			Details: map[string]string{"provisioner": "kubeflow.io/standard", "reclaimPolicy": "Delete"},
+		},
+		{
+			Kind: "StorageClass", Name: "nfs-csi", State: "Active",
+			Details: map[string]string{"provisioner": "nfs.csi.k8s.io", "reclaimPolicy": "Retain"},
+		},
+		{
+			Kind: "StorageClass", Name: "beegfs-csi", State: "Active",
+			Details: map[string]string{"provisioner": "beegfs.csi.netapp.com", "reclaimPolicy": "Retain"},
+		},
+		{
+			Kind: "PodDefault", Namespace: "team-alpha", Name: "mount-toast", UID: "uid-pd-team-alpha-toast", State: "Active",
+			Details: map[string]string{"claims": "team-alpha-claim", "shared": "false", "externalManaged": "false"},
+		},
+		{
+			Kind: "PodDefault", Namespace: "team-alpha", Name: "mount-review-claim", UID: "uid-pd-team-alpha-review", State: "Active",
+			Details: map[string]string{"claims": "data,team-alpha-claim", "shared": "true", "externalManaged": "false", "additionalSettings": "false"},
 		},
 		{
 			Kind: "Pod", Namespace: "team-alpha", Name: "team-alpha-notebook-0-0", Owner: "StatefulSet/team-alpha-notebook-0", State: "Running",
@@ -405,7 +477,7 @@ func observations() []resource {
 // resource keys, allowed images, approved storage class and template names
 // and the optional footer text.
 // No database path, no kubeconfig location and no secret ever reaches it.
-func projection(writes, deletion, notebookContract, storageEditing, storageDeletion bool) map[string]any {
+func projection(writes, deletion, notebookContract, storageEditing, storageDeletion, podDefaults bool) map[string]any {
 	return map[string]any{
 		"Identity": map[string]any{
 			"Email":             fixtureIdentity.Email,
@@ -424,6 +496,7 @@ func projection(writes, deletion, notebookContract, storageEditing, storageDelet
 				"ProfileDeletion": deletion && writes,
 				"StorageEditing":  storageEditing && writes,
 				"StorageDeletion": storageDeletion && writes,
+				"PodDefaults":     podDefaults && writes,
 			},
 			"Notebooks": map[string]any{
 				"ControllerContractConfirmed": notebookContract,
@@ -431,9 +504,10 @@ func projection(writes, deletion, notebookContract, storageEditing, storageDelet
 				"AllowedImages":               []string{"kubeflownotebookswg/jupyter:1.9.0"},
 			},
 			"Storage": map[string]any{
-				"AllowedStorageClasses": []string{"standard", "nfs-csi"},
+				"AllowedStorageClasses": []string{"standard", "nfs-csi", "beegfs-csi"},
 				"NFSTemplates":          []map[string]string{{"Name": "nfs-shared", "StorageClass": "nfs-csi"}},
 				"CSITemplates":          []map[string]string{{"Name": "csi-shared", "StorageClass": "nfs-csi"}},
+				"RegistrationTemplates": writes,
 			},
 			"UI": map[string]any{
 				// The footer is deployment configuration. The synthetic
@@ -504,6 +578,7 @@ type server struct {
 	deletion        bool
 	storageEditing  bool
 	storageDeletion bool
+	podDefaults     bool
 	notebookWrites  bool
 	tmpl            *template.Template
 	assets          string
@@ -523,6 +598,7 @@ func main() {
 	deletion := os.Getenv("KF_ADMIN_PROFILE_DELETION") != "0"
 	storageEditing := os.Getenv("KF_ADMIN_STORAGE_EDITING") != "0"
 	storageDeletion := os.Getenv("KF_ADMIN_STORAGE_DELETION") != "0"
+	podDefaults := os.Getenv("KF_ADMIN_POD_DEFAULTS") != "0"
 	// The installed Notebook controller contract is an independent capability:
 	// a deployment may enable writes without confirming it.
 	notebookWrites := writes && os.Getenv("KF_ADMIN_NOTEBOOK_CONTRACT") != "0"
@@ -531,6 +607,7 @@ func main() {
 		deletion:        deletion,
 		storageEditing:  storageEditing,
 		storageDeletion: storageDeletion,
+		podDefaults:     podDefaults && writes,
 		notebookWrites:  notebookWrites,
 		tmpl:            template.Must(template.New("index.html").Parse(string(page))),
 		assets:          assets,
@@ -552,7 +629,7 @@ func main() {
 	// model than the console can observe.
 	mux.HandleFunc("GET /api/v1/operations", func(w http.ResponseWriter, r *http.Request) {
 		historyHeaders(w, "recent-plus-unresolved")
-		writeJSON(w, 200, []any{})
+		writeJSON(w, 200, syntheticOperations())
 	})
 	mux.HandleFunc("GET /api/v1/operations/{id}", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"error": map[string]any{"code": "not_found", "message": "Not found."}})
@@ -589,7 +666,7 @@ func port() string {
 
 // handlePage renders the real console template with the projection.
 func (s *server) handlePage(w http.ResponseWriter, r *http.Request) {
-	view := projection(s.writes, s.deletion, s.notebookWrites, s.storageEditing, s.storageDeletion)
+	view := projection(s.writes, s.deletion, s.notebookWrites, s.storageEditing, s.storageDeletion, s.podDefaults)
 	if gaps := missingProjectionFields(s.tmpl, view); len(gaps) > 0 {
 		warning := "projection gap: " + strings.Join(gaps, ", ")
 		s.mu.Lock()
@@ -722,11 +799,15 @@ func (s *server) handleInventory(w http.ResponseWriter, r *http.Request) {
 		}
 		resources = append(resources, item)
 	}
-	writeJSON(w, 200, inventory{
+	out := inventory{
 		// The observation is dated against the real clock of the fixture.
 		ObservedAt: time.Now().UTC(),
 		Resources:  resources,
-	})
+	}
+	if s.writes {
+		out.StorageTemplates = syntheticStorageTemplates
+	}
+	writeJSON(w, 200, out)
 }
 
 // allowedActionFields are the typed fields a plan request may carry. A field
@@ -739,6 +820,8 @@ var allowedActionFields = map[string]bool{
 	"cpuRequest": true, "cpuLimit": true, "memoryRequest": true, "memoryLimit": true,
 	"gpuPreset": true, "gpuCount": true, "mounts": true, "restart": true, "force": true,
 	"storageYAML": true, "targetUID": true, "targetResourceVersion": true,
+	"nfsPath": true, "beeGFSPath": true, "directoryUID": true, "directoryGID": true,
+	"podDefault": true, "confirmPodDefaultCleanup": true,
 }
 
 var quotaKeyPattern = regexp.MustCompile(`^[A-Za-z0-9]+([./-][A-Za-z0-9]+)*$`)
@@ -912,6 +995,7 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 			"profileDeletion":  s.deletion && s.writes,
 			"storageEditing":   s.storageEditing && s.writes,
 			"storageDeletion":  s.storageDeletion && s.writes,
+			"podDefaults":      s.podDefaults && s.writes,
 			"notebookWrites":   s.notebookWrites,
 			"notebookContract": s.notebookWrites,
 		},
@@ -960,6 +1044,38 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+// syntheticOperations carries durable mutation receipts for browser review.
+// They describe only actual writes and safe identities; no spec, backend path
+// or secret-bearing setting is present.
+func syntheticOperations() []map[string]any {
+	now := time.Now().UTC()
+	return []map[string]any{
+		{
+			"id": "operation-partial-pvc", "planID": "plan-partial-pvc",
+			"actor": "https://issuer.example|browser-subject", "actorDisplay": "Synthetic Operator",
+			"target": "pvc:team-alpha/partial-claim", "action": "pvc.create.bound",
+			"state": "needs-review", "step": "create-pod-default",
+			"error":     "The optional PodDefault step could not be verified. The claim and selected volume remain; inspect the recorded receipts.",
+			"createdAt": now.Add(-3 * time.Minute), "updatedAt": now.Add(-2 * time.Minute),
+			"mutationReceipts": []map[string]string{
+				{"kind": "PersistentVolumeClaim", "namespace": "team-alpha", "name": "partial-claim", "uid": "uid-pvc-partial-claim", "resourceVersion": "88", "outcome": "created"},
+				{"kind": "PersistentVolume", "name": "nfs-registered", "uid": "uid-pv-nfs-registered", "resourceVersion": "77", "outcome": "reserved"},
+			},
+		},
+		{
+			"id": "operation-partial-cleanup", "planID": "plan-partial-cleanup",
+			"actor": "https://issuer.example|browser-subject", "actorDisplay": "Synthetic Operator",
+			"target": "pvc:team-alpha/data", "action": "pvc.delete",
+			"state": "needs-review", "step": "delete-pvc",
+			"error":     "A reviewed related PodDefault was deleted, but the claim deletion was not verified.",
+			"createdAt": now.Add(-8 * time.Minute), "updatedAt": now.Add(-7 * time.Minute),
+			"mutationReceipts": []map[string]string{
+				{"kind": "PodDefault", "namespace": "team-alpha", "name": "mount-review-claim", "uid": "uid-pd-team-alpha-review", "resourceVersion": "41", "outcome": "deleted"},
+			},
+		},
+	}
 }
 
 func historyHeaders(w http.ResponseWriter, window string) {

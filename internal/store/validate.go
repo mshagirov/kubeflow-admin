@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"kubeflow-admin/internal/model"
 )
@@ -71,6 +72,12 @@ func decodeOperation(value []byte) (model.Operation, error) {
 	case "queued", "applying", "succeeded", "failed", "needs-review":
 	default:
 		return op, integrity("operation record has an unknown state")
+	}
+	// Older records have no mutationReceipts field at all; a nil list remains
+	// valid. Present proofs must be bounded, structurally safe and bound to the
+	// operation's canonical namespaced target where applicable.
+	if err := validateOperationMutationReceiptsForTarget(op); err != nil {
+		return op, integrity("operation record has invalid mutation receipts")
 	}
 	return op, nil
 }
@@ -167,28 +174,33 @@ func validateActiveHistory(ctx context.Context, q sqlQueryer) error {
 	if err := validatePrimaryTargets(ctx, q); err != nil {
 		return err
 	}
-	if err := validateKnownSecondaryPVLocks(ctx, q); err != nil {
+	if err := validateKnownDependencyLocks(ctx, q); err != nil {
 		return err
 	}
 	return validateTargetOwnership(ctx, q)
 }
 
-// validateKnownSecondaryPVLocks uses a still-present server-owned plan as
-// evidence. A plan may already have expired, in which case no secondary lock is
-// invented or required. When the plan is available and names a PV for a PV
-// action, the active lock must exist.
-func validateKnownSecondaryPVLocks(ctx context.Context, q sqlQueryer) error {
+// validateKnownDependencyLocks validates the declared secondary lock set of
+// every active operation whose plan record still exists. A plan may already
+// have expired; then no secondary lock is invented or required. A present but
+// unreadable/malformed plan is an integrity failure, never an empty set.
+//
+// New provisioning actions and reviewed cleanup use an exact declared set,
+// including the namespace fence, so an extra stale PV/PodDefault lock is also
+// detected. Legacy actions keep the historical subset rule so their legitimate
+// old lock shapes remain compatible.
+func validateKnownDependencyLocks(ctx context.Context, q sqlQueryer) error {
 	rows, err := q.QueryContext(ctx, `SELECT c.id,c.plan_id,p.value FROM operation_claims c
-		JOIN (SELECT key,value FROM records WHERE bucket='plans' AND json_valid(value)=1) p ON p.key=c.plan_id
+		LEFT JOIN records p ON p.bucket='plans' AND p.key=c.plan_id
 		WHERE c.active=1`)
 	if err != nil {
 		return err
 	}
-	type pvEvidence struct {
+	type planEvidence struct {
 		operationID string
-		pvName      string
+		plan        model.Plan
 	}
-	var evidence []pvEvidence
+	var evidence []planEvidence
 	for rows.Next() {
 		var operationID, planID string
 		var value []byte
@@ -196,14 +208,17 @@ func validateKnownSecondaryPVLocks(ctx context.Context, q sqlQueryer) error {
 			rows.Close()
 			return err
 		}
-		var plan model.Plan
-		if err := json.Unmarshal(value, &plan); err != nil || plan.ID != planID {
+		if value == nil {
+			// The preview plan was cleaned up; durable locks remain, but the
+			// declared dependency set is no longer available to re-derive.
 			continue
 		}
-		kind := plan.Prepared.Action.Kind
-		if (kind == "storage.create.static" || kind == "pv.reserve-and-claim") && plan.Prepared.Action.PVName != "" {
-			evidence = append(evidence, pvEvidence{operationID: operationID, pvName: plan.Prepared.Action.PVName})
+		var plan model.Plan
+		if err := json.Unmarshal(value, &plan); err != nil || plan.ID != planID {
+			rows.Close()
+			return integrity("an active operation has an unreadable plan record")
 		}
+		evidence = append(evidence, planEvidence{operationID: operationID, plan: plan})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -211,15 +226,81 @@ func validateKnownSecondaryPVLocks(ctx context.Context, q sqlQueryer) error {
 	}
 	rows.Close()
 	for _, e := range evidence {
-		var n int
-		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_targets WHERE operation_id=? AND target=? AND active=1`, e.operationID, "pv:"+e.pvName).Scan(&n); err != nil {
-			return err
+		expected, err := targets(e.plan)
+		if err != nil {
+			return integrity("an active operation plan carries unsafe dependency evidence")
 		}
-		if n == 0 {
-			return integrity("an active operation is missing a known secondary PV lock")
+		if strictDependencyLocks(e.plan.Prepared.Action) {
+			actual, err := activeOperationTargets(ctx, q, e.operationID)
+			if err != nil {
+				return err
+			}
+			if !sameTargetSet(actual, expected) {
+				return integrity("an active operation holds a secondary dependency lock set that does not match its plan")
+			}
+			continue
+		}
+		// Legacy actions preserve their historical shape: every declared lock
+		// must exist, but an unrelated extra lock is not newly rejected.
+		for _, target := range expected {
+			var n int
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_targets WHERE operation_id=? AND target=? AND active=1`, e.operationID, target).Scan(&n); err != nil {
+				return err
+			}
+			if n == 0 {
+				return integrity("an active operation is missing a known secondary dependency lock")
+			}
 		}
 	}
 	return nil
+}
+
+// strictDependencyLocks reports whether the plan's complete target set is
+// declared and must match exactly. Legacy actions without new dependency
+// fields keep the subset rule.
+func strictDependencyLocks(a model.Action) bool {
+	switch a.Kind {
+	case "pv.create.static", "pvc.create.bound":
+		return true
+	case "pvc.create.dynamic":
+		return a.PodDefault != nil
+	case pvcDeleteKind:
+		return a.ConfirmPodDefaultCleanup
+	}
+	return false
+}
+
+func activeOperationTargets(ctx context.Context, q sqlQueryer, operationID string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT target FROM operation_targets WHERE operation_id=? AND active=1 ORDER BY target`, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var target string
+		if err := rows.Scan(&target); err != nil {
+			return nil, err
+		}
+		out = append(out, target)
+	}
+	return out, rows.Err()
+}
+
+func sameTargetSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sortedA := append([]string(nil), a...)
+	sortedB := append([]string(nil), b...)
+	sort.Strings(sortedA)
+	sort.Strings(sortedB)
+	for i := range sortedA {
+		if sortedA[i] != sortedB[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // checkActiveAcceptance verifies that every active claim has a ledger row whose

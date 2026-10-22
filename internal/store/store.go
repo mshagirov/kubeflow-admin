@@ -592,7 +592,7 @@ func PrimaryTarget(a model.Action) string {
 		return "notebook:" + a.Namespace + "/" + a.Name
 	case strings.HasPrefix(a.Kind, "profile."):
 		return "profile:" + a.Name
-	case a.Kind == "pv.edit" || a.Kind == "pv.delete":
+	case a.Kind == "pv.create.static" || a.Kind == "pv.edit" || a.Kind == "pv.delete":
 		// PersistentVolumes are cluster scoped: the canonical target never
 		// carries a namespace, even when another field does.
 		return "pv:" + a.Name
@@ -791,6 +791,18 @@ func validateStorageDelete(a model.Action) error {
 // without changing the persisted lock shape of existing actions. A PV deletion
 // is already serialized by the existing pv:<name> lock used by reservations.
 func Targets(p model.Plan) []string {
+	out, err := targets(p)
+	if err == nil {
+		return out
+	}
+	// Direct callers of Targets keep the historical fallback: malformed
+	// dependency evidence yields only the base targets. Admission and integrity
+	// never use this fallback; they call targets and fail closed on the error.
+	return baseTargets(p)
+}
+
+// targets is the strict lock-set builder used by admission and integrity.
+func targets(p model.Plan) ([]string, error) {
 	a := p.Prepared.Action
 	out := []string{PrimaryTarget(a)}
 	add := func(v string) {
@@ -801,11 +813,40 @@ func Targets(p model.Plan) []string {
 		}
 		out = append(out, v)
 	}
-	// PVName is meaningful only for these two actions. Other adapters ignore it;
-	// carrying an irrelevant field in an otherwise valid action must not acquire
-	// a lock on an unrelated PV (especially a needs-review lock).
-	if (a.Kind == "storage.create.static" || a.Kind == "pv.reserve-and-claim") && a.PVName != "" {
-		add("pv:" + a.PVName)
+	// Secondary dependencies are derived only from the validated action and its
+	// safe prepared evidence: the selected PV of a binding, the optional
+	// dedicated PodDefault of a PVC creation, and the exact reviewed PodDefaults
+	// of a cleanup. An error is a real admission/integrity failure, never an
+	// empty dependency set.
+	deps, err := plannedDependencyTargets(p.Prepared)
+	if err != nil {
+		return nil, err
+	}
+	for _, target := range deps {
+		add(target)
+	}
+	if a.Kind == "pod.restart" && validTargetName(a.Namespace) && validTargetName(p.Prepared.ParentNotebook) {
+		add("notebook:" + a.Namespace + "/" + p.Prepared.ParentNotebook)
+	}
+	if a.Kind == profileDeleteKind || a.Kind == pvcDeleteKind {
+		if ns := fenceNamespace(a); ns != "" {
+			add("namespace:" + ns)
+		}
+	}
+	return out, nil
+}
+
+// baseTargets returns only targets that never depend on parsed evidence.
+func baseTargets(p model.Plan) []string {
+	a := p.Prepared.Action
+	out := []string{PrimaryTarget(a)}
+	add := func(v string) {
+		for _, old := range out {
+			if old == v {
+				return
+			}
+		}
+		out = append(out, v)
 	}
 	if a.Kind == "pod.restart" && validTargetName(a.Namespace) && validTargetName(p.Prepared.ParentNotebook) {
 		add("notebook:" + a.Namespace + "/" + p.Prepared.ParentNotebook)
@@ -828,10 +869,10 @@ func Targets(p model.Plan) []string {
 // unused-only PVC deletion) is refused while any other active mutation still
 // targets the same namespace. The compared targets are exactly the ordinary
 // namespace-scoped primary targets (notebook:<ns>/..., pod:<ns>/... and
-// pvc:<ns>/...), the Profile target (profile:<ns>) and the namespace fence
-// target itself (namespace:<ns>). Cluster-scoped targets such as pv:<name>
-// and node:<name> are deliberately not compared: they are not namespace
-// scoped.
+// pvc:<ns>/...), plus a secondary poddefault:<ns>/... dependency, the Profile
+// target (profile:<ns>) and the namespace fence target itself
+// (namespace:<ns>). Cluster-scoped targets such as pv:<name> and node:<name>
+// are deliberately not compared: they are not namespace scoped.
 //
 // The caller has already resolved an idempotent retry before this check, so a
 // retry of an accepted deletion keeps resolving to the same operation even
@@ -855,16 +896,18 @@ func checkNamespaceFence(ctx context.Context, tx *sql.Tx, a model.Action, ns, op
 	notebookPrefix := "notebook:" + ns + "/"
 	podPrefix := "pod:" + ns + "/"
 	pvcPrefix := "pvc:" + ns + "/"
+	podDefaultPrefix := "poddefault:" + ns + "/"
 	err = tx.QueryRowContext(ctx, `SELECT 1 FROM operation_targets
 		WHERE active=1 AND operation_id<>? AND (
 			target=? OR target=?
-			OR substr(target,1,?)=? OR substr(target,1,?)=? OR substr(target,1,?)=?)
+			OR substr(target,1,?)=? OR substr(target,1,?)=? OR substr(target,1,?)=? OR substr(target,1,?)=?)
 		LIMIT 1`,
 		operationID,
 		"namespace:"+ns, "profile:"+ns,
 		len(notebookPrefix), notebookPrefix,
 		len(podPrefix), podPrefix,
 		len(pvcPrefix), pvcPrefix,
+		len(podDefaultPrefix), podDefaultPrefix,
 	).Scan(&found)
 	if err == nil {
 		return ErrConflict
@@ -900,6 +943,11 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 	if op.ID == "" || plan.ID == "" || op.PlanID != plan.ID || op.Actor == "" || op.Actor != plan.Actor || op.Target == "" || op.Action == "" || op.Action != plan.Prepared.Action.Kind || key == "" || op.State != "queued" {
 		return model.Operation{}, false, ErrConflict
 	}
+	// A freshly queued operation cannot already carry mutation proof. Receipts
+	// are appended only through durable checkpoints after a real write.
+	if len(op.MutationReceipts) != 0 {
+		return model.Operation{}, false, ErrConflict
+	}
 	// A restart's secondary lock is derived only from the server-validated parent
 	// Notebook. Never accept a namespace/path/wildcard there.
 	if plan.Prepared.Action.Kind == "pod.restart" {
@@ -919,6 +967,14 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 	// destructive/privileged actions. Validate their target scope and exact
 	// identity before any claim or lock is written.
 	switch plan.Prepared.Action.Kind {
+	case "pv.create.static":
+		if err := validatePVCreateStatic(plan.Prepared.Action); err != nil {
+			return model.Operation{}, false, err
+		}
+	case "pvc.create.bound":
+		if err := validatePVCCreateBound(plan.Prepared.Action); err != nil {
+			return model.Operation{}, false, err
+		}
 	case "pv.edit", "pvc.edit":
 		if err := validateStorageEdit(plan.Prepared.Action); err != nil {
 			return model.Operation{}, false, err
@@ -927,6 +983,21 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 		if err := validateStorageDelete(plan.Prepared.Action); err != nil {
 			return model.Operation{}, false, err
 		}
+	}
+	// The optional PodDefault dependency fields are typed and only meaningful
+	// on a PVC creation or the reviewed PVC cleanup. Validate them before any
+	// claim or lock is written.
+	if err := validatePodDefaultContract(plan.Prepared); err != nil {
+		return model.Operation{}, false, err
+	}
+	// Admission must fail closed on malformed dependency evidence instead of
+	// relying on Targets' historical no-op fallback.
+	if _, err := plannedDependencyTargets(plan.Prepared); err != nil {
+		return model.Operation{}, false, ErrInvalidTarget
+	}
+	lockedTargets, err := targets(plan)
+	if err != nil {
+		return model.Operation{}, false, ErrInvalidTarget
 	}
 	// There is no namespace delete action. The Profile cascade owns the
 	// namespace it removes, so a direct namespace deletion is refused outright
@@ -951,7 +1022,27 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 	op.ActorDisplay = display
 	// Build the exact accepted audit row before admission so its serialized size
 	// is included in the byte budget inside the acceptance transaction.
-	acceptedAudit := model.Audit{ID: op.ID + "-accepted", Actor: op.Actor, ActorDisplay: op.ActorDisplay, Action: op.Action, Target: op.Target, Result: "queued", OperationID: op.ID, Reason: plan.Prepared.Action.Reason, Changes: plan.Prepared.Changes, Time: op.CreatedAt}
+	// Persist the exact reviewed PodDefault identities independently of backend
+	// presentation changes, so the immutable acceptance evidence remains
+	// complete after the transient plan is cleaned up. Durable audit/acceptance
+	// evidence never carries raw paths or handles.
+	acceptedChanges := plan.Prepared.Changes
+	if identityChange, ok, err := reviewedPodDefaultIdentityChange(plan.Prepared); err != nil {
+		return model.Operation{}, false, ErrInvalidTarget
+	} else if ok {
+		// The store owns this reserved field. Drop any server-supplied value
+		// with the same name so the immutable snapshot is unambiguous.
+		filtered := make([]model.Change, 0, len(acceptedChanges)+1)
+		for _, change := range acceptedChanges {
+			if change.Field == reviewedPodDefaultIdentitiesField {
+				continue
+			}
+			filtered = append(filtered, change)
+		}
+		acceptedChanges = append(filtered, identityChange)
+	}
+	acceptedChanges = redactAcceptanceChanges(acceptedChanges)
+	acceptedAudit := model.Audit{ID: op.ID + "-accepted", Actor: op.Actor, ActorDisplay: op.ActorDisplay, Action: op.Action, Target: op.Target, Result: "queued", OperationID: op.ID, Reason: plan.Prepared.Action.Reason, Changes: acceptedChanges, Time: op.CreatedAt}
 	acceptedAuditValue, err := json.Marshal(acceptedAudit)
 	if err != nil {
 		return op, false, err
@@ -1019,7 +1110,7 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 	if !errors.Is(err, sql.ErrNoRows) {
 		return op, false, err
 	}
-	for _, target := range Targets(plan) {
+	for _, target := range lockedTargets {
 		err = tx.QueryRowContext(ctx, `SELECT 1 FROM operation_targets WHERE target=? AND active=1`, target).Scan(&exists)
 		if err == nil {
 			return op, false, ErrConflict
@@ -1042,7 +1133,7 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 	if _, err = tx.ExecContext(ctx, `INSERT INTO operation_claims(id,actor,idem,plan_id,target) VALUES(?,?,?,?,?)`, op.ID, op.Actor, key, plan.ID, op.Target); err != nil {
 		return op, false, err
 	}
-	for _, target := range Targets(plan) {
+	for _, target := range lockedTargets {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO operation_targets(operation_id,target) VALUES(?,?)`, op.ID, target); err != nil {
 			return op, false, err
 		}
@@ -1050,11 +1141,11 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 	if err = put(ctx, tx, "operations", op.ID, op); err != nil {
 		return op, false, err
 	}
-	changes, err := json.Marshal(plan.Prepared.Changes)
+	changes, err := json.Marshal(acceptedChanges)
 	if err != nil {
 		return op, false, err
 	}
-	if plan.Prepared.Changes == nil {
+	if acceptedChanges == nil {
 		changes = []byte("[]")
 	}
 	// The ledger is written in the same transaction as the claim, locks,
@@ -1140,6 +1231,15 @@ func (s *Store) updateOperationTx(ctx context.Context, tx *sql.Tx, op model.Oper
 	if current, err = decodeOperation(currentBytes); err != nil {
 		return err
 	}
+	// Mutation receipts are append-only proof. A checkpoint, finish or recovery
+	// update may extend the persisted prefix but can never drop, reorder or
+	// rewrite an earlier receipt.
+	if err := validateOperationMutationReceiptsForTarget(op); err != nil {
+		return ErrConflict
+	}
+	if !mutationReceiptPrefix(current.MutationReceipts, op.MutationReceipts) {
+		return ErrConflict
+	}
 	// Only real lifecycle transitions are accepted. In particular a fresh
 	// queued operation cannot be reported succeeded without an applying
 	// checkpoint, while shutdown (queued->failed) and crash recovery
@@ -1191,14 +1291,17 @@ func (s *Store) updateOperationTx(ctx context.Context, tx *sql.Tx, op model.Oper
 	audit.OperationID = op.ID
 	audit.Time = op.UpdatedAt
 	audit.Reason = acceptedReason
-	audit.Changes = changes
+	// Acceptance changes stay immutable. Receipt proof is appended to visible
+	// audit descriptions only, so audit pruning or plan expiry cannot remove the
+	// durable operation receipts.
+	audit.Changes = append(append([]model.Change(nil), changes...), mutationReceiptChanges(op.MutationReceipts)...)
 	if reconcile != nil {
 		// The reconciliation is a distinct, operator-attributed audit row. The
 		// accepted actor, display and reason stay exactly as they were
 		// accepted; the offline operator and the reconciliation reason are
 		// appended as a reviewed change of their own.
 		audit.Result = reconcile.Result
-		audit.Changes = append(append([]model.Change(nil), changes...), model.Change{
+		audit.Changes = append(audit.Changes, model.Change{
 			Field:  "Offline reconciliation",
 			Before: "accepted by " + op.Actor + " with reason: " + acceptedReason,
 			After:  "reconciled by " + reconcile.Operator + ": " + reconcile.Reason,

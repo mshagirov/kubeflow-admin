@@ -78,6 +78,9 @@ func (s *Service) storageQuota(ctx context.Context, ns string, size resource.Qua
 	if err != nil {
 		return safe(err)
 	}
+	if qs.GetContinue() != "" {
+		return errors.New("resource quota list is incomplete; storage headroom cannot be verified")
+	}
 	for _, q := range qs.Items {
 		for key, hard := range q.Status.Hard {
 			var delta resource.Quantity
@@ -181,6 +184,12 @@ func (s *Service) prepareStorage(ctx context.Context, a model.Action, w *work) e
 		if c.ReclaimPolicy != nil {
 			w.prepared.Warnings = append(w.prepared.Warnings, "StorageClass reclaim policy: "+string(*c.ReclaimPolicy))
 		}
+		if err := s.attachPodDefault(ctx, a, w); err != nil {
+			return err
+		}
+		if w.podDefault != nil && w.delayed {
+			w.prepared.Warnings = append(w.prepared.Warnings, "WaitForFirstConsumer: the optional PodDefault may be created after the PVC object while the claim is still Pending. PodDefault acceptance is not storage provisioning or binding readiness.")
+		}
 		return nil
 	}
 	if !s.Config.Features.StaticStorage {
@@ -211,6 +220,8 @@ func (s *Service) prepareStorage(ctx context.Context, a model.Action, w *work) e
 		w.prepared.ResourceVersion = v.ResourceVersion
 		w.ev.Target = digest(v.Spec)
 		w.ops = []patchOp{{"add", "/spec/claimRef", map[string]any{"apiVersion": "v1", "kind": "PersistentVolumeClaim", "name": a.Name, "namespace": a.Namespace}}}
+		// Legacy reserve-and-claim keeps its existing shape: no PodDefault
+		// substep is accepted here.
 		return nil
 	}
 	if a.Kind != "storage.create.static" {
@@ -291,29 +302,29 @@ func (s *Service) prepareStorage(ctx context.Context, a model.Action, w *work) e
 	if err != nil {
 		return safe(err)
 	}
-	for _, other := range all.Items {
-		if sameBackend(v, &other) {
+	if all.GetContinue() != "" {
+		return errors.New("PersistentVolume list is incomplete; backend uniqueness cannot be verified")
+	}
+	for i := range all.Items {
+		overlap, err := sameBackendChecked(v, &all.Items[i])
+		if err != nil {
+			return err
+		}
+		if overlap {
 			return errors.New("backing storage is already represented by a PV")
 		}
 	}
 	w.ev.add("PersistentVolumeList", "", "", all.Items)
 	w.pv = v
 	w.prepared.Warnings = append(w.prepared.Warnings, "Registers existing storage only; does not create directories, set permissions, allocate backend space, or move files.")
+	// Legacy combined static creation keeps its existing shape: no PodDefault
+	// substep is accepted here.
 	return nil
 }
 func pathWithin(base, candidate string) bool {
 	base = path.Clean(base)
 	candidate = path.Clean(candidate)
 	return base == candidate || base == "/" && path.IsAbs(candidate) || strings.HasPrefix(candidate, strings.TrimSuffix(base, "/")+"/")
-}
-func sameBackend(a, b *corev1.PersistentVolume) bool {
-	if a.Spec.NFS != nil && b.Spec.NFS != nil {
-		return a.Spec.NFS.Server == b.Spec.NFS.Server && (pathWithin(a.Spec.NFS.Path, b.Spec.NFS.Path) || pathWithin(b.Spec.NFS.Path, a.Spec.NFS.Path))
-	}
-	if a.Spec.CSI != nil && b.Spec.CSI != nil {
-		return a.Spec.CSI.Driver == b.Spec.CSI.Driver && a.Spec.CSI.VolumeHandle == b.Spec.CSI.VolumeHandle
-	}
-	return false
 }
 func (s *Service) approvedExistingVolume(v *corev1.PersistentVolume) error {
 	if v.Spec.NFS != nil {
@@ -359,6 +370,9 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		if err := checkpoint(cp, "expand-pvc"); err != nil {
 			return err
 		}
+		if err := s.checkEvidence(ctx, a.Namespace, w.ev); err != nil {
+			return err
+		}
 		if err := s.revalidateClass(ctx, *w.pvc.Spec.StorageClassName, w); err != nil {
 			return err
 		}
@@ -384,6 +398,9 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		// coordination, not an invented atomic list+create. We deliberately relist
 		// and compare backend identity instead of the recorded PersistentVolumeList
 		// digest, which our own create would always invalidate.
+		if err := s.checkEvidence(ctx, a.Namespace, w.ev); err != nil {
+			return err
+		}
 		if err := s.revalidateClass(ctx, a.StorageClass, w); err != nil {
 			return err
 		}
@@ -394,11 +411,20 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		if err != nil {
 			return safe(err)
 		}
+		if v == nil || v.UID == "" {
+			return errors.New("created PersistentVolume identity was not observed")
+		}
+		if err := recordMutationReceipt(ctx, mutationKindPersistentVolume, "", v.Name, v.UID, v.ResourceVersion, model.MutationOutcomeCreated); err != nil {
+			return err
+		}
 		reserved = v
 	}
 	if a.Kind == "pv.reserve-and-claim" {
 		b, _ := json.Marshal(conditional(string(w.pv.UID), w.pv.ResourceVersion, w.ops))
 		if err := checkpoint(cp, "reserve-pv"); err != nil {
+			return err
+		}
+		if err := s.checkEvidence(ctx, a.Namespace, w.ev); err != nil {
 			return err
 		}
 		if err := s.revalidateClass(ctx, a.StorageClass, w); err != nil {
@@ -408,9 +434,24 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		if err != nil {
 			return safe(err)
 		}
+		if v == nil || v.UID == "" {
+			return errors.New("reserved PersistentVolume identity was not observed")
+		}
+		if err := recordMutationReceipt(ctx, mutationKindPersistentVolume, "", v.Name, v.UID, v.ResourceVersion, model.MutationOutcomeReserved); err != nil {
+			return err
+		}
 		reserved = v
 	}
 	if reserved != nil {
+		receipt := "pv-reserved"
+		if static {
+			receipt = "static-pv-created"
+		}
+		// Completion receipt for the first write. It can only be written after
+		// the create/reservation request returned the reviewed object identity.
+		if err := checkpoint(cp, receipt); err != nil {
+			return err
+		}
 		// Post-write, pre-PVC validation. Policy dependencies are rechecked, the
 		// object we just wrote is re-read and compared to the reviewed plan, and
 		// (for a newly created PV) the backend overlap relist excludes our own PV.
@@ -434,7 +475,17 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 	if err != nil {
 		return safe(err)
 	}
-	return s.wait(ctx, func() (bool, error) {
+	if p == nil || p.UID == "" {
+		return errors.New("created PersistentVolumeClaim identity was not observed")
+	}
+	if err := recordMutationReceipt(ctx, mutationKindPersistentVolumeClaim, p.Namespace, p.Name, p.UID, p.ResourceVersion, model.MutationOutcomeCreated); err != nil {
+		return err
+	}
+	if err := checkpoint(cp, "pvc-object-created"); err != nil {
+		return err
+	}
+	var observedPVC *corev1.PersistentVolumeClaim
+	if err := s.wait(ctx, func() (bool, error) {
 		cur, err := s.Typed.CoreV1().PersistentVolumeClaims(a.Namespace).Get(ctx, a.Name, metav1.GetOptions{})
 		if err != nil {
 			return false, safe(err)
@@ -443,6 +494,7 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 			return false, ErrConflict
 		}
 		if w.delayed && cur.Status.Phase == corev1.ClaimPending {
+			observedPVC = cur
 			return true, nil
 		}
 		if cur.Status.Phase != corev1.ClaimBound || cur.Spec.VolumeName == "" {
@@ -459,8 +511,49 @@ func (s *Service) executeStorageOrProfile(ctx context.Context, w *work, cp func(
 		if r == nil || r.UID != cur.UID || r.Namespace != cur.Namespace || r.Name != cur.Name {
 			return false, errors.New("PVC/PV binding identity mismatch")
 		}
-		return v.Status.Phase == corev1.VolumeBound, nil
-	})
+		if v.Status.Phase != corev1.VolumeBound {
+			return false, nil
+		}
+		observedPVC = cur
+		return true, nil
+	}); err != nil {
+		return err
+	}
+	if observedPVC != nil && observedPVC.Status.Phase == corev1.ClaimBound {
+		if err := recordMutationReceipt(ctx, mutationKindPersistentVolumeClaim, observedPVC.Namespace, observedPVC.Name, observedPVC.UID, observedPVC.ResourceVersion, model.MutationOutcomeBound); err != nil {
+			return err
+		}
+	}
+	if err := checkpoint(cp, "pvc-verified"); err != nil {
+		return err
+	}
+	if w.podDefault == nil {
+		return nil
+	}
+	step := "create-poddefault"
+	if w.podDefault.overwrite {
+		step = "overwrite-poddefault"
+	}
+	if err := checkpoint(cp, step); err != nil {
+		return err
+	}
+	if err := s.checkEvidence(ctx, a.Namespace, w.ev); err != nil {
+		return err
+	}
+	if err := s.revalidatePodDefaultBeforeWrite(ctx, w.podDefault, p); err != nil {
+		return err
+	}
+	if err := s.writePodDefault(ctx, w.podDefault, p); err != nil {
+		return err
+	}
+	if err := s.verifyPodDefault(ctx, w.podDefault); err != nil {
+		return err
+	}
+	completed := "poddefault-created"
+	if w.podDefault.overwrite {
+		completed = "poddefault-overwritten"
+	}
+	return checkpoint(cp, completed)
 }
 
 // waitForPVCExpansion waits until the claim's status capacity reaches the
@@ -571,12 +664,19 @@ func (s *Service) assertNoOverlap(ctx context.Context, planned *corev1.Persisten
 	if err != nil {
 		return safe(err)
 	}
+	if all.GetContinue() != "" {
+		return errors.New("PersistentVolume list is incomplete; backend uniqueness cannot be verified")
+	}
 	for i := range all.Items {
 		other := &all.Items[i]
 		if other.Name == own {
 			continue
 		}
-		if sameBackend(planned, other) {
+		overlap, err := sameBackendChecked(planned, other)
+		if err != nil {
+			return err
+		}
+		if overlap {
 			return errors.New("backing storage is already represented by a PV")
 		}
 	}
@@ -625,10 +725,11 @@ func pvMatchesPlan(actual, planned *corev1.PersistentVolume) bool {
 // assertNoOverlap/verifyReservedPV cover backend uniqueness and exact PV
 // identity for a newly created or reserved PV.
 func (s *Service) prePVCValidation(ctx context.Context, a model.Action, w *work, reserved *corev1.PersistentVolume, static bool) error {
-	if reserved != nil {
-		if err := s.checkEvidence(ctx, a.Namespace, w.ev); err != nil {
-			return err
-		}
+	// Dynamic PVC creation has no reserved PV, but its Profile/namespace/quota/
+	// LimitRange evidence must still be fresh after the checkpoint and before
+	// the claim write.
+	if err := s.checkEvidence(ctx, a.Namespace, w.ev); err != nil {
+		return err
 	}
 	if err := s.revalidateClass(ctx, a.StorageClass, w); err != nil {
 		return err

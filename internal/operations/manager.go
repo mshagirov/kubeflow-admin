@@ -43,6 +43,10 @@ type Manager struct {
 
 	cleanupMu       sync.Mutex
 	lastPlanCleanup time.Time
+
+	// persistReceipt is an internal test seam for exercising a receipt
+	// checkpoint failure. Production always uses the Store.
+	persistReceipt func(context.Context, model.Operation, model.Audit) error
 }
 
 // historyCleanupInterval is frequent enough to keep logical history bounded but
@@ -381,7 +385,14 @@ func (m *Manager) run(t task) bool {
 			}
 		}
 	}()
+	var opMu sync.Mutex
+	var receiptFailure error
 	checkpoint := func(step string) error {
+		opMu.Lock()
+		defer opMu.Unlock()
+		if receiptFailure != nil {
+			return errors.New("mutation receipt was not durably recorded; refusing the next checkpoint")
+		}
 		if ctx.Err() != nil {
 			return context.Cause(ctx)
 		}
@@ -415,10 +426,36 @@ func (m *Manager) run(t task) bool {
 	}
 	err := checkpoint("validating")
 	if err == nil {
-		err = m.k.Execute(ctx, t.plan.Prepared, checkpoint)
+		execCtx := model.WithMutationReceiptRecorder(ctx, func(receipt model.MutationReceipt) error {
+			opMu.Lock()
+			defer opMu.Unlock()
+			if err := m.recordMutationReceipt(&op, t.plan.Prepared.Action, receipt); err != nil {
+				receiptFailure = err
+				// Cancel the execution context as well as refusing checkpoints:
+				// even an erroneous continuation must not issue another request.
+				cancel(err)
+				return err
+			}
+			return nil
+		})
+		err = m.k.Execute(execCtx, t.plan.Prepared, checkpoint)
 	} else {
 		// No backend execution or cluster write has started.
 		err = errors.Join(model.ErrRejectedBeforeMutation, err)
+	}
+	opMu.Lock()
+	failedReceipt := receiptFailure
+	receiptProof := len(op.MutationReceipts) > 0
+	opMu.Unlock()
+	if failedReceipt != nil && (err == nil || errors.Is(err, model.ErrRejectedBeforeMutation)) {
+		// A failed receipt checkpoint means no next write may be authorized. It
+		// also cannot be reported as a clean pre-mutation rejection.
+		err = failedReceipt
+	} else if receiptProof && errors.Is(err, model.ErrRejectedBeforeMutation) {
+		// A receipt is recorded only after a real write. A present receipt proof
+		// can never coexist with a clean pre-mutation rejection. Merely reaching
+		// a checkpoint (including the initial validating one) is not proof.
+		err = errors.New("backend reported a pre-mutation rejection after a durable mutation receipt")
 	}
 	// A backend that returns nil after cancellation cannot report success.
 	if err == nil && ctx.Err() != nil {
@@ -499,10 +536,14 @@ const profileDeleteReviewGuidance = "The Profile deletion may already have been 
 // Restricted storage actions need guidance naming the reviewed storage
 // object and possible edit/deletion effects, separate from Profile cascades.
 const (
-	pvDeleteKind  = "pv.delete"
-	pvcDeleteKind = "pvc.delete"
-	pvEditKind    = "pv.edit"
-	pvcEditKind   = "pvc.edit"
+	pvDeleteKind            = "pv.delete"
+	pvcDeleteKind           = "pvc.delete"
+	pvEditKind              = "pv.edit"
+	pvcEditKind             = "pvc.edit"
+	pvCreateStaticKind      = "pv.create.static"
+	pvcCreateBoundKind      = "pvc.create.bound"
+	pvcCreateDynamicKind    = "pvc.create.dynamic"
+	storageCreateStaticKind = "storage.create.static"
 )
 
 // storageDeleteReviewGuidance is the uncertain-outcome guidance for the typed
@@ -514,15 +555,49 @@ const storageDeleteReviewGuidance = "The storage deletion may already have been 
 // resize, even though the operation did not observe a durable outcome.
 const storageEditReviewGuidance = "The storage edit may already have been applied. Inspect the reviewed PersistentVolume or PersistentVolumeClaim UID and the accepted before/after changes, not a replacement object under the same name. A PersistentVolume reclaim policy may now be Delete, allowing backing data to be destroyed on a later claim release or volume deletion. A PersistentVolumeClaim resize may still be pending in the CSI controller or filesystem. Do not retry, force cleanup, shrink storage, remove finalizers or delete a replacement object. The storage target remains locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
 
+// A standalone static PV registration may have created the volume but failed
+// before observing its identity or availability.
+const pvCreateStaticReviewGuidance = "The static PersistentVolume creation may already have been accepted. Inspect the exact reviewed PersistentVolume name and its observed UID, spec, reclaim policy, claimRef and availability, and check whether another PersistentVolume already represents the same backing storage. Do not retry the creation, do not adopt or delete a replacement volume and do not remove finalizers. The PersistentVolume name remains locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
+
+// A bound claim and its optional dedicated PodDefault are separate writes. The
+// claim is never deleted as a rollback when the PodDefault step is unfinished.
+const pvcCreateBoundReviewGuidance = "The bound PersistentVolumeClaim creation and its optional PodDefault may be partially applied. Inspect the exact reviewed PersistentVolumeClaim and selected PersistentVolume UIDs and their binding, then inspect any reviewed PodDefault by its exact reviewed name and observed UID/spec. A failed PodDefault step does not roll back the claim. Do not delete the claim as rollback and do not recreate or overwrite a PodDefault automatically. Do not retry. The claim, the selected volume and any reviewed PodDefault remain locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
+
+// Dynamic PVC creation may also carry the optional dedicated PodDefault.
+const pvcCreateDynamicReviewGuidance = "The PersistentVolumeClaim creation and its optional PodDefault may be partially applied. Inspect the exact reviewed PersistentVolumeClaim UID and its observed provisioning state, then inspect any reviewed PodDefault by its exact reviewed name and observed UID/spec. Pending does not prove provisioning or mount readiness. Do not delete the claim as rollback and do not recreate or overwrite a PodDefault automatically. Do not retry. The claim and any reviewed PodDefault remain locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
+
+// The legacy combined static action creates a PV and then a reserved claim. A
+// failure between them leaves a partial pair that only an operator may repair.
+const storageCreateStaticReviewGuidance = "The combined static storage creation may be partially applied: the PersistentVolume may exist without its claim or with a reserved claimRef. Inspect the exact reviewed PersistentVolume and PersistentVolumeClaim names, UIDs and binding, and check for backend overlap. Do not retry, adopt or delete a replacement object and do not remove claim references or finalizers. The reviewed targets remain locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
+
+// A PVC cleanup deletes reviewed PodDefaults before the claim. PodDefaults may
+// already be gone while the claim deletion is unresolved.
+const pvcDeleteReviewGuidance = "The PVC deletion and any reviewed PodDefault cleanup may be partially applied. PodDefaults may already be gone while the claim still exists, or the claim may already be gone. Inspect the exact reviewed PersistentVolumeClaim, its bound PersistentVolume and each reviewed PodDefault by name and observed UID. Do not recreate PodDefaults automatically. Do not retry, do not delete a replacement object and do not remove finalizers or force cleanup. The namespace fence remains locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
+
 // recoveryGuidance is the startup guidance for an operation whose durable
 // outcome is unknown. A restart never resumes or replays any action. The typed
 // storage actions get guidance that names the object and possible effects.
 func recoveryGuidance(action string) string {
-	if action == pvDeleteKind || action == pvcDeleteKind {
-		return "Application restarted before a durable outcome. A storage deletion may already have been accepted. Inspect the exact PersistentVolume or PersistentVolumeClaim UID, any replacement object, its references and finalizers; no action was replayed and nothing will be resumed automatically."
+	if action == pvDeleteKind {
+		return "Application restarted before a durable outcome. A storage deletion may already have been accepted. Inspect the exact PersistentVolume UID, any replacement object, its references and finalizers; no action was replayed and nothing will be resumed automatically."
+	}
+	if action == pvcDeleteKind {
+		return "Application restarted before a durable outcome; no action was replayed and nothing will be resumed automatically. " + pvcDeleteReviewGuidance
 	}
 	if action == pvEditKind || action == pvcEditKind {
 		return "Application restarted before a durable outcome; no action was replayed and nothing will be resumed automatically. " + storageEditReviewGuidance
+	}
+	if action == pvCreateStaticKind {
+		return "Application restarted before a durable outcome; no action was replayed and nothing will be resumed automatically. " + pvCreateStaticReviewGuidance
+	}
+	if action == pvcCreateBoundKind {
+		return "Application restarted before a durable outcome; no action was replayed and nothing will be resumed automatically. " + pvcCreateBoundReviewGuidance
+	}
+	if action == pvcCreateDynamicKind {
+		return "Application restarted before a durable outcome; no action was replayed and nothing will be resumed automatically. " + pvcCreateDynamicReviewGuidance
+	}
+	if action == storageCreateStaticKind {
+		return "Application restarted before a durable outcome; no action was replayed and nothing will be resumed automatically. " + storageCreateStaticReviewGuidance
 	}
 	return "Application restarted before a durable outcome. Inspect actual cluster state; no action was replayed."
 }
@@ -534,10 +609,20 @@ func reviewGuidance(action string) string {
 	switch action {
 	case profileDeleteKind:
 		return profileDeleteReviewGuidance
-	case pvDeleteKind, pvcDeleteKind:
+	case pvDeleteKind:
 		return storageDeleteReviewGuidance
+	case pvcDeleteKind:
+		return pvcDeleteReviewGuidance
 	case pvEditKind, pvcEditKind:
 		return storageEditReviewGuidance
+	case pvCreateStaticKind:
+		return pvCreateStaticReviewGuidance
+	case pvcCreateBoundKind:
+		return pvcCreateBoundReviewGuidance
+	case pvcCreateDynamicKind:
+		return pvcCreateDynamicReviewGuidance
+	case storageCreateStaticKind:
+		return storageCreateStaticReviewGuidance
 	}
 	return genericReviewGuidance
 }

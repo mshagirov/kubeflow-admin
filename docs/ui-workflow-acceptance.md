@@ -27,7 +27,8 @@ gated workflows.
 
 Item identifiers are stable and unique per section: `PC` profile create,
 `PU` profile update, `PD` delete, `VC` PVC create, `VE` PVC expansion,
-`VS` static PV, `VR` PV reservation, `NB` notebook start, `NP` notebook stop,
+`VS` legacy static pair, `VR` PV reservation, `VP` separate registration/binding,
+`NB` notebook start, `NP` notebook stop,
 `NR` notebook resource edit, `NM` notebook mount edit, `PR` pod restart,
 `NC` node cordon, `SY` storage editing, `SD` storage deletion, `UI` console
 surfaces, `MR` refusal matrix, `HY` hygiene.
@@ -148,6 +149,7 @@ no overlay is stacked on top of another by accident.
 - [ ] **G10** The **Profile-deletion grant** includes only `kubeflow.org/profiles` `delete`: no namespace, PV, PVC or Pod delete, and no finalizer update or patch. Narrow it with `resourceNames` on the ClusterRole for the disposable pilot Profile. This restricts the name, not fields or the namespace cascade; admission policy and namespace protection remain necessary. Storage permissions, if separately enabled, are independent grants.
 - [ ] **G11** Restricted storage editing requires writes, `features.storageEditing` and the separately reviewed `deploy/overlays/storage-editing/rbac.yaml` patch grant. PVC request growth additionally requires `features.pvcExpansion` and compatible storage; label-only edits do not require expansion.
 - [ ] **G12** Unused-only storage deletion requires writes, `features.storageDeletion` and the independently reviewed `deploy/overlays/storage-deletion/rbac.yaml` delete grant. These are not enabled by Profile-deletion RBAC, static-storage RBAC or a broad feature bundle.
+- [ ] **G13** Optional PodDefault creation/overwrite and related-PVC cleanup require writes, `features.podDefaults` and the separate `deploy/overlays/poddefaults/rbac.yaml` grant. Prefer a namespace-scoped equivalent for a pilot. Base get/list access detects references even when mutation is disabled. Verify the installed namespaced API and webhook contract independently; discovery denial is not API absence.
 
 ### 1.5 Notebook controller contract (independent verification)
 
@@ -247,10 +249,10 @@ record an independently verified outcome without writing to Kubernetes; see
 - [ ] **VE5** Success requires the claim to report capacity at least as large as requested, with no active Resizing/FileSystemResizePending condition. Still independently verify mounted filesystem size, backend capacity, data and quota accounting with the storage operator.
 - [ ] **VE6** Expansion cannot be undone; there is no shrink path in this release.
 
-### 2.6 Static PV from an approved template (NFS / CSI)
+### 2.6 Legacy combined static pair from an approved template (NFS / CSI)
 
 - [ ] **VS1** Requires the static-storage gate (G3). The backend must already be **prepared** by the storage operator: a distinct NFS export/directory with reviewed ACLs and mount options, or a distinct CSI volume with an exact reviewed handle. The console creates no directories and sets no permissions.
-- [ ] **VS2** The browser cannot supply a server, path, driver, volume handle or arbitrary driver attributes. The template only selects a **pre-approved** backend. Attempting to type a handle is not possible.
+- [ ] **VS2** In this legacy combined workflow, the browser cannot replace the server, driver, fixed CSI handle or arbitrary driver attributes. NFS accepts only the relative subdirectory described below. The separate registration workflow in 2.7a has different, bounded path inputs.
 - [ ] **VS3** For NFS templates, the relative subdirectory must be a canonical, non-empty relative path strictly **beneath** the approved base path. `..`, absolute paths, `.` and non-canonical paths are refused.
 - [ ] **VS4** For CSI templates, no subdirectory is accepted and the driver must match the class provisioner.
 - [ ] **VS5** The template's class and access modes must match the ones you selected; mismatches are refused.
@@ -264,6 +266,29 @@ record an independently verified outcome without writing to Kubernetes; see
 - [ ] **VR2** The PV must match the claim's class, capacity and access modes, and must be one of the approved NFS/CSI backends.
 - [ ] **VR3** The operation reserves the PV by setting the claim reference and creating the claim. It does not modify the PV's backend, capacity, class or access modes, and it does not repair a mismatched PV.
 - [ ] **VR4** Verify the reservation took effect and the claim is bound to exactly the intended PV.
+
+### 2.7a Separate template-driven registration and binding
+
+These checks require configured `storage.registrationTemplates`, the static-storage
+gate/grant, and a distinct operator-prepared disposable backend. Do not reuse a
+valuable existing directory. See [storage configuration](storage.md).
+
+Boundary probes: joined BeeGFS handles must fit 128 bytes; new/overwritten
+PodDefault request names must fit 52 bytes. Existing related PodDefaults with
+valid Kubernetes names up to 253 characters must still be included in cleanup
+review, not hidden or rejected by the creation-name policy.
+
+- [ ] **VP1** Create an NFS PV with a new administrator-supplied name and full absolute path. The configured approved root itself or a descendant is accepted; escape, traversal, duplicate/overlapping registration and unapproved class are refused. Capacity, access modes, server, mount options and Retain policy are read-only template values.
+- [ ] **VP2** Create a BeeGFS PV using the fixed template prefix, including `/home`, plus only the administrator's relative suffix. Refuse URL/authority replacement, traversal, encodings and noncanonical paths. Verify the exact registered handle independently; do not expose it in a public evidence bundle.
+- [ ] **VP3** Each standalone PV is unclaimed: no implicit PVC or claimRef. After refresh it becomes selectable only when Available and compatible. Verify independently; API success does not prove a mount works.
+- [ ] **VP4** Create a new PVC in an eligible Profile namespace, selecting an approved class/template and the exact compatible PV. PV identity/version changes, reservations, wrong class/mode or insufficient capacity refuse binding. The PVC request/access modes are template-controlled and independent of PV capacity; exercise 2400Gi/10Gi NFS and 500Gi/10Gi BeeGFS examples if approved for the pilot.
+- [ ] **VP5** NFS UID/GID are required nonzero decimal values and appear only as the two approved annotations. Verify actual filesystem permissions separately: these annotations do not chown static directories or enforce quotas.
+- [ ] **VP6** With Create PodDefault off, create no PodDefault. With the separate PodDefaults gate/grant enabled, review its suggested name/mount path and independent selector, same namespace and exact new PVC reference. No standalone PodDefault management control or arbitrary spec editor exists.
+- [ ] **VP7** An existing PodDefault name requires a warning, reviewed before/after change summary and explicit overwrite acknowledgement. A concurrent edit/replacement refuses the guarded patch. Confirm overwritten objects are dedicated to the new PVC; unrelated settings removed by the overwrite must be called out without revealing sensitive values.
+- [ ] **VP8** Opt into the generated configuration only on an approved disposable Notebook/new Pod through the normal workflow. Verify admission and actual mount access independently. Existing Pods remain unchanged; CRD presence and PodDefault creation alone do not prove webhook operation.
+- [ ] **VP9** PVC deletion is refused before PodDefault cleanup while any Pod or Notebook template, including a stopped Notebook, references the claim. Once unused, preview and explicitly confirm every related PodDefault deletion and the PVC deletion. Shared/external-management warnings permit confirmed removal but other PVCs remain untouched. Test this only on wholly disposable resources.
+- [ ] **VP10** Discovery denial/failure, malformed or incomplete dependencies, a changed/replaced object, an unreviewed new reference or more than 32 related PodDefaults fails closed. Do not interpret missing permission as no references. With PodDefault mutation disabled, related references still prevent unsafe PVC deletion.
+- [ ] **VP11** Controlled partial-failure tests report actual completed substeps, preserve the PVC if PodDefault creation fails, and never recreate PodDefaults when later cleanup fails. Ambiguous outcomes retain needs-review evidence/locks; no automatic replay, force or finalizer removal. Verify Retain backing data separately after cleanup.
 
 ### 2.8 Notebook start
 
@@ -322,7 +347,7 @@ record an independently verified outcome without writing to Kubernetes; see
 - [ ] **UI3** **Namespace drilldown.** The namespace links from a profile summary set the namespace context (and the `?namespace=` URL parameter). Every scoped page then filters to that namespace, while genuinely cluster-scoped pages (Profiles, Namespaces, Nodes) keep showing all rows.
 - [ ] **UI4** **Clearing filters.** After applying search, namespace or resource drilldown, use **Clear filters**. It must remove search/resource focus and namespace scope, reset pagination and restore the default rows/count. Back/forward and refresh must not retain an invisible exact-resource restriction.
 - [ ] **UI5** **Pagination and search scope.** Search applies to all loaded rows before pagination (50 rows per page by default), not only the visible page. History's loaded window is bounded and is not a full export.
-- [ ] **UI6** **Safe details only.** No drawer, plan preview, history row or notification may reveal: Secret values, the OIDC client secret, kubeconfig paths, the database path, environment values of running Pods, full Pod/Notebook manifests, CSI volume handles or driver attributes, NFS server addresses and export paths, or session tokens. The storage surface exposes template **names** and classes only.
+- [ ] **UI6** **Safe details only.** No drawer, plan preview, history row or notification may reveal Secret values, the OIDC client secret, kubeconfig paths, the database path, environment values of running Pods, full manifests, session tokens, or arbitrary existing PV backend sources/driver attributes. The gated registration form may show approved non-secret template server/options/prefix and administrator-entered paths as required for review. Durable audit/acceptance summaries must redact full paths/handles; keep private execution evidence and all pilot screenshots out of the public repository.
 - [ ] **UI7** **Resource names and Notebook-only listing.** The Notebooks table lists only Kubeflow Notebook custom resources, not Pods or StatefulSets. Notebook, Pod and Node names open Resource Details, with no separate Details button on those pages. Storage names continue opening their details. Each drawer must identify the exact kind, namespace and name, including when names collide.
 - [ ] **UI8** **Manage the selected Notebook.** From a Notebook's Resource Details, choose **Manage Notebook**. Its management drawer must select that exact namespace and Notebook and the known container when unambiguous. Blank edit fields preserve the existing resource/image configuration; mounts are preserved unless replacement is explicitly selected. The inventory does not supply full editable container or mount configuration, so blank fields must not be mistaken for the actual deployed values. Changing the Notebook/namespace/container must clear another target's typed edits, mounts and restart flags. Check disabled write/controller gates, UID-change refusal and visible focus restoration. This app manages existing Notebooks; create the disposable pilot Notebook through the normal Kubeflow workflow first.
 - [ ] **UI10** **Fail-safe surfaces.** Policy explanations identify disabled writes, Notebook controller contract, Pod restarts and Node cordon. Profile Delete is offered only with writes and its deletion gate; PV/PVC Edit/Delete stay visible but disabled with an explanation when gated off. APIs independently refuse gated actions. At 390 px and 1280 px, pages do not overflow horizontally; smaller-view tables scroll within their own region. The Nodes table itself fits its wide-screen container.
@@ -347,7 +372,8 @@ record an independently verified outcome without writing to Kubernetes; see
 | Removing a quota key | Removal is unsupported; existing keys must be resubmitted |
 | Transferring Profile ownership, migrating an owner, or a custom owner controller | Ownership is immutable in the installed Profile controller; `profile.update` edits quotas only and refuses an owner change as an unsupported contract |
 | Editing a Notebook's non-container fields (volumes other than PVC mounts, service account, security context, init containers) | Only the listed container fields and PVC mounts are editable |
-| Displaying credentials, secrets, kubeconfig, environment values, full manifests, NFS/CSI backend details | Not rendered anywhere, by design |
+| Displaying credentials, secrets, kubeconfig, environment values, full manifests or arbitrary existing PV backend details | Not rendered. Registration forms expose only approved non-secret template settings and administrator-entered paths, not arbitrary existing volume sources |
+| Standalone PodDefault management or arbitrary injected Pod settings | PodDefaults are created/explicitly overwritten only within PVC creation, and removed only within confirmed related-PVC cleanup |
 | Pipeline counts, live CPU/memory usage, real health probes | No KFP or metrics integration exists; nothing is inferred as zero |
 | Upstream LDAP/Dex password handling, user registration, group membership changes | The app authenticates administrators only and never manages identities |
 | Any mutation outside the configured namespace scope or against protected namespaces | Scope and protection are enforced server-side |
@@ -365,7 +391,7 @@ leave the console able to prepare a fresh, corrected plan.
 - [ ] **MR6** PVC create with a class outside the approved list → refused.
 - [ ] **MR7** PVC expand on an unbound, terminating, class-less, non-CSI or NFS-backed claim → refused.
 - [ ] **MR8** PVC expand to a smaller or equal size → refused.
-- [ ] **MR9** Static create with a template whose class/access modes do not match → refused; with an NFS path outside the approved base → refused; with a backend already represented by a PV → refused.
+- [ ] **MR9** Static create with a template whose class/access modes do not match → refused; new registration outside all approved NFS roots → refused (legacy remains strictly below its base); with a backend already represented by a PV → refused.
 - [ ] **MR10** PV reservation of a `Released`, `Bound`, topology-constrained or block-mode PV → refused.
 - [ ] **MR11** Notebook start/stop/edit against a namespace outside the configured scope or in a protected namespace → refused.
 - [ ] **MR12** Notebook edit with an image outside the approved list, or a GPU count without an approved preset → refused.
@@ -398,15 +424,16 @@ leave the console able to prepare a fresh, corrected plan.
 | Profile delete, gated and typed (PD1–PD12) | | | | |
 | PVC create (VC1–VC7) | | | | |
 | PVC expansion (VE1–VE6) | | | | |
-| Static PV from template (VS1–VS8) | | | | |
+| Legacy combined static pair (VS1–VS8) | | | | |
 | PV reservation (VR1–VR4) | | | | |
+| Separate registration/binding and PodDefaults (VP1–VP11) | | | | |
 | Notebook start (NB1–NB5) | | | | |
 | Notebook stop (NP1–NP4) | | | | |
 | Notebook edit — resources (NR1–NR7) | | | | |
 | Notebook edit — storage mounts (NM1–NM6) | | | | |
 | Pod restart (PR1–PR6) | | | | |
 | Node cordon / uncordon (NC1–NC4) | | | | |
-| Console surfaces, drilldown, filters, safe details (UI1–UI8) | | | | |
+| Console surfaces, drilldown, filters, safe details (UI1–UI15) | | | | |
 | Refusal matrix (MR1–MR19) | | | | |
 | Pilot cleanup plan (HY6) | | | | |
 

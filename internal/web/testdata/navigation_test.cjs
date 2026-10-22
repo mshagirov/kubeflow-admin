@@ -186,6 +186,7 @@ assert.equal(app.includes("document.write"), false);
 assert.equal(app.includes("eval("), false);
 assert.ok(style.includes("position:sticky") && style.includes("max-height:62vh"), "bounded sticky table viewport is required");
 assert.ok(style.includes(".drawer{position:fixed"), "right-side drawer styling is required");
+assert.ok(style.includes(".drawer-body{flex:1;overflow:auto;padding:16px 24px 24px"), "the right drawer keeps a distinct header-to-entry gap");
 assert.ok(style.includes("@media(max-width:800px)"), "small-screen layout is required");
 assert.ok(style.includes(".notification.warning") && style.includes(".notification.error"));
 assert.ok(style.includes(".notifications{position:fixed;bottom:18px") && style.includes("max-height:50vh"), "notices sit bottom-right with a bounded stack");
@@ -457,7 +458,29 @@ async function bootHarness(options = {}) {
       notebookControls.memoryLimit, notebookControls.gpuPreset, notebookControls.gpuCount, notebookControls.restart,
       notebookControls.reason];
   } });
-  forms[1].controls = [control("kind", "pvc.create"), control("namespace", "team-a"), control("name", "data")];
+  const storageSelect = (selector, value = "") => {
+    const select = get(selector); select.tagName = "SELECT"; select.name = selector.includes("[name=") ? selector.split('[name="')[1].split('"]')[0] : "kind";
+    select.value = value; select.options = [...select.options || []]; return select;
+  };
+  const storageKind = get("#storage-kind"); storageKind.tagName = "SELECT"; storageKind.name = "kind"; storageKind.value = "pvc.create";
+  const storageNamespace = get('#storage-form [name="namespace"]'); storageNamespace.tagName = "SELECT"; storageNamespace.name = "namespace"; storageNamespace.value = "team";
+  const storageName = get('#storage-form [name="name"]'); storageName.name = "name"; storageName.value = "data";
+  nodes.set("#storage-claim-name", storageName); nodes.set("#storage-pv-name", storageName);
+  const storageClassControl = get("#storage-class"); storageClassControl.tagName = "SELECT"; storageClassControl.name = "storageClass";
+  const storageTemplateControl = get("#storage-registration-template"); storageTemplateControl.tagName = "SELECT"; storageTemplateControl.name = "template"; storageTemplateControl.selectedOptions = [];
+  const boundPVControl = get("#bound-pv-selector"); boundPVControl.tagName = "SELECT"; boundPVControl.name = "pvName"; boundPVControl.selectedOptions = [];
+  const storageSize = get('#storage-form [name="size"]'); storageSize.name = "size"; storageSize.value = "20Gi";
+  const storageAccessMode = get('#storage-form [name="accessMode"]'); storageAccessMode.name = "accessMode"; storageAccessMode.value = "ReadWriteMany";
+  const storageReason = get('#storage-form [name="reason"]'); storageReason.name = "reason"; storageReason.value = "provision workspace storage";
+  const nfsPath = get("#storage-nfs-path"); nfsPath.name = "nfsPath";
+  const beeGFSPath = get("#storage-beegfs-path"); beeGFSPath.name = "beeGFSPath";
+  const directoryUID = get("#storage-directory-uid"); directoryUID.name = "directoryUID";
+  const directoryGID = get("#storage-directory-gid"); directoryGID.name = "directoryGID";
+  const pdEnable = get("#storage-pod-default-enable"); pdEnable.type = "checkbox"; pdEnable.checked = false;
+  const pdName = get("#storage-pod-default-name"); pdName.name = "podDefaultName";
+  const pdMount = get("#storage-pod-default-mount-path"); pdMount.name = "podDefaultMountPath";
+  const pdOverwrite = get("#storage-pod-default-overwrite"); pdOverwrite.type = "checkbox"; pdOverwrite.checked = false;
+  forms[1].controls = [storageKind, storageNamespace, storageName, storageClassControl, storageTemplateControl, boundPVControl, storageSize, storageAccessMode, storageReason, nfsPath, beeGFSPath, directoryUID, directoryGID, pdName, pdMount, pdOverwrite];
   forms[3].controls = [control("kind", "pod.restart"), control("namespace", "team-a"), control("name", "work-0"), control("reason", "Synthetic retry reason")];
   const nodeCordonForm = get("#node-cordon-form");
   nodeCordonForm.elements = { kind: new Element("input"), name: new Element("input"), reason: new Element("input"), force: new Element("input") };
@@ -493,7 +516,8 @@ async function bootHarness(options = {}) {
     if (!controlNode.value) controlNode.value = "";
   }
   const storageDeleteAck = get("#storage-delete-ack"); storageDeleteAck.type = "checkbox"; storageDeleteAck.checked = false;
-  forms[6].controls = [...Object.values(storageDeleteControls), storageDeleteAck];
+  const storageDeletePodDefaultAck = get("#storage-delete-pod-default-ack"); storageDeletePodDefaultAck.type = "checkbox"; storageDeletePodDefaultAck.checked = false;
+  forms[6].controls = [...Object.values(storageDeleteControls), storageDeleteAck, storageDeletePodDefaultAck];
   get("#storage-edit-drawer").append(forms[5]);
   get("#storage-delete-drawer").append(forms[6]);
   const openers = ["profile", "storage", "notebook"].map(kind => { const button = new Element("button"); button.dataset.openDrawer = kind; return button; });
@@ -541,7 +565,8 @@ async function bootHarness(options = {}) {
   const notebookWrites = options.notebookWrites !== false, podRestarts = options.podRestarts !== false, nodeCordon = options.nodeCordon !== false;
   const profileDeletion = options.profileDeletion !== false;
   const storageEditing = options.storageEditing !== false, storageDeletion = options.storageDeletion !== false;
-  for (const name of ["csrf-token", "notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "node-cordon", "profile-deletion", "storage-editing", "storage-deletion", "notification-scope"]) {
+  const podDefaults = options.podDefaults !== false;
+  for (const name of ["csrf-token", "notebook-writes", "static-storage", "pvc-expansion", "pod-restarts", "node-cordon", "profile-deletion", "storage-editing", "storage-deletion", "pod-defaults", "notification-scope"]) {
     get(`meta[name="${name}"]`).content = name === "csrf-token" ? "test-csrf"
       : name === "notebook-writes" ? String(notebookWrites)
       : name === "pod-restarts" ? String(podRestarts)
@@ -549,6 +574,7 @@ async function bootHarness(options = {}) {
       : name === "profile-deletion" ? String(profileDeletion)
       : name === "storage-editing" ? String(storageEditing)
       : name === "storage-deletion" ? String(storageDeletion)
+      : name === "pod-defaults" ? String(podDefaults)
       : name === "notification-scope" ? "random-test-scope" : "false";
   }
   get("#storage-kind").value = "pvc.create"; get("#notebook-kind").value = "notebook.start"; get("#profile-kind").value = "profile.create";
@@ -567,9 +593,14 @@ async function bootHarness(options = {}) {
     },
     addEventListener(name, handler) { (windowHandlers[name] || (windowHandlers[name] = [])).push(handler); }
   };
+  const defaultStorageTemplates = [
+    { name: "nfs-template", kind: "nfs", storageClass: "nfs-csi", pvCapacity: "2400Gi", pvAccessModes: ["ReadWriteMany"], pvcRequest: "10Gi", pvcAccessModes: ["ReadWriteMany"], reclaimPolicy: "Retain", volumeMode: "Filesystem", nfsServer: "nfs.example.test", nfsRoots: ["/exports/kubeflow"], nfsMountOptions: ["nfsvers=3"], requireDirectoryUIDGID: true, podDefaultName: "mount-toast", podDefaultMountPathPrefix: "/home/jovyan" },
+    { name: "beegfs-template", kind: "beegfs", storageClass: "beegfs-csi", pvCapacity: "500Gi", pvAccessModes: ["ReadWriteMany"], pvcRequest: "10Gi", pvcAccessModes: ["ReadWriteMany"], reclaimPolicy: "Retain", volumeMode: "Filesystem", beegfsDriver: "beegfs.csi.netapp.com", beegfsPrefix: "beegfs://beegfs.example.test/home", podDefaultName: "mount-hpc-home", podDefaultMountPathPrefix: "/home/jovyan" }
+  ];
   const inventory = {
     // Deliberately skewed server time proves the browser uses local receipt age.
     observedAt: options.observedAt || "2000-01-01T00:00:00Z",
+    storageTemplates: options.storageTemplates || defaultStorageTemplates,
     resources: options.resources || [
       { kind: "Profile", name: "team", uid: "uid-profile-team", state: "Active", owner: "alice@example.test",
         details: { apiVersion: "kubeflow.org/v1", ownerKind: "User", createdAt: "2026-01-01T00:00:00Z", resourceVersion: "7", configDigest: "sha256:teamdigest", "quota.requests.cpu": "4", "quota.requests.memory": "8Gi", "quota.example.com/gpu": "1" } },
@@ -591,6 +622,12 @@ async function bootHarness(options = {}) {
       { kind: "PersistentVolume", name: "data", uid: "uid-pv-data", state: "Bound", details: { requested: "10Gi", capacity: "10Gi", storageClass: "team-class", claim: "team/data", reclaimPolicy: "Retain" } },
       { kind: "StorageClass", name: "data", uid: "uid-sc-data", details: { provisioner: "example.test/nfs" } },
       { kind: "StorageClass", name: "team-class", uid: "uid-sc-team-class" },
+      { kind: "StorageClass", name: "nfs-csi", uid: "uid-sc-nfs-csi", details: { provisioner: "nfs.csi.k8s.io" } },
+      { kind: "StorageClass", name: "beegfs-csi", uid: "uid-sc-beegfs-csi", details: { provisioner: "beegfs.csi.netapp.com" } },
+      { kind: "PersistentVolume", name: "nfs-pv", uid: "uid-pv-nfs-pv", resourceVersion: "77", state: "Available", details: { capacity: "2400Gi", storageClass: "nfs-csi", reclaimPolicy: "Retain", volumeMode: "Filesystem", accessModes: "ReadWriteMany", resourceVersion: "77" } },
+      { kind: "PersistentVolume", name: "beegfs-pv", uid: "uid-pv-beegfs-pv", resourceVersion: "78", state: "Available", details: { capacity: "500Gi", storageClass: "beegfs-csi", reclaimPolicy: "Retain", volumeMode: "Filesystem", accessModes: "ReadWriteMany", resourceVersion: "78" } },
+      { kind: "PodDefault", name: "mount-toast", namespace: "team", uid: "uid-pd-team-toast", state: "Active", details: { claims: "data" } },
+      { kind: "PodDefault", name: "mount-toast", namespace: "other", uid: "uid-pd-other-toast", state: "Active", details: { claims: "data" } },
       { kind: "Event", name: "scheduled", namespace: "team", uid: "uid-event-scheduled", state: "Warning" },
       // A resource quota that shares the name of the event.
       { kind: "ResourceQuota", name: "scheduled", namespace: "team", uid: "uid-quota-scheduled", details: { "requests.cpu": "8" } },
@@ -816,6 +853,26 @@ async function bootHarness(options = {}) {
   for (const handler of details.listeners.toggle || []) handler();
   assert.ok(appTest.walk(details, node => String(node.className).includes("stage-table")).length === 1, "stage table builds on first toggle");
   assert.equal(appTest.walk(details, node => node.tagName === "TH").map(node => node.textContent).includes("Reason"), false, "identical group reasons are not repeated in stage details");
+
+  // Durable mutation receipts are a separate, safe list of actual writes.
+  const receiptTest = await bootHarness({ operations: [
+    { id: "operation-partial", actor: "https://issuer.example|raw", target: "pvc:team/partial", action: "pvc.create.bound", state: "needs-review", step: "create-pod-default", error: "Partial synthetic failure", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      mutationReceipts: [
+        { kind: "PersistentVolumeClaim", namespace: "team", name: "partial", uid: "uid-pvc-partial", resourceVersion: "88", outcome: "created" },
+        { kind: "PodDefault", namespace: "team", name: "mount-partial", uid: "uid-pd-partial", resourceVersion: "41", outcome: "deleted" },
+        { kind: "PersistentVolume", name: "hidden", uid: "uid-hidden", resourceVersion: "1", outcome: "invented", spec: { secret: "never-render" } }
+      ] }
+  ] });
+  await receiptTest.click("history");
+  const receiptContainer = receiptTest.get('[data-table="historyOperations"]');
+  const receiptText = receiptTest.textOf(receiptContainer);
+  assert.ok(receiptText.includes("2 recorded mutation receipts") || receiptText.includes("recorded mutation receipts"), "the receipt disclosure is not rendered");
+  assert.ok(receiptText.includes("Created") && receiptText.includes("Deleted") && receiptText.includes("uid-pvc-partial") && receiptText.includes("uid-pd-partial"), "actual receipt outcomes and UIDs are not shown");
+  assert.ok(receiptText.includes("needs-review") && receiptText.includes("known completed facts"), "the ambiguous current stage is not distinguished from the known receipts");
+  assert.ok(receiptText.includes("separately from planned changes"), "the receipts are not distinguished from planned changes");
+  assert.ok(receiptText.includes("verified observations") && receiptText.includes("do not prove mount or admission readiness"), "receipt facts must not imply mount or admission readiness");
+  assert.equal(receiptText.includes("never-render") || receiptText.includes("invented"), false, "unknown receipt outcomes or extra fields are rendered");
+  assert.deepEqual(logic.mutationReceipts({ mutationReceipts: [{ kind: "PodDefault", namespace: "team", name: "x", uid: "u", outcome: "deleted" }, { kind: "PodDefault", name: "y", outcome: "unknown" }] }).map(receipt => receipt.name), ["x"], "only approved receipt outcomes and safe identities are accepted");
 
   // Unsupported observed owners are disabled and explained.
   await appTest.click("pods");
@@ -1817,6 +1874,11 @@ async function bootHarness(options = {}) {
   assert.equal(storageDeleteTest.bodies.length, deleteBefore, "a padded confirmation never reaches the API");
   assert.ok(storageDeleteTest.error.textContent.includes("does not match"), "the exact confirmation is explained");
   storageDeleteTest.get("#storage-delete-confirm").value = "data";
+  const missingCleanupBefore = storageDeleteTest.bodies.length;
+  await storageDeleteTest.submitForm(6);
+  assert.equal(storageDeleteTest.bodies.length, missingCleanupBefore, "an observed related PodDefault needs the cleanup acknowledgement");
+  assert.ok(storageDeleteTest.error.textContent.includes("related PodDefaults"), "the missing cleanup acknowledgement is explained");
+  storageDeleteTest.get("#storage-delete-pod-default-ack").checked = true;
   await storageDeleteTest.submitForm(6);
   const storageDeleteBody = storageDeleteTest.bodies[storageDeleteTest.bodies.length - 1];
   assert.equal(storageDeleteBody.kind, "pvc.delete");
@@ -2550,6 +2612,242 @@ async function bootHarness(options = {}) {
   await digestUpdate.submitForm(0);
   const digestBody = digestUpdate.bodies[digestUpdate.bodies.length - 1];
   assert.equal(digestBody.baseConfigDigest, "sha256:teamdigest", "the update request still carries the precondition");
+
+
+  // ---- Template-driven PV/PVC provisioning payloads ------------------------
+  // The produced request, not only the rendered form, is asserted. The server
+  // remains authoritative, but a forged or stale browser value must never be
+  // able to silently change the typed action.
+  function chooseRegistrationTemplate(test, name) {
+    const select = test.get("#storage-registration-template");
+    const option = (select.options || []).find(item => item.value === name) || { value: name };
+    select.value = name; select.selectedOptions = [option];
+    for (const handler of select.listeners.change || []) handler();
+  }
+  function setStorageKind(test, kind) {
+    const select = test.get("#storage-kind");
+    select.value = kind;
+    for (const handler of select.listeners.change || []) handler();
+  }
+  async function submitStoragePlan(test) {
+    const before = test.bodies.length;
+    await test.submitForm(1);
+    return test.bodies.length > before ? test.bodies[test.bodies.length - 1] : null;
+  }
+
+  const staticPVTest = await bootHarness({});
+  setStorageKind(staticPVTest, "pv.create.static");
+  chooseRegistrationTemplate(staticPVTest, "nfs-template");
+  staticPVTest.get("#storage-pv-name").value = "team-nfs-pv";
+  staticPVTest.get("#storage-class").value = "nfs-csi";
+  staticPVTest.get("#storage-nfs-path").value = "/exports/kubeflow/team";
+  staticPVTest.get('#storage-form [name="reason"]').value = " register approved NFS volume ";
+  let staticBody = await submitStoragePlan(staticPVTest);
+  assert.ok(staticBody, "the static PV form prepares a plan");
+  assert.equal(staticBody.kind, "pv.create.static");
+  assert.equal(staticBody.name, "team-nfs-pv", "the entered PV name is submitted as name, not pvName");
+  assert.equal(staticBody.storageClass, "nfs-csi", "the selected approved class is submitted");
+  assert.equal(staticBody.template, "nfs-template");
+  assert.equal(staticBody.nfsPath, "/exports/kubeflow/team");
+  assert.equal(staticBody.beeGFSPath, undefined, "an NFS template never receives a BeeGFS path");
+  assert.equal(staticBody.namespace, undefined, "a static PV action is cluster scoped");
+  assert.equal(staticBody.reason, "register approved NFS volume");
+  assert.equal(staticBody.pvName, undefined, "the new PV name is not duplicated into pvName");
+  assert.equal(staticBody.directoryUID, undefined);
+  assert.equal(staticBody.podDefault, undefined, "a PV-only action never carries a PodDefault");
+
+  const beegfsPVTest = await bootHarness({});
+  setStorageKind(beegfsPVTest, "pv.create.static");
+  chooseRegistrationTemplate(beegfsPVTest, "beegfs-template");
+  beegfsPVTest.get("#storage-pv-name").value = "team-beegfs-pv";
+  beegfsPVTest.get("#storage-class").value = "beegfs-csi";
+  beegfsPVTest.get("#storage-beegfs-path").value = "example.user/kf-shared-volume";
+  beegfsPVTest.get('#storage-form [name="reason"]').value = "register approved BeeGFS volume";
+  const beegfsBody = await submitStoragePlan(beegfsPVTest);
+  assert.equal(beegfsBody.kind, "pv.create.static");
+  assert.equal(beegfsBody.beeGFSPath, "example.user/kf-shared-volume");
+  assert.equal(beegfsBody.nfsPath, undefined, "a BeeGFS template never receives an NFS path");
+  assert.equal(beegfsBody.directoryUID, undefined);
+
+  // A bound PVC carries the exact observed PV identity. Path fields are not
+  // rendered on the bound form and must never be serialized even if a forged
+  // control exists in the page.
+  const boundTest = await bootHarness({});
+  setStorageKind(boundTest, "pvc.create.bound");
+  chooseRegistrationTemplate(boundTest, "nfs-template");
+  boundTest.get('#storage-form [name="namespace"]').value = "team";
+  boundTest.get("#storage-claim-name").value = "team-data";
+  boundTest.get("#storage-class").value = "nfs-csi";
+  boundTest.get("#bound-pv-selector").value = "nfs-pv";
+  boundTest.get("#storage-directory-uid").value = "1000";
+  boundTest.get("#storage-directory-gid").value = "2000";
+  boundTest.get("#storage-nfs-path").value = "/forged/path";
+  boundTest.get("#storage-beegfs-path").value = "forged/suffix";
+  boundTest.get('#storage-form [name="reason"]').value = "bind the reviewed volume";
+  const boundBody = await submitStoragePlan(boundTest);
+  assert.ok(boundBody, "the bound PVC form prepares a plan");
+  assert.equal(boundBody.kind, "pvc.create.bound");
+  assert.equal(boundBody.namespace, "team");
+  assert.equal(boundBody.name, "team-data");
+  assert.equal(boundBody.template, "nfs-template");
+  assert.equal(boundBody.pvName, "nfs-pv");
+  assert.equal(boundBody.targetUID, "uid-pv-nfs-pv", "the selected PV UID is sent");
+  assert.equal(boundBody.targetResourceVersion, "77", "the selected PV resourceVersion is sent");
+  assert.equal(boundBody.directoryUID, "1000");
+  assert.equal(boundBody.directoryGID, "2000");
+  assert.equal(boundBody.nfsPath, undefined, "a bound PVC never sends an NFS path");
+  assert.equal(boundBody.beeGFSPath, undefined, "a bound PVC never sends a BeeGFS path");
+
+  // Missing UID/GID or a mismatched class never reaches the API.
+  const boundGuardTest = await bootHarness({});
+  setStorageKind(boundGuardTest, "pvc.create.bound");
+  chooseRegistrationTemplate(boundGuardTest, "nfs-template");
+  boundGuardTest.get('#storage-form [name="namespace"]').value = "team";
+  boundGuardTest.get("#storage-claim-name").value = "team-data";
+  boundGuardTest.get("#storage-class").value = "nfs-csi";
+  boundGuardTest.get("#bound-pv-selector").value = "nfs-pv";
+  boundGuardTest.get('#storage-form [name="reason"]').value = "bind";
+  const noIDs = await submitStoragePlan(boundGuardTest);
+  assert.equal(noIDs, null, "NFS directory UID/GID are required for a bound NFS template");
+  boundGuardTest.get("#storage-directory-uid").value = "1000";
+  boundGuardTest.get("#storage-directory-gid").value = "2000";
+  boundGuardTest.get("#storage-class").value = "standard";
+  assert.equal(await submitStoragePlan(boundGuardTest), null, "a class that differs from the template never reaches the API");
+  boundGuardTest.get("#storage-class").value = "nfs-csi";
+
+  // PodDefault is off by default, namespace-local for collision detection and
+  // requires the explicit overwrite acknowledgement when the observed object
+  // is in the same namespace.
+  const pdTest = await bootHarness({});
+  setStorageKind(pdTest, "pvc.create.bound");
+  chooseRegistrationTemplate(pdTest, "nfs-template");
+  pdTest.get('#storage-form [name="namespace"]').value = "team";
+  pdTest.get("#storage-claim-name").value = "team-data";
+  pdTest.get("#storage-class").value = "nfs-csi";
+  pdTest.get("#bound-pv-selector").value = "nfs-pv";
+  pdTest.get("#storage-directory-uid").value = "1000";
+  pdTest.get("#storage-directory-gid").value = "2000";
+  const boundPD = pdTest.get("#storage-pod-default-enable");
+  boundPD.checked = true;
+  for (const handler of boundPD.listeners.change || []) handler();
+  pdTest.get("#storage-pod-default-name").value = "mount-toast";
+  pdTest.get("#storage-pod-default-mount-path").value = "/home/jovyan/team-data";
+  assert.equal(await submitStoragePlan(pdTest), null, "an observed same-namespace PodDefault requires explicit overwrite");
+  assert.equal(pdTest.get("#storage-pod-default-warning").hidden, false, "the overwrite collision warning is visible");
+  pdTest.get("#storage-pod-default-overwrite").checked = true;
+  const pdBody = await submitStoragePlan(pdTest);
+  assert.ok(pdBody, "the acknowledged overwrite prepares a plan");
+  assert.deepEqual(pdBody.podDefault, { name: "mount-toast", mountPath: "/home/jovyan/team-data", overwrite: true });
+  assert.equal(pdBody.podDefault.namespace, undefined, "the PodDefault namespace is never browser-supplied");
+  assert.equal(Object.hasOwn(pdBody, "podDefaultName"), false, "raw PodDefault controls are never submitted");
+
+  // The same name in another namespace is not a collision for this claim.
+  const pdOtherNamespaceTest = await bootHarness({});
+  setStorageKind(pdOtherNamespaceTest, "pvc.create.bound");
+  chooseRegistrationTemplate(pdOtherNamespaceTest, "nfs-template");
+  pdOtherNamespaceTest.get('#storage-form [name="namespace"]').value = "reserved-ns";
+  pdOtherNamespaceTest.get("#storage-claim-name").value = "reserved-data";
+  pdOtherNamespaceTest.get("#storage-class").value = "nfs-csi";
+  pdOtherNamespaceTest.get("#bound-pv-selector").value = "nfs-pv";
+  pdOtherNamespaceTest.get("#storage-directory-uid").value = "1000";
+  pdOtherNamespaceTest.get("#storage-directory-gid").value = "2000";
+  const otherPD = pdOtherNamespaceTest.get("#storage-pod-default-enable"); otherPD.checked = true;
+  for (const handler of otherPD.listeners.change || []) handler();
+  pdOtherNamespaceTest.get("#storage-pod-default-name").value = "mount-toast";
+  pdOtherNamespaceTest.get("#storage-pod-default-mount-path").value = "/home/jovyan/reserved-data";
+  const otherNamespaceBody = await submitStoragePlan(pdOtherNamespaceTest);
+  assert.ok(otherNamespaceBody, "a same-named PodDefault in another namespace is not a collision");
+  assert.equal(otherNamespaceBody.podDefault.overwrite, false);
+
+  // Dynamic PVC creation also offers the optional PodDefault and keeps the
+  // Pending/WaitForFirstConsumer boundary visible in the plan preview.
+  const dynamicPDTest = await bootHarness({});
+  setStorageKind(dynamicPDTest, "pvc.create");
+  dynamicPDTest.get('#storage-form [name="namespace"]').value = "team";
+  dynamicPDTest.get("#storage-claim-name").value = "dynamic-data";
+  dynamicPDTest.get("#storage-class").value = "team-class";
+  dynamicPDTest.get('#storage-form [name="size"]').value = "7Gi";
+  dynamicPDTest.get('#storage-form [name="accessMode"]').value = "ReadWriteOnce";
+  dynamicPDTest.get('#storage-form [name="reason"]').value = "dynamic claim";
+  const dynamicPD = dynamicPDTest.get("#storage-pod-default-enable"); dynamicPD.checked = true;
+  for (const handler of dynamicPD.listeners.change || []) handler();
+  dynamicPDTest.get("#storage-pod-default-name").value = "mount-dynamic";
+  dynamicPDTest.get("#storage-pod-default-mount-path").value = "/home/jovyan/dynamic-data";
+  const dynamicBody = await submitStoragePlan(dynamicPDTest);
+  assert.equal(dynamicBody.kind, "pvc.create.dynamic");
+  assert.equal(dynamicBody.podDefault.name, "mount-dynamic");
+  assert.equal(dynamicBody.nfsPath, undefined);
+  const dynamicPreview = logic.previewFields({ prepared: { action: dynamicBody, summary: "", warnings: [] } }).map(([key, value]) => key + ": " + value).join("\n");
+  assert.ok(dynamicPreview.includes("WaitForFirstConsumer") && dynamicPreview.includes("Pending"), "the dynamic preview states the pending provisioning boundary");
+
+  // A template switch resets every dependent target field, so a value from
+  // one volume can never travel with another.
+  const resetTest = await bootHarness({});
+  setStorageKind(resetTest, "pvc.create.bound");
+  chooseRegistrationTemplate(resetTest, "nfs-template");
+  resetTest.get("#bound-pv-selector").value = "nfs-pv";
+  resetTest.get("#storage-directory-uid").value = "1000";
+  resetTest.get("#storage-directory-gid").value = "2000";
+  resetTest.get("#storage-nfs-path").value = "/forged";
+  chooseRegistrationTemplate(resetTest, "beegfs-template");
+  assert.equal(resetTest.get("#bound-pv-selector").value, "", "a template switch clears the selected PV");
+  assert.equal(resetTest.get("#storage-directory-uid").value, "", "a template switch clears NFS directory IDs");
+  assert.equal(resetTest.get("#storage-nfs-path").value, "", "a template switch clears a forged path field");
+  assert.equal(resetTest.get("#storage-beegfs-path").disabled, true, "a bound PVC keeps path fields disabled even for a BeeGFS template");
+
+  // A late plan answer for a form whose action changed while the request was
+  // pending is discarded before it can open a plan for a different review.
+  const lateStorageTest = await bootHarness({ deferPlans: true });
+  setStorageKind(lateStorageTest, "pv.create.static");
+  chooseRegistrationTemplate(lateStorageTest, "nfs-template");
+  lateStorageTest.get("#storage-pv-name").value = "late-pv";
+  lateStorageTest.get("#storage-class").value = "nfs-csi";
+  lateStorageTest.get("#storage-nfs-path").value = "/exports/kubeflow/late";
+  lateStorageTest.get('#storage-form [name="reason"]').value = "late plan guard";
+  lateStorageTest.beginSubmitForm(1);
+  await lateStorageTest.settle();
+  assert.equal(lateStorageTest.pendingPlans.length, 1, "the late storage plan is pending");
+  setStorageKind(lateStorageTest, "pvc.create");
+  lateStorageTest.resolvePlan(false);
+  await lateStorageTest.settle();
+  assert.equal(lateStorageTest.get("#plan-dialog").open, false, "a late plan for another action opened the dialog");
+  assert.equal(lateStorageTest.bodies.length, 1, "the late answer still corresponds to the one submitted request");
+
+  // The separate PodDefault gate is visible and disables the optional block.
+  const pdGatedTest = await bootHarness({ podDefaults: false });
+  setStorageKind(pdGatedTest, "pvc.create.bound");
+  chooseRegistrationTemplate(pdGatedTest, "nfs-template");
+  assert.equal(pdGatedTest.get("#storage-pod-default").hidden, true, "a disabled PodDefault gate hides the optional block");
+  assert.equal(pdGatedTest.get("#storage-pod-default-enable").disabled, true);
+
+  // The cleanup acknowledgement is sent as its own typed boolean and is never
+  // mixed into the ordinary data-loss acknowledgement.
+  const cleanupTest = await bootHarness({});
+  await cleanupTest.click("storage");
+  cleanupTest.walk(cleanupTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  cleanupTest.walk(cleanupTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete")[0].click();
+  await cleanupTest.settle();
+  cleanupTest.get("#storage-delete-reason").value = "remove the unused claim";
+  cleanupTest.get("#storage-delete-confirm").value = "data";
+  cleanupTest.get("#storage-delete-ack").checked = true;
+  const cleanupBefore = cleanupTest.bodies.length;
+  await cleanupTest.submitForm(6);
+  assert.equal(cleanupTest.bodies.length, cleanupBefore, "an observed related PodDefault blocks the plan until the cleanup acknowledgement is checked");
+  assert.ok(cleanupTest.error.textContent.includes("related PodDefaults"), "the missing cleanup acknowledgement is explained");
+
+  const cleanupAckTest = await bootHarness({});
+  await cleanupAckTest.click("storage");
+  cleanupAckTest.walk(cleanupAckTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  cleanupAckTest.walk(cleanupAckTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete")[0].click();
+  await cleanupAckTest.settle();
+  cleanupAckTest.get("#storage-delete-reason").value = "remove the unused claim";
+  cleanupAckTest.get("#storage-delete-confirm").value = "data";
+  cleanupAckTest.get("#storage-delete-ack").checked = true;
+  cleanupAckTest.get("#storage-delete-pod-default-ack").checked = true;
+  await cleanupAckTest.submitForm(6);
+  const cleanupBody = cleanupAckTest.bodies[cleanupAckTest.bodies.length - 1];
+  assert.equal(cleanupBody.confirmPodDefaultCleanup, true, "the explicit cleanup acknowledgement is submitted");
+  assert.equal(cleanupBody.dataLossAck, undefined, "the browser data-loss acknowledgement is never submitted");
 
   console.log("Dashboard navigation, bounded viewers, drawer contracts, notification policy and history tests passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

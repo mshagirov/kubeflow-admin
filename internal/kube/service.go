@@ -320,6 +320,9 @@ func (s *Service) scopeState(ctx context.Context, ns string, e *evidence) (names
 	if err != nil {
 		return namespaceState{}, nil, safe(err)
 	}
+	if q.GetContinue() != "" {
+		return namespaceState{}, nil, errors.New("resource quota list is incomplete; policy cannot be verified")
+	}
 	type quotaPolicy struct {
 		Name string
 		UID  types.UID
@@ -334,6 +337,9 @@ func (s *Service) scopeState(ctx context.Context, ns string, e *evidence) (names
 	l, err := s.Typed.CoreV1().LimitRanges(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return namespaceState{}, nil, safe(err)
+	}
+	if l.GetContinue() != "" {
+		return namespaceState{}, nil, errors.New("LimitRange list is incomplete; policy cannot be verified")
 	}
 	type limitPolicy struct {
 		Name string

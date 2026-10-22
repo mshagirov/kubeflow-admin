@@ -12,7 +12,7 @@ Still required: dedicated admin hostname/DNS, public issuer URL and trusted CA, 
 
 ## 2. Prepare a real site overlay and DB disk
 
-Base uses the default StorageClass; local disks keep the WAL default, while BeeGFS requires `journalMode: delete` plus `allowUnverifiedFilesystem: true` — follow [database requirements](database.md), including the global-lock and remote-fsync verification, before setting either. Use the release image built, published and scanned from this source (section 4), pinned by its fresh registry digest in the site overlay. The historical 0.1.0 image is not this release. The group placeholder still requires configuration. For an optional **node-local** deployment instead:
+Base uses the default StorageClass; local disks keep the WAL default, while BeeGFS requires `journalMode: delete` plus `allowUnverifiedFilesystem: true` — follow [database requirements](database.md), including the global-lock and remote-fsync verification, before setting either. Use the release image built, scanned and approved, then published from this source (section 4), pinned by its fresh registry digest in the site overlay. The group placeholder still requires configuration. For an optional **node-local** deployment instead:
 
 1. Select a durable node and record its exact `kubernetes.io/hostname` label (not an assumed DNS name). On that node, select an existing local ext4/XFS filesystem with sufficient capacity, proper locking and durable fsync; do not use a network mount, symlink, ephemeral boot disk or notebook data directory.
 2. As the node operator, prepare a **new dedicated** `/var/lib/kubeflow-admin-db` directory. After confirming it is absent and the parent is the intended filesystem, `sudo install -d -o 65532 -g 65532 -m 0700 /var/lib/kubeflow-admin-db`. Do not recursively chown existing data. Verify permissions, free space, backup and node-loss recovery.
@@ -42,7 +42,7 @@ images:
 EOF
 ```
 
-The historical `docker.io/muratshagirov/kubeflow-admin:0.1.0` image (linux/amd64) does **not** include these review fixes. Its old digest is recorded only in [historical verification](verification.md), not recommended as the fixed release. Build, publish and scan the reviewed source (section 4), then replace the overlay's placeholder with the fresh registry digest. Do not assume a tag or a previous digest represents current source.
+Build and scan the reviewed source and both runtime architectures before publication (section 4), then replace the overlay's placeholder with the verified registry digest. Historical release receipts are in [verification](verification.md); do not assume an older tag or digest includes current features or fixes.
 
 Configure `deploy/site/config.yaml` strictly against `internal/config/config.go`, **not** the older design-plan schema. Set `server.publicURL` to the HTTPS origin (no path), issuer/client, exact admin groups or subjects, approved user classes/images/presets, protected namespaces and preferably a single pilot `allowedNamespaces` entry. `adminSubjects` contains exact `sub` strings and is bound to the configured issuer. Keep every `features` switch false (including `podRestarts`, `nodeCordon` and `profileDeletion`) and `controllerContractConfirmed` false initially. Pod restart additionally needs its separate, namespace-scoped eviction permission and a disposable pilot; see [Pods](pods.md). Node cordon/uncordon needs a separately reviewed `nodes/patch` grant: the supplied overlay covers all Nodes, and Kubernetes RBAC cannot restrict the patched fields (named Nodes can be restricted with `resourceNames`); see [Nodes](nodes.md). Profile deletion needs a separately reviewed `kubeflow.org/profiles` `delete` grant and the `profileDeletion` opt-in; see section 7. Add every site's system namespace to the protected list. Config is read at startup; the generated ConfigMap name changes trigger a restart. Never put credentials in it.
 
@@ -61,9 +61,12 @@ need for `cluster-admin`, and destructive testing remains disposable-only.
 | Profile create/quota update, dynamic PVC create | `features.writesEnabled` | `writes` overlay |
 | Existing Notebook start/stop/edit | Writes + `notebooks.controllerContractConfirmed` after verification | `writes` overlay |
 | Static PV registration/reservation | `features.staticStorage`, approved prepared template | `static-storage` overlay |
+| Separate `pv.create.static` / `pvc.create.bound` | `features.staticStorage`, approved registration template | `static-storage` PV grant; binding also needs PVC create from `writes` |
 | PVC expansion | `features.pvcExpansion`, compatible bound CSI storage | `pvc-expansion` overlay for the standalone expansion action |
 | Restricted PV/PVC Edit | `features.storageEditing`; request growth additionally needs `pvcExpansion` | `storage-editing` overlay |
 | Unused-only PV/PVC Delete | `features.storageDeletion` | `storage-deletion` overlay |
+| PVC-associated PodDefault create/overwrite | `features.podDefaults`, applicable PVC creation gates | Separate `poddefaults` overlay |
+| Related PodDefault cleanup with PVC Delete | `features.podDefaults` + `features.storageDeletion` | Both `poddefaults` and `storage-deletion` grants; explicit cleanup confirmation |
 | Profile Delete | `features.profileDeletion` | `profile-deletion` overlay |
 | Pod restart | `features.podRestarts` + verified Notebook contract | `pod-restarts` overlay or pilot-scoped eviction grant |
 | Node cordon/uncordon | `features.nodeCordon` | `node-cordon` overlay |
@@ -72,6 +75,9 @@ Overlay names above identify permission sets, not bases to stack together. Copy
 their reviewed RBAC files into the site overlay and include the base exactly once.
 Flags grant no permissions by themselves; grants do not enable flags. Review
 [storage limits](storage.md), [Pods](pods.md) and [Nodes](nodes.md) before opt-in.
+Base `get`/`list` access to PodDefaults detects PVC references even with mutation
+disabled. Denied discovery/reads fail closed; the separate mutation grant does
+not install or verify the CRD or admission webhook.
 
 New Profiles (`profile.create`) require an **email-formatted** owner value, and the check is syntax only — the console performs **no** identity-provider or LDAP registration lookup, so a well-formed address may still be unregistered. Existing Profiles whose owner is a configured username keep working: `profile.update` accepts them **while the owner is left unmodified**, so there is no universal email-format rejection on update. Owner transfer, owner migration and custom owner controllers are a separate future workflow; do not delete or rewrite existing data to satisfy the email rule.
 
@@ -137,23 +143,50 @@ kubectl --context YOUR_CONTEXT -n kubeflow-admin create secret generic kubeflow-
 
 The Pod receives a read-only Secret file; the app has no Kubernetes Secret-read permission. For rotation, update through the site's secret manager and restart the deployment; verify the old client secret is revoked upstream. Protect both Secret and SQLite backups; DB contains administrative identity/session/login state.
 
-## 4. Build, push and render
+## 4. Verify, publish and render
 
 ```sh
 make test vet manifests
-make image-push IMAGE=registry.example.org/platform/kubeflow-admin:YOUR_RELEASE
-# Record registry output digest and insert it in deploy/site/kustomization.yaml.
+# Also run the release browser, vulnerability/secret and runtime checks below.
+# Build one OCI artifact from archived source, scan both architectures, then
+# publish that exact artifact under VERSION and latest without another build.
+# Verify registry platform/index digests match the scanned artifact, then
+# insert its immutable digest in deploy/site/kustomization.yaml.
 kustomize build deploy/site > rendered.yaml
 ```
 
 `make image-push` publishes the explicit version tag **and `latest`** from the
 same multi-platform build, with provenance and SBOM on both. The helper rejects
-untagged, digest-only or `latest`-only input so a version tag is not accidentally
-omitted. Use this target for future releases; if publishing with Buildx directly,
-include both `-t repository:VERSION` and `-t repository:latest`. Promote `latest`
-only with the reviewed current release, not when rebuilding historical versions.
-Verify that both registry tags resolve to the recorded release index digest.
-Tags are mutable; continue pinning the immutable digest in deployment overlays.
+untagged, digest-only, `latest`-only, and non-release placeholder input
+(`dev`, `unknown`, `local`) so a real version tag is used. This is a direct
+build-and-push helper, **not** the offline artifact-promotion flow. If publishing
+with Buildx directly, include both
+`-t repository:VERSION` and `-t repository:latest`, and pass
+`--build-arg VERSION=<tag> --build-arg REVISION=$(git rev-parse HEAD)` so the
+release labels are not the `dev`/`unknown` local defaults.
+Promote `latest` only with the reviewed current release, not when rebuilding
+historical versions. Verify that both registry tags resolve to the recorded
+release index digest. Tags are mutable; continue pinning the immutable digest in
+deployment overlays.
+
+The publishing helper also refuses to run from a dirty tracked/untracked
+worktree; ignored local site files, databases and build output do not count.
+It derives `VERSION` from the explicit image tag and `REVISION` from
+`git rev-parse HEAD`, then passes both as build arguments. The runtime image
+therefore carries `org.opencontainers.image.version`, `.revision`, `.source` and
+`.licenses` labels; a plain `docker build` keeps the non-release defaults
+`dev`/`unknown`. The Docker context is not the working tree: after the
+clean-tree check the helper archives the exact tracked `HEAD` revision with
+`git archive` and feeds that tar to Buildx on stdin. Ignored files, including
+ignored files under `cmd/` or `internal/`, therefore cannot enter the image, and
+archive creation failure stops before Docker is called. Because `make image-push`
+rebuilds, do **not** use it to promote an already scanned offline artifact. The
+release flow is: verify source and successful source CI; independently archive
+the exact commit; build once to OCI with those version/revision arguments and
+SBOM/provenance; scan both platform artifacts; verify non-root identity, labels,
+license and fail-closed runtime behavior; then push that same scanned index under
+the version and `latest` tags. Verify both tags, platform digests and attestations
+against the offline artifact and retain the receipt in [verification](verification.md).
 
 Documentation-only corrections need no new image or deployment and, by operator
 policy, no CI run. They can be committed/pushed with `[skip ci]` in the commit
@@ -192,6 +225,11 @@ Then, on a disposable **pre-existing test profile/notebook/PVC** with backups an
 2. Restrict `policy.allowedNamespaces` to the pilot. Copy `deploy/overlays/writes/rbac.yaml` to `deploy/site/writes-rbac.yaml` and add `writes-rbac.yaml` under the site's `resources`. Set `features.writesEnabled: true`, `notebooks.controllerContractConfirmed: true` only after verification. Keep the base supplied exactly once by whichever base or local-storage resource the site uses. For static/expansion also copy those overlays' exact RBAC files under distinct site filenames and enable only the corresponding feature after policy/backend review; do not stack bases or duplicate resources.
 3. Render/review/apply; preview stop/start, inspect warnings, execute once, poll the durable operation and confirm real Pod disappearance/readiness plus audit attribution. Test expired/stale previews, double submission, non-admin/CSRF denials and crash recovery without automatic replay.
 4. Pilot dynamic storage/profile quota/edits separately, then approved NFS/static CSI and expansion only when supported. The implemented expansion action requires a verified bound CSI volume with a driver matching the StorageClass; a plain NFS PV remains unsupported even if its class reports expansion. Verify non-app fields and user data remain intact. There is no arbitrary cleanup workflow: separately gated `profile.delete` deletes a Profile and cascades to its namespace (section 7); separately gated storage deletion is unused-only and never forces cleanup. Other workflows can also irreversibly lose volatile state. Review the [storage editing/deletion permissions and caveats](storage.md#restricted-yaml-editing-and-unused-only-deletion) before enabling them. Backend cleanup always needs a separate reviewed data/reclaim plan.
+   For optional PodDefaults, independently verify the installed API/webhook,
+   install the reviewed `poddefaults/rbac.yaml` grant (prefer a namespaced pilot
+   equivalent), and only then enable `features.podDefaults`. Test optional
+   creation/overwrite and confirmed PVC-associated cleanup separately; base read
+   access is not mutation permission, and cleanup also needs storage deletion.
 5. Widen namespace scope deliberately only after evidence is recorded. RBAC patch rights are not field-limited; enforce privileged workload/service-account/volume and PV-source restrictions through existing admission policy. Static PV backend uniqueness cannot be enforced atomically by this app (or by a CEL admission rule alone): keep exactly one application writer and a site-owned cluster-wide registration/coordination process covering every privileged writer, as described in [storage](storage.md).
 
 Turning feature flags off stops new UI/API writes but does not revoke RBAC or undo mutations. Removing overlays from a Kustomization and applying does **not** remove existing ClusterRoleBindings; revoke the exact optional bindings separately through the platform operator after reviewing in-flight work. Never use broad prune/delete to downgrade.

@@ -2,6 +2,53 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
+## 0.4.4 — template-driven storage provisioning (22 October 2026)
+
+**Release candidate:** source/browser verification is complete; source CI,
+runtime-image scanning and publication are pending at this source revision.
+No deployment or live storage mutation has been performed.
+
+- Separate unclaimed NFS/BeeGFS PV registration and template-bound PVC creation;
+  independent template-controlled capacities/requests and access modes. New NFS
+  templates allow an approved root itself or descendants; legacy templates retain
+  their original semantics. NFS UID/GID are required nonzero intent-only metadata.
+- Optional dedicated PodDefault creation and explicitly confirmed guarded
+  overwrite only within PVC creation. Unused-PVC deletion previews and confirms
+  related PodDefault cleanup, including shared/external warnings, orphan
+  propagation and the 32-object bound. No standalone PodDefault management,
+  automatic PVC rollback, PodDefault recreation, force or finalizer removal.
+- Fresh scope/policy and UID/resourceVersion checks, fail-closed discovery across
+  served versions, incomplete-list refusals and canonical backend overlap checks.
+  Durable append-only mutation receipts retain exact known UIDs through partial
+  outcomes, preview expiry and restart; uncertain operations retain locks.
+- Drawer body top padding increased from 4px to 16px. Registration payloads use
+  the active name input and exact selected-PV identity; namespace and backend
+  fields follow the selected workflow/template.
+- Release helper now archives exact tracked HEAD, excludes ignored local files,
+  sets version/revision/source/license labels and tags version plus `latest`.
+  Publication still requires independently scanned artifacts; the direct helper
+  is not an offline-artifact promotion gate.
+
+Final local checks passed: serialized Go 1.27.3 race suite, vet/build, module
+verification and `govulncheck` (no vulnerabilities); Node regressions, API parity,
+16 Python tests, OpenAPI validation and twelve manifest invariant variants.
+Real Chrome acceptance passed **37/37**, including NFS/BeeGFS/bound-PVC forms,
+PodDefault gating/overwrite/cleanup acknowledgements, partial receipts and drawer
+spacing. No skips, JavaScript errors or page overflow at 390px/1280px.
+
+Independent security review produced regression tests for discovery, scope
+changes at checkpoints, pagination, backend aliases, provenance and post-cleanup
+rejections. All pass; the final race rerun includes the completed fixes. A further
+empty-discovery-list test and preserved inventory-warning check also pass.
+Tracked/nonignored source review found no matching site-specific metadata,
+private keys or credential-shaped tokens; ignored site configuration remains
+outside Git and image build contexts. This is not a proof of absence of every
+possible secret. The temporary planning document was removed; operator contracts
+remain in [storage](storage.md), [deployment](deployment.md) and
+[live acceptance](ui-workflow-acceptance.md). The learning guide remains exactly
+15 lessons. New features remain disabled by default; installed admission/mount
+behavior still needs the disposable operator-run acceptance checklist.
+
 ## 0.4.3 — Profile and Notebook panel layout (22 October 2026)
 
 Published and registry-verified: `0.4.3` and `latest` resolve to the same image

@@ -534,7 +534,13 @@ func storageDeleteActionConstraints(a model.Action) error {
 	if a.Force || a.StorageYAML != "" {
 		return errors.New("storage deletion does not accept force or an edit document")
 	}
-	if err := storageActionFields(a, "Kind", "Namespace", "Name", "Reason", "ConfirmName", "TargetUID", "TargetResourceVersion"); err != nil {
+	allowed := []string{"Kind", "Namespace", "Name", "Reason", "ConfirmName", "TargetUID", "TargetResourceVersion"}
+	if a.Kind == "pvc.delete" {
+		// Cleanup acknowledgement exists only on the PVC deletion workflow.
+		// A PV deletion carrying it is refused by the reflective allowlist.
+		allowed = append(allowed, "ConfirmPodDefaultCleanup")
+	}
+	if err := storageActionFields(a, allowed...); err != nil {
 		return err
 	}
 	if a.TargetUID == "" || a.TargetResourceVersion == "" {
@@ -994,6 +1000,9 @@ func (s *Service) storagePVTarget(ctx context.Context, volumeName string, ev *ev
 	if err != nil {
 		return nil, nil, errors.New("PersistentVolumeClaim reference list could not be verified")
 	}
+	if claims.GetContinue() != "" {
+		return nil, nil, errors.New("PersistentVolumeClaim reference list is incomplete")
+	}
 	for _, claim := range claims.Items {
 		if claim.Spec.VolumeName == volumeName {
 			return nil, nil, errors.New("PersistentVolume is referenced by a PersistentVolumeClaim")
@@ -1020,12 +1029,14 @@ func storagePVFingerprint(pv *corev1.PersistentVolume) storagePVBindingFingerpri
 
 // storageDeletePlan is the internal execution plan of a storage delete.
 type storageDeletePlan struct {
-	prepared  model.Prepared
-	kind      string
-	namespace string
-	name      string
-	uid       types.UID
-	rv        string
+	prepared    model.Prepared
+	kind        string
+	namespace   string
+	name        string
+	uid         types.UID
+	rv          string
+	podDefaults []podDefaultCleanupTarget
+	ev          evidence
 }
 
 func (s *Service) prepareStorageDelete(ctx context.Context, a model.Action) (model.Prepared, error) {
@@ -1050,6 +1061,8 @@ func (s *Service) buildStorageDelete(ctx context.Context, a model.Action) (*stor
 	ev := s.newEvidence()
 	var uid types.UID
 	var rv, className, classDigest, reclaim, namespace, targetName string
+	podDefaults := []podDefaultCleanupTarget{}
+	podDefaultAPI := ""
 	switch kind {
 	case storageKindPV:
 		pv, class, err := s.storagePVTarget(ctx, a.Name, &ev)
@@ -1078,11 +1091,22 @@ func (s *Service) buildStorageDelete(ctx context.Context, a model.Action) (*stor
 		}
 		uid, rv, targetName, namespace = pvc.UID, pvc.ResourceVersion, pvc.Name, pvc.Namespace
 		className, classDigest, reclaim = class, classDigestValue, reclaimValue
+		// PodDefault dependencies are inspected after the Pod/Notebook unused
+		// checks above. Genuine CRD absence is explicit; every discovery, list,
+		// read or permission failure is a refusal. The helper also enforces the
+		// feature/acknowledgement gates and dry-runs every reviewed deletion.
+		var state string
+		podDefaults, state, err = s.podDefaultDependencies(ctx, namespace, targetName, a, &ev)
+		if err != nil {
+			return nil, err
+		}
+		podDefaultAPI = state
 	}
 	evd := storageDeleteEvidence{
 		Version: 1, Policy: s.newEvidence().Policy, Kind: kind, Namespace: namespace,
 		Name: targetName, UID: string(uid), ResourceVersion: rv,
 		StorageClass: className, ClassDigest: classDigest, ReclaimPolicy: reclaim,
+		PodDefaultAPI: podDefaultAPI, PodDefaults: podDefaults,
 		Scope: digest(string(ev.bytes())),
 	}
 	data, err := json.Marshal(evd)
@@ -1098,25 +1122,29 @@ func (s *Service) buildStorageDelete(ctx context.Context, a model.Action) (*stor
 		p.Warnings = append(storagePVWarnings(reclaim, "delete"), "Finalizers are never removed. If the delete remains pending for ten minutes the operation stops for review; it is never retried or forced.")
 	} else {
 		p.Warnings = storagePVCDeleteWarnings(reclaim)
+		p.Changes = append(p.Changes, podDefaultCleanupChanges(podDefaults)...)
+		p.Warnings = append(p.Warnings, podDefaultCleanupWarnings(podDefaults, targetName, a.ConfirmPodDefaultCleanup)...)
 	}
 	if err := s.storageDeleteDryRun(ctx, kind, namespace, targetName, uid, rv); err != nil {
 		return nil, err
 	}
-	return &storageDeletePlan{prepared: p, kind: kind, namespace: namespace, name: targetName, uid: uid, rv: rv}, nil
+	return &storageDeletePlan{prepared: p, kind: kind, namespace: namespace, name: targetName, uid: uid, rv: rv, podDefaults: podDefaults, ev: ev}, nil
 }
 
 type storageDeleteEvidence struct {
-	Version         int    `json:"version"`
-	Policy          string `json:"policy"`
-	Kind            string `json:"kind"`
-	Namespace       string `json:"namespace,omitempty"`
-	Name            string `json:"name"`
-	UID             string `json:"uid"`
-	ResourceVersion string `json:"resourceVersion"`
-	StorageClass    string `json:"storageClass,omitempty"`
-	ClassDigest     string `json:"classDigest,omitempty"`
-	ReclaimPolicy   string `json:"reclaimPolicy,omitempty"`
-	Scope           string `json:"scope,omitempty"`
+	Version         int                       `json:"version"`
+	Policy          string                    `json:"policy"`
+	Kind            string                    `json:"kind"`
+	Namespace       string                    `json:"namespace,omitempty"`
+	Name            string                    `json:"name"`
+	UID             string                    `json:"uid"`
+	ResourceVersion string                    `json:"resourceVersion"`
+	StorageClass    string                    `json:"storageClass,omitempty"`
+	ClassDigest     string                    `json:"classDigest,omitempty"`
+	ReclaimPolicy   string                    `json:"reclaimPolicy,omitempty"`
+	PodDefaultAPI   string                    `json:"podDefaultAPI,omitempty"`
+	PodDefaults     []podDefaultCleanupTarget `json:"podDefaults"`
+	Scope           string                    `json:"scope,omitempty"`
 }
 
 // storagePVCDeleteTarget proves the unused-only PVC precondition. It allows a
@@ -1219,6 +1247,9 @@ func (s *Service) rejectPVCReservation(ctx context.Context, pvc *corev1.Persiste
 	if err != nil {
 		return errors.New("PersistentVolume reservation list could not be verified")
 	}
+	if volumes.GetContinue() != "" {
+		return errors.New("PersistentVolume reservation list is incomplete")
+	}
 	matches := 0
 	for _, pv := range volumes.Items {
 		ref := pv.Spec.ClaimRef
@@ -1249,6 +1280,9 @@ func (s *Service) rejectPVCReferences(ctx context.Context, namespace, name strin
 	if err != nil {
 		return errors.New("Pod reference list could not be verified")
 	}
+	if pods.GetContinue() != "" {
+		return errors.New("Pod reference list is incomplete")
+	}
 	for _, pod := range pods.Items {
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == name {
@@ -1265,6 +1299,9 @@ func (s *Service) rejectPVCReferences(ctx context.Context, namespace, name strin
 	notes, err := s.Dynamic.Resource(Notebooks).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return errors.New("Notebook reference list could not be verified")
+	}
+	if notes.GetContinue() != "" {
+		return errors.New("Notebook reference list is incomplete")
 	}
 	for i := range notes.Items {
 		used, err := notebookReferencesPVC(&notes.Items[i], name)
@@ -1483,7 +1520,8 @@ func storagePreparedMatches(want, got model.Prepared) bool {
 		want.Action.Name == got.Action.Name &&
 		want.Action.TargetUID == got.Action.TargetUID &&
 		want.Action.TargetResourceVersion == got.Action.TargetResourceVersion &&
-		want.Action.StorageYAML == got.Action.StorageYAML
+		want.Action.StorageYAML == got.Action.StorageYAML &&
+		want.Action.ConfirmPodDefaultCleanup == got.Action.ConfirmPodDefaultCleanup
 }
 
 func (s *Service) verifyStorageEdit(ctx context.Context, plan *storageEditPlan) error {
@@ -1554,9 +1592,38 @@ func (s *Service) executeStorageDelete(ctx context.Context, p model.Prepared, cp
 	if !storagePreparedMatches(p, plan.prepared) {
 		return ErrConflict
 	}
-	if err = checkpoint(cp, storageDeleteStep); err != nil {
-		return err
+	if len(plan.podDefaults) == 0 {
+		// Preserve the established single-write path for a PV deletion and a
+		// PVC deletion with no reviewed PodDefault cleanup.
+		if err = checkpoint(cp, storageDeleteStep); err != nil {
+			return err
+		}
+		fresh, err := s.buildStorageDelete(ctx, p.Action)
+		if err != nil {
+			return err
+		}
+		if !storagePreparedMatches(p, fresh.prepared) {
+			return ErrConflict
+		}
+		plan = fresh
+		opts := storageDeleteOptions(plan.uid, plan.rv, false)
+		mutationAttempted = true
+		if plan.kind == storageKindPV {
+			err = s.Typed.CoreV1().PersistentVolumes().Delete(ctx, plan.name, opts)
+		} else {
+			err = s.Typed.CoreV1().PersistentVolumeClaims(plan.namespace).Delete(ctx, plan.name, opts)
+		}
+		if err != nil && !apierrors.IsNotFound(err) {
+			return storageMutationError(err, plan.kind, "delete")
+		}
+		if err := s.waitForStorageDeletion(ctx, plan.kind, plan.namespace, plan.name, plan.uid); err != nil {
+			return err
+		}
+		return s.recordStorageDeletionReceipt(ctx, plan)
 	}
+	// A reviewed cleanup is a sequence of independent writes. One checkpoint
+	// precedes every PodDefault deletion and another precedes the PVC deletion.
+	// There is no rollback, replay or automatic discovery-and-delete.
 	fresh, err := s.buildStorageDelete(ctx, p.Action)
 	if err != nil {
 		return err
@@ -1565,22 +1632,147 @@ func (s *Service) executeStorageDelete(ctx context.Context, p model.Prepared, cp
 		return ErrConflict
 	}
 	plan = fresh
+	remaining := append([]podDefaultCleanupTarget(nil), plan.podDefaults...)
+	for i, target := range plan.podDefaults {
+		step := fmt.Sprintf("delete-poddefault-%d", i+1)
+		if err = checkpoint(cp, step); err != nil {
+			return err
+		}
+		// Profile ownership, namespace identity and policy/quota configuration
+		// are re-read after every checkpoint. Quota status usage is deliberately
+		// not compared: this operation's own earlier deletions are expected
+		// self-deltas, and headroom was checked before the first allocation.
+		if err = s.checkEvidence(ctx, plan.namespace, plan.ev); err != nil {
+			return err
+		}
+		// Re-list after the checkpoint and require exactly the remaining
+		// reviewed set. A new reference requires a fresh plan; a changed or
+		// replaced reviewed object is refused before it is touched.
+		if err = s.assertOnlyPlannedPodDefaults(ctx, plan.namespace, plan.name, remaining); err != nil {
+			return err
+		}
+		if err = s.recheckPodDefaultTarget(ctx, target, plan.name); err != nil {
+			return err
+		}
+		mutationAttempted = true
+		if err = s.deletePodDefault(ctx, target); err != nil {
+			return err
+		}
+		remaining = remaining[1:]
+		// Completion receipt for exactly this reviewed index. The review order
+		// is deterministic (sorted by name) and the acceptance Changes carry the
+		// exact name/namespace/UID/resourceVersion snapshot for that index.
+		if err = checkpoint(cp, fmt.Sprintf("delete-poddefault-%d-completed", i+1)); err != nil {
+			return err
+		}
+	}
+	if err = s.assertOnlyPlannedPodDefaults(ctx, plan.namespace, plan.name, nil); err != nil {
+		return err
+	}
+	if err = checkpoint(cp, "delete-pvc"); err != nil {
+		return err
+	}
+	if err = s.checkEvidence(ctx, plan.namespace, plan.ev); err != nil {
+		return err
+	}
+	// Revalidate the complete PVC deletion contract after the PodDefault
+	// writes and after the checkpoint. A new Pod/Notebook reference blocks the
+	// PVC; the already-deleted PodDefaults stay deleted and are never recreated.
+	target, err := s.Typed.CoreV1().PersistentVolumeClaims(plan.namespace).Get(ctx, plan.name, metav1.GetOptions{})
+	if err != nil {
+		return errors.New("the PersistentVolumeClaim could not be verified after PodDefault cleanup")
+	}
+	if target.UID != plan.uid || target.ResourceVersion != plan.rv || target.DeletionTimestamp != nil {
+		return fmt.Errorf("the PersistentVolumeClaim changed after PodDefault cleanup: %w", ErrConflict)
+	}
+	var cleanupEv evidence
+	_, className, classDigest, _, err := s.storagePVCDeleteTarget(ctx, plan.namespace, plan.name, &cleanupEv)
+	if err != nil {
+		return err
+	}
+	// The reviewed class and bound PV must still be the same objects that were
+	// accepted. PodDefault cleanup may already have succeeded, so a change here
+	// is a partial outcome that must stop before the PVC write.
+	if want, ok := evidenceDep(plan.ev, "StorageClass", "", className); !ok || want.Digest != classDigest {
+		return fmt.Errorf("the bound StorageClass changed after PodDefault cleanup: %w", ErrConflict)
+	}
+	if vol := target.Spec.VolumeName; vol != "" {
+		want, ok := evidenceDep(plan.ev, "PersistentVolume", "", vol)
+		got, current := evidenceDep(cleanupEv, "PersistentVolume", "", vol)
+		if !ok || !current || want.Digest != got.Digest {
+			return fmt.Errorf("the bound PersistentVolume changed after PodDefault cleanup: %w", ErrConflict)
+		}
+	}
+	// The PodDefault dependency set is checked again after the PVC checkpoint
+	// and every other dependency read, immediately before the one PVC delete.
+	if err = s.assertOnlyPlannedPodDefaults(ctx, plan.namespace, plan.name, nil); err != nil {
+		return err
+	}
 	opts := storageDeleteOptions(plan.uid, plan.rv, false)
 	mutationAttempted = true
+	if err = s.Typed.CoreV1().PersistentVolumeClaims(plan.namespace).Delete(ctx, plan.name, opts); err != nil && !apierrors.IsNotFound(err) {
+		// Reviewed PodDefaults may already be deleted. Even a definite 403/409/
+		// 422 is a partial outcome here, never a pre-mutation refusal.
+		return storagePostMutationError(err, plan.kind, "delete")
+	}
+	if err := s.waitForStorageDeletion(ctx, plan.kind, plan.namespace, plan.name, plan.uid); err != nil {
+		return err
+	}
+	return s.recordStorageDeletionReceipt(ctx, plan)
+}
+
+func (s *Service) recordStorageDeletionReceipt(ctx context.Context, plan *storageDeletePlan) error {
+	kind := mutationKindPersistentVolumeClaim
 	if plan.kind == storageKindPV {
-		err = s.Typed.CoreV1().PersistentVolumes().Delete(ctx, plan.name, opts)
-	} else {
-		err = s.Typed.CoreV1().PersistentVolumeClaims(plan.namespace).Delete(ctx, plan.name, opts)
+		kind = mutationKindPersistentVolume
 	}
-	if err != nil && !apierrors.IsNotFound(err) {
-		return storageMutationError(err, plan.kind, "delete")
+	return recordMutationReceipt(ctx, kind, plan.namespace, plan.name, plan.uid, plan.rv, model.MutationOutcomeDeleted)
+}
+
+func (s *Service) recheckPodDefaultTarget(ctx context.Context, target podDefaultCleanupTarget, claim string) error {
+	present, err := s.podDefaultAPI(ctx, false)
+	if err != nil {
+		return err
 	}
-	return s.waitForStorageDeletion(ctx, plan.kind, plan.namespace, plan.name, plan.uid)
+	if !present {
+		return fmt.Errorf("the reviewed PodDefault API disappeared before cleanup: %w", ErrConflict)
+	}
+	obj, err := s.Dynamic.Resource(PodDefaults).Namespace(target.Namespace).Get(ctx, target.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("the reviewed PodDefault could not be re-read: %w", ErrConflict)
+	}
+	if string(obj.GetUID()) != target.UID || obj.GetResourceVersion() != target.ResourceVersion || obj.GetDeletionTimestamp() != nil {
+		return fmt.Errorf("the reviewed PodDefault changed before deletion: %w", ErrConflict)
+	}
+	usage, err := podDefaultUsageFrom(obj)
+	if err != nil || !containsString(usage.Claims, claim) {
+		return fmt.Errorf("the reviewed PodDefault no longer matches the reviewed dependency: %w", ErrConflict)
+	}
+	return nil
 }
 
 // storageMutationError classifies a write failure. Only an explicit API refusal
 // that proves no mutation was applied may release the target lock. A 429, a 5xx,
 // a timeout or a transport failure is ambiguous and stays in needs-review.
+func storagePostMutationError(err error, kind, operation string) error {
+	object := "PersistentVolume"
+	if kind == storageKindPVC {
+		object = "PersistentVolumeClaim"
+	}
+	switch {
+	case apierrors.IsForbidden(err), apierrors.IsUnauthorized(err):
+		return fmt.Errorf("Kubernetes API rejected the %s %s after a prior mutation; partial outcome requires review", object, operation)
+	case apierrors.IsConflict(err), apierrors.IsInvalid(err), apierrors.IsBadRequest(err):
+		return fmt.Errorf("%s %s was rejected after a prior mutation; partial outcome requires review: %w", object, operation, ErrConflict)
+	case apierrors.IsTooManyRequests(err), apierrors.IsServerTimeout(err), apierrors.IsTimeout(err), apierrors.IsServiceUnavailable(err), apierrors.IsInternalError(err):
+		return fmt.Errorf("Kubernetes API %s %s outcome is unknown after a prior mutation", object, operation)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	default:
+		return fmt.Errorf("Kubernetes API %s %s outcome is unknown after a prior mutation", object, operation)
+	}
+}
+
 func storageMutationError(err error, kind, operation string) error {
 	object := "PersistentVolume"
 	if kind == storageKindPVC {

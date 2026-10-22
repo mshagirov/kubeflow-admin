@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
@@ -249,6 +250,50 @@ func testService(t *testing.T) (*Service, *crAPI, *fake.Clientset) {
 		objects = append(objects, v, boundPVC(n))
 	}
 	typed := fake.NewSimpleClientset(objects...)
+	if fd, ok := typed.Discovery().(*fakediscovery.FakeDiscovery); ok {
+		// The application requires kubeflow.org/v1 Profiles and Notebooks in
+		// production. Expose that group in the fake so a missing
+		// kubeflow.org/v1alpha1 PodDefault resource is explicit absence rather
+		// than an unverifiable nil discovery result.
+		fd.Resources = []*metav1.APIResourceList{{
+			GroupVersion: "kubeflow.org/v1",
+			APIResources: []metav1.APIResource{
+				{Name: "profiles", Namespaced: false, Kind: "Profile"},
+				{Name: "notebooks", Namespaced: true, Kind: "Notebook"},
+			},
+		}}
+	}
+	if fd, ok := typed.Discovery().(*fakediscovery.FakeDiscovery); ok {
+		fd.Resources = append(fd.Resources,
+			&metav1.APIResourceList{GroupVersion: "storage.k8s.io/v1", APIResources: []metav1.APIResource{{Name: "storageclasses", Namespaced: false, Kind: "StorageClass"}}},
+		)
+	}
+	// The typed fake does not assign UID/resourceVersion on create. Real API
+	// responses always do, and creation identity checks depend on it.
+	typed.PrependReactor("create", "persistentvolumes", func(a ktesting.Action) (bool, runtime.Object, error) {
+		ca, ok := a.(ktesting.CreateActionImpl)
+		if !ok {
+			return false, nil, nil
+		}
+		pv, ok := ca.GetObject().(*corev1.PersistentVolume)
+		if !ok {
+			return false, nil, nil
+		}
+		if len(ca.GetCreateOptions().DryRun) > 0 {
+			return true, pv.DeepCopy(), nil
+		}
+		stored := pv.DeepCopy()
+		if stored.UID == "" {
+			stored.UID = types.UID("fake-pv-" + stored.Name)
+		}
+		if stored.ResourceVersion == "" {
+			stored.ResourceVersion = "1"
+		}
+		if err := typed.Tracker().Create(pvGVR, stored, ""); err != nil {
+			return true, nil, err
+		}
+		return true, stored, nil
+	})
 	cfg := config.Config{Features: config.Features{WritesEnabled: true, StaticStorage: true, PVCExpansion: true}, Storage: config.Storage{AllowedStorageClasses: []string{"approved"}, NFSTemplates: []config.NFSTemplate{{Name: "nfs-template", Server: "nfs.example.test", BasePath: "/prepared", StorageClass: "approved", AccessModes: []string{"ReadWriteMany"}, MountOptions: []string{"nfsvers=3"}}}, CSITemplates: []config.CSITemplate{{Name: "csi-template", Driver: "csi.example.vendor", VolumeHandle: "example://mgmt/prepared/operator-approved", StorageClass: "approved", AccessModes: []string{"ReadWriteMany"}}}}, Notebooks: config.Notebooks{ControllerContractConfirmed: true, AllowedImages: []string{"approved:v1", "approved:v2"}}}
 	return &Service{Config: cfg, Typed: typed, Dynamic: d, PollInterval: time.Millisecond}, api, typed
 }

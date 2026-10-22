@@ -19,6 +19,66 @@ assert.deepEqual(buildAction(base, {replaceMounts:true,mounts:[mount]}).mounts, 
 for (const [form, backend] of [["profile.create","profile.create"],["profile.quota","profile.quota.change"],["pvc.create","pvc.create.dynamic"],["pvc.expand","pvc.expand"],["pv.nfs.create","storage.create.static"],["pv.reserve","pv.reserve-and-claim"],["notebook.start","notebook.start"],["notebook.stop","notebook.stop"]]) {
   assert.equal(buildAction([["kind",form]]).kind,backend);
 }
+// Typed storage registration actions keep their exact kind. No generic alias
+// can change their meaning, and each action only carries its own fields.
+assert.equal(buildAction([["kind","pv.create.static"]]).kind, "pv.create.static");
+assert.equal(buildAction([["kind","pvc.create.bound"]]).kind, "pvc.create.bound");
+assert.deepEqual(
+  buildAction([["kind","pv.create.static"],["name","nfs-new"],["storageClass","nfs-csi"],["template","nfs-template"],["nfsPath","/exports/kubeflow/team"],["podDefaultName","mount-x"]], {podDefault:{name:"mount-x",mountPath:"/home/jovyan/x",overwrite:false}}),
+  {kind:"pv.create.static",name:"nfs-new",storageClass:"nfs-csi",template:"nfs-template",nfsPath:"/exports/kubeflow/team",podDefault:{name:"mount-x",mountPath:"/home/jovyan/x",overwrite:false}},
+  "a static PV action carries only its approved typed fields");
+// pvc.create.bound accepts no backend path at all.
+const boundPayload = buildAction([["kind","pvc.create.bound"],["namespace","team"],["name","data"],["storageClass","nfs-csi"],["template","nfs-template"],["pvName","nfs-pv"],["targetUID","uid-pv"],["targetResourceVersion","77"],["directoryUID","1000"],["directoryGID","2000"],["nfsPath","/forged"],["beeGFSPath","forged/suffix"]]);
+assert.equal(Object.hasOwn(boundPayload,"nfsPath"), false, "a bound PVC never accepts an NFS path");
+assert.equal(Object.hasOwn(boundPayload,"beeGFSPath"), false, "a bound PVC never accepts a BeeGFS path");
+assert.equal(boundPayload.directoryUID, "1000");
+const pdAction = buildAction([["kind","pvc.create.bound"],["namespace","team"],["name","data"],["podDefaultName","raw-control"]], {podDefault:{name:"mount-toast",mountPath:"/home/jovyan/data",overwrite:true}});
+assert.deepEqual(pdAction.podDefault, {name:"mount-toast",mountPath:"/home/jovyan/data",overwrite:true});
+assert.equal(Object.hasOwn(pdAction,"podDefaultName"), false, "raw PodDefault controls are never action fields");
+assert.equal(logic.podDefaultNameError("a".repeat(52)), "");
+assert.ok(logic.podDefaultNameError("a".repeat(53)).includes("52"), "the PodDefault creation name is capped at 52 bytes");
+assert.equal(logic.nfsPathError("/exports/kubeflow", ["/exports/kubeflow"]), "", "the approved NFS root itself is accepted");
+assert.equal(logic.nfsPathError("/exports/kubeflow/team", ["/exports/kubeflow"]), "");
+assert.ok(logic.nfsPathError("/exports/other", ["/exports/kubeflow"]), "an unapproved NFS root is refused");
+assert.ok(logic.nfsPathError("/exports/kubeflow/../other", ["/exports/kubeflow"]), "NFS traversal is refused");
+assert.equal(logic.beeGFSPathError("example.user/kf-shared-volume"), "");
+for (const value of ["/example.user", "../x", "foo//bar", "beegfs://host/home/x", "x?y=1"]) assert.ok(logic.beeGFSPathError(value), "invalid BeeGFS suffix refused: " + value);
+assert.equal(logic.directoryIDError("1000"), "");
+for (const value of ["0", "00", "-1", "1.5", "+1"]) assert.ok(logic.directoryIDError(value), "invalid directory ID refused: " + value);
+const nfsTemplate = {name:"nfs-template",kind:"nfs",storageClass:"nfs-csi",pvCapacity:"2400Gi",pvAccessModes:["ReadWriteMany"],pvcRequest:"10Gi",volumeMode:"Filesystem",nfsRoots:["/exports/kubeflow"]};
+const compatible = logic.compatiblePVs([
+  {kind:"PersistentVolume",name:"exact",state:"Available",details:{capacity:"2400Gi",storageClass:"nfs-csi",reclaimPolicy:"Retain",accessModes:"ReadWriteMany",registrationTemplate:"nfs-template"}},
+  {kind:"PersistentVolume",name:"larger-compatible",state:"Available",details:{capacity:"5000Gi",storageClass:"nfs-csi",reclaimPolicy:"Retain",accessModes:"ReadWriteMany",registrationTemplate:"nfs-template"}},
+  {kind:"PersistentVolume",name:"too-small",state:"Available",details:{capacity:"5Gi",storageClass:"nfs-csi",reclaimPolicy:"Retain",accessModes:"ReadWriteMany",registrationTemplate:"nfs-template"}},
+  {kind:"PersistentVolume",name:"wrong-class",state:"Available",details:{capacity:"2400Gi",storageClass:"standard",reclaimPolicy:"Retain",accessModes:"ReadWriteMany",registrationTemplate:"nfs-template"}},
+  {kind:"PersistentVolume",name:"claimed",state:"Available",details:{capacity:"2400Gi",storageClass:"nfs-csi",reclaimPolicy:"Retain",accessModes:"ReadWriteMany",claim:"team/data",registrationTemplate:"nfs-template"}},
+  {kind:"PersistentVolume",name:"wrong-mode-subset",state:"Available",details:{capacity:"2400Gi",storageClass:"nfs-csi",reclaimPolicy:"Retain",accessModes:"ReadOnlyMany",registrationTemplate:"nfs-template"}},
+  {kind:"PersistentVolume",name:"wrong-mode-superset",state:"Available",details:{capacity:"2400Gi",storageClass:"nfs-csi",reclaimPolicy:"Retain",accessModes:"ReadWriteMany,ReadOnlyMany",registrationTemplate:"nfs-template"}}
+], nfsTemplate, "nfs-csi").map(resource => resource.name);
+assert.deepEqual(compatible, ["exact", "larger-compatible"], "a larger compatible PV passes, while a too-small, wrong-class, claimed or mode-mismatched PV does not");
+const projectedModes = {...nfsTemplate, pvAccessModes:["ReadWriteMany","ReadOnlyMany"]};
+const observedStringModes = [
+  {kind:"PersistentVolume",name:"string-modes",state:"Available",details:{capacity:"2400Gi",storageClass:"nfs-csi",reclaimPolicy:"Retain",accessModes:"ReadWriteMany,ReadOnlyMany",registrationTemplate:"nfs-template"}},
+  {kind:"PersistentVolume",name:"wrong-subset",state:"Available",details:{capacity:"2400Gi",storageClass:"nfs-csi",reclaimPolicy:"Retain",accessModes:"ReadWriteMany",registrationTemplate:"nfs-template"}},
+  {kind:"PersistentVolume",name:"other-template",state:"Available",details:{capacity:"2400Gi",storageClass:"nfs-csi",reclaimPolicy:"Retain",accessModes:"ReadWriteMany,ReadOnlyMany",registrationTemplate:"other-template"}}
+];
+assert.deepEqual(logic.compatiblePVs(observedStringModes, projectedModes, "nfs-csi").map(resource => resource.name), ["string-modes"], "comma-separated modes must match the complete template set exactly and the template name must match");
+assert.equal(logic.beeGFSHandleError("example.user/x", "beegfs://beegfs.example.test/home"), "", "a bounded BeeGFS suffix passes");
+assert.ok(logic.beeGFSHandleError("a".repeat(120), "beegfs://beegfs.example.test/home"), "a joined BeeGFS handle over 128 bytes is refused");
+for (const value of ["bad%2fpath", "bad\\path", "bad:path", "bad@path", "bad?x", "bad#x", "bad path"]) assert.ok(logic.beeGFSPathError(value), "unsafe BeeGFS suffix refused: " + value);
+assert.ok(logic.nfsPathError("/exports/kubeflow%2fteam", ["/exports/kubeflow"]), "an encoded NFS escape is refused");
+assert.ok(logic.nfsPathError("\\exports\\kubeflow", ["/exports/kubeflow"]), "a backslash NFS path is refused");
+assert.equal(logic.directoryIDError("4294967294"), "", "the maximum 10-digit directory ID passes");
+assert.ok(logic.directoryIDError("4294967295"), "an ID above the 32-bit unsigned bound is refused");
+assert.ok(logic.directoryIDError("10000000000"), "an 11-digit directory ID is refused");
+for (const id of ["storage-directory-uid", "storage-directory-gid"]) {
+  const tag = [...html.matchAll(new RegExp(`<input[^>]*id="${id}"[^>]*>`, "g"))][0]?.[0] || "";
+  assert.ok(tag.includes('maxlength="10"') && tag.includes('inputmode="numeric"'), "the directory ID input keeps the 10-digit numeric contract: " + id);
+}
+
+assert.equal(logic.podDefaultSuggestion(nfsTemplate, "data").mountPath, "/home/jovyan/data", "the mount suggestion is prefilled but remains editable");
+assert.equal(logic.podDefaultSuggestion(null, "data").name, "mount-data");
+
 // The Profile quota count fields accept a deliberate zero hard limit. The
 // server enforces a non-negative quantity, so a native minimum of one would
 // make the browser refuse every update of a Profile that limits a count to

@@ -2,7 +2,11 @@
 // Shared pure presentation/payload logic, executable in local Node tests and in
 // the browser. No network access, credentials or Kubernetes manifests live here.
 ((root) => {
-  const kinds = { "profile.quota": "profile.quota.change", "pvc.create": "pvc.create.dynamic", "pv.nfs.create": "storage.create.static", "pv.reserve": "pv.reserve-and-claim" };
+  const kinds = { "profile.quota": "profile.quota.change", "pvc.create": "pvc.create.dynamic", "pv.nfs.create": "storage.create.static", "pv.reserve": "pv.reserve-and-claim", "pv.create.static": "pv.create.static", "pvc.create.bound": "pvc.create.bound" };
+  // The template-driven registration flows are separate typed actions. Their
+  // template, path, UID/GID and PodDefault fields are bound to the server-owned
+  // template; the browser only narrows the choice before preview.
+  const storageTemplateKinds = new Set(["pv.create.static", "pvc.create.bound"]);
   // The narrow storage document workflow. Editing and deletion are separate
   // server-owned actions; the browser only prepares a typed plan.
   const storageEditKinds = new Set(["pv.edit", "pvc.edit"]);
@@ -116,6 +120,48 @@
       delete action.force;
       if (!action.namespace) delete action.namespace;
     }
+    if (action.kind === "pv.create.static") {
+      // A new PV is cluster scoped and independent of any claim. Only typed
+      // template/path fields are sent; the server owns the rest.
+      action.reason = String(action.reason || "").trim();
+      if (!action.reason) delete action.reason;
+      delete action.namespace;
+      delete action.confirmName;
+      delete action.force;
+      if (!action.nfsPath) delete action.nfsPath;
+      if (!action.beeGFSPath) delete action.beeGFSPath;
+      delete action.directoryUID;
+      delete action.directoryGID;
+    }
+    if (action.kind === "pvc.create.bound") {
+      // Binding an existing PV carries the exact observed PV identity plus
+      // the optional PodDefault request. Unknown or unrelated form values are
+      // dropped before the request leaves the browser.
+      action.reason = String(action.reason || "").trim();
+      if (!action.reason) delete action.reason;
+      action.targetUID = String(action.targetUID ?? "");
+      action.targetResourceVersion = String(action.targetResourceVersion ?? "");
+      if (!action.directoryUID) delete action.directoryUID;
+      if (!action.directoryGID) delete action.directoryGID;
+      delete action.confirmName;
+      delete action.force;
+      delete action.nfsPath;
+      delete action.beeGFSPath;
+      if (!action.namespace) delete action.namespace;
+    }
+    // Optional PodDefault fields are only ever submitted as the typed object
+    // of a PVC creation. The raw form controls are never action fields.
+    delete action.podDefaultName;
+    delete action.podDefaultMountPath;
+    delete action.podDefaultOverwrite;
+    if (settings.podDefault && settings.podDefault.name) {
+      const mountPath = String(settings.podDefault.mountPath || "");
+      action.podDefault = {
+        name: String(settings.podDefault.name),
+        mountPath,
+        overwrite: settings.podDefault.overwrite === true
+      };
+    }
     return keepProfileFields(action);
   }
   function scopedResources(resources, namespace) {
@@ -164,6 +210,7 @@
   const actionLabels = {
     kind: "Change", namespace: "Namespace", name: "Name", reason: "Reason", owner: "Owner identity", quota: "Quota targets",
     storageClass: "Storage class", size: "Requested capacity", accessMode: "Access mode", pvName: "PV name", template: "Approved template", subdirectory: "Relative NFS subdirectory",
+    nfsPath: "NFS path", beeGFSPath: "BeeGFS relative path", directoryUID: "NFS directory UID", directoryGID: "NFS directory GID", podDefault: "PodDefault",
     container: "Named container", image: "Image", cpuRequest: "CPU request", cpuLimit: "CPU limit", memoryRequest: "Memory request", memoryLimit: "Memory limit",
     gpuPreset: "GPU preset", gpuCount: "GPU count", mounts: "Replacement PVC mounts", restart: "Restart after edit",
     force: "Force", confirmName: "Confirmation name", storageYAML: "Restricted YAML projection",
@@ -228,8 +275,38 @@
       fields.push(["Eligibility", action.kind === "pvc.delete"
         ? "The server revalidates that no observed Pod or Notebook references this claim."
         : "The server revalidates that the PersistentVolume is Available, unclaimed, unreserved and in an approved StorageClass."]);
+      if (action.kind === "pvc.delete") {
+        fields.push(["Related PodDefaults", "Any dependent PodDefault listed by the server's fresh review is deleted after the claim's unused checks. Shared or externally managed PodDefaults may also be listed; their other injected mounts and settings are removed from future matching Pods. Other PVCs are not deleted and existing Pod mounts are not removed."]);
+        fields.push(["Cleanup confirmations", "The typed claim name, the reason, the data-loss acknowledgement and the separate related-PodDefault acknowledgement are required. A newly observed reference refuses the plan and requires a fresh review; the server never removes a finalizer or forces cleanup."]);
+      }
       fields.push(["Confirmation", `The confirmation name must match "${action.name}" character for character. The browser-side data-loss acknowledgement is only a safeguard and is never sent as an action field.`]);
       fields.push(["Needs review", "If the result is needs-review, do not retry. Inspect Operations and History and ask the operator to review the target."]);
+    }
+    if (action.kind === "pvc.create.dynamic") {
+      fields.push(["Provisioning", "Dynamic provisioning asks the approved StorageClass to provision storage. With WaitForFirstConsumer the claim stays Pending until a consuming Pod is scheduled; Pending is not proof that provisioning or backend capacity will succeed."]);
+      if (action.podDefault) {
+        fields.push(["PodDefault", `Creates or explicitly overwrites the dedicated PodDefault ${action.podDefault.name} with the mount ${action.podDefault.mountPath}. It carries exactly one PVC volume and mount, an independent selector and no unrelated injected settings, and is never selected on a Notebook automatically. The PodDefault object may exist while the claim stays Pending; that is not proof of a successful mount.${action.podDefault.overwrite ? " The reviewed object is overwritten only after its exact UID/resourceVersion is revalidated." : ""}`]);
+      } else {
+        fields.push(["PodDefault", "No PodDefault is requested by this plan."]);
+      }
+      fields.push(["Partial result", "If the optional PodDefault step fails after claim creation, the claim is preserved and reported; it is never deleted as rollback and nothing is replayed automatically."]);
+    }
+    if (action.kind === "pv.create.static") {
+      fields.push(["New volume", "Creates one new PersistentVolume from the approved registration template. It is cluster-scoped, has no claimRef and is independent of any namespace or PVC. The template fixes the StorageClass, capacity, access modes, Filesystem mode, Retain policy, driver and backend prefix."]);
+      fields.push(["Entered path", "Only the NFS path or BeeGFS relative suffix is entered here. The server joins the fixed BeeGFS prefix without permitting scheme, authority, query, traversal or prefix escape."]);
+      fields.push(["Backend boundary", "This console does not create the backend directory, change filesystem ownership or enforce a directory capacity quota. Declared sizes are not proof of backend capacity."]);
+      fields.push(["Verification", "The server verifies the created identity and observed availability. A successful create alone does not prove backend readiness."]);
+    }
+    if (action.kind === "pvc.create.bound") {
+      fields.push(["Binding", "Creates a new PersistentVolumeClaim and binds it to the selected Available, unclaimed PersistentVolume. The selected PV is revalidated by UID, resourceVersion, class, capacity, access modes and volume mode before any write."]);
+      fields.push(["Sizes", "The PV capacity and the PVC request are independent template values. The claim request must not exceed the volume capacity."]);
+      if (action.podDefault) {
+        fields.push(["PodDefault", `Creates or explicitly overwrites the dedicated PodDefault ${action.podDefault.name} with the mount ${action.podDefault.mountPath}. It carries exactly one PVC volume and mount, an independent selector and no unrelated injected settings. It is never selected on a Notebook automatically.${action.podDefault.overwrite ? " The reviewed object is overwritten only after its exact UID/resourceVersion is revalidated." : ""}`]);
+      } else {
+        fields.push(["PodDefault", "No PodDefault is requested by this plan."]);
+      }
+      fields.push(["Partial result", "The claim is created before any PodDefault write. If the PodDefault step fails later, the claim/PV binding is preserved and reported; it is never deleted as a rollback."]);
+      fields.push(["Verification", "Admission and mount success require live acceptance; the plan only proves the typed request and reviewed dependencies."]);
     }
     return fields;
   }
@@ -778,6 +855,40 @@
     };
   }
 
+  // Operation mutation receipts are durable, server-recorded facts about
+  // accepted writes or verified observations: safe identity and outcome only.
+  // They are never
+  // planned changes, manifests, backend paths or secret-bearing settings.
+  const mutationReceiptOutcomes = new Set(["created", "reserved", "overwritten", "deleted", "available", "bound"]);
+  function mutationReceipts(operation) {
+    const raw = Array.isArray(operation?.mutationReceipts) ? operation.mutationReceipts : [];
+    return raw.map(receipt => {
+      if (!receipt || typeof receipt !== "object") return null;
+      const outcome = String(receipt.outcome || "").trim().toLowerCase();
+      const kind = String(receipt.kind || "").trim();
+      const name = String(receipt.name || "").trim();
+      if (!mutationReceiptOutcomes.has(outcome) || !kind || !name) return null;
+      return {
+        kind,
+        namespace: String(receipt.namespace || "").trim(),
+        name,
+        uid: String(receipt.uid || "").trim(),
+        resourceVersion: String(receipt.resourceVersion || "").trim(),
+        outcome
+      };
+    }).filter(Boolean);
+  }
+  function receiptOutcomeLabel(outcome) {
+    switch (String(outcome || "")) {
+      case "created": return "Created";
+      case "reserved": return "Reserved";
+      case "overwritten": return "Overwritten";
+      case "deleted": return "Deleted";
+      case "available": return "Available";
+      case "bound": return "Bound";
+      default: return "Recorded";
+    }
+  }
   function routeFor(pathname, search) {
     const path = String(pathname || "/");
     if (path === "/operations") return { page: "history", tab: "operations" };
@@ -841,10 +952,214 @@
     return paginate(sorted, state?.page || 1, perPage);
   }
 
+  // ---- Static provisioning paths and template eligibility ------------------
+  // These are browser-side early checks only. The server repeats every rule
+  // against its own typed configuration and refuses anything it cannot prove.
+  const pathControl = /[\u0000-\u001f\u007f]/;
+  function canonicalAbsolutePath(value) {
+    const raw = String(value ?? "");
+    if (!raw || raw !== raw.trim() || pathControl.test(raw)) return "";
+    if (!raw.startsWith("/") || raw === "/" || raw.endsWith("/")) return "";
+    if (/\/{2,}/.test(raw) || /\/(\.|\.\.)(\/|$)/.test(raw) || raw.includes("%") || raw.includes("\\")) return "";
+    return raw;
+  }
+  function canonicalRelativePath(value) {
+    const raw = String(value ?? "");
+    if (!raw || raw !== raw.trim() || pathControl.test(raw)) return "";
+    if (raw.startsWith("/") || /\/{2,}/.test(raw) || /(^|\/)\.\.?($|\/)/.test(raw)) return "";
+    // The BeeGFS driver decodes and joins the suffix. Refuse every segment
+    // that could change meaning after decoding or escaping.
+    if (/[%\\?#@:\s]/.test(raw)) return "";
+    return raw;
+  }
+  function utf8Length(value) {
+    let bytes = 0;
+    for (const char of String(value ?? "")) {
+      const code = char.codePointAt(0);
+      bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+    }
+    return bytes;
+  }
+  function beeGFSHandleError(value, prefix = "") {
+    const suffix = canonicalRelativePath(value);
+    if (!suffix) return beeGFSPathError(value);
+    const base = String(prefix || "").replace(/\/+$/, "");
+    if (base && utf8Length(base + "/" + suffix) > 128) return "The joined BeeGFS handle exceeds the supported 128-byte bound.";
+    return "";
+  }
+  function nfsPathError(value, roots = []) {
+    const path = canonicalAbsolutePath(value);
+    if (!path) return "Enter the complete canonical absolute NFS path, without a trailing slash, empty segment or traversal.";
+    const approved = (Array.isArray(roots) ? roots : []).map(root => canonicalAbsolutePath(root)).filter(Boolean);
+    if (!approved.length) return "";
+    const inside = approved.some(root => path === root || path.startsWith(root + "/"));
+    return inside ? "" : "The NFS path must be the template's approved root or one of its descendants.";
+  }
+  function beeGFSPathError(value) {
+    return canonicalRelativePath(value) ? "" : "Enter a canonical relative BeeGFS path without a leading slash, scheme, authority, query or traversal.";
+  }
+  function directoryIDError(value) {
+    const raw = String(value ?? "").trim();
+    if (!/^[1-9][0-9]{0,9}$/.test(raw) || Number(raw) > 4294967294) return "Enter a non-zero numeric directory UID/GID (1-4294967294) as a plain decimal string.";
+    return "";
+  }
+  function mountPathError(value, protectedPaths = ["/", "/home", "/home/jovyan"], prefix = "") {
+    const path = canonicalAbsolutePath(value);
+    if (!path) return "Enter a canonical absolute mount path without traversal.";
+    if (protectedPaths.includes(path)) return "Choose a directory below the protected mount path, not the path itself.";
+    const approvedPrefix = canonicalAbsolutePath(prefix);
+    if (approvedPrefix && (path === approvedPrefix || !path.startsWith(approvedPrefix + "/"))) {
+      return "The mount path must remain beneath the selected template's approved mount prefix.";
+    }
+    return "";
+  }
+  // The upstream PodDefault admission webhook derives an annotation whose name
+  // segment is "poddefault-" plus the object name, so the reviewed creation
+  // name is capped at 52 bytes independently of the object's normal 63.
+  const podDefaultNameMaxLength = 52;
+  function podDefaultNameError(value) {
+    const name = String(value ?? "").trim();
+    if (!name) return "A PodDefault name is required.";
+    if (name.length > podDefaultNameMaxLength) return `The PodDefault name is limited to ${podDefaultNameMaxLength} bytes by the installed admission schema.`;
+    if (!/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(name)) return "Use lowercase letters, digits, interior hyphens or dots, starting and ending with a letter or digit.";
+    if (name.split(".").some(label => label.length > 63)) return "Each dot-separated PodDefault name segment is limited to 63 characters.";
+    return "";
+  }
+  function templateKind(template) {
+    const raw = String(template?.kind ?? template?.type ?? "").trim().toLowerCase();
+    return raw.indexOf("bee") === 0 ? "beegfs" : raw === "nfs" ? "nfs" : raw;
+  }
+  function templateLabel(template) {
+    if (!template) return "";
+    const kind = templateKind(template) === "beegfs" ? "BeeGFS" : templateKind(template).toUpperCase();
+    return `${template.name || "template"} · ${kind}${template.storageClass ? " · " + template.storageClass : ""}`;
+  }
+  // A template is eligible for an action when its backend kind is supported by
+  // that action and its approved fields are present. The browser never invents
+  // a template or a class.
+  function templatesForKind(templates, kind) {
+    const wanted = kind === "pv.create.static" || kind === "pvc.create.bound";
+    if (!wanted) return [];
+    return (Array.isArray(templates) ? templates : []).filter(template =>
+      template && template.name && template.storageClass &&
+      (templateKind(template) === "nfs" || templateKind(template) === "beegfs"));
+  }
+  function quantityBytes(value) {
+    const text = String(value ?? "").trim();
+    const match = /^([0-9]+(?:\.[0-9]+)?)([KMGTPE]i?)?$/.exec(text);
+    if (!match) return null;
+    const suffix = match[2] || "";
+    const binary = suffix.length > 1 && suffix.endsWith("i");
+    const unit = suffix.replace(/i$/, "").toUpperCase();
+    const factors = { "": 1, K: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18 };
+    if (binary) {
+      const powers = { K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4, P: 1024 ** 5, E: 1024 ** 6 };
+      return Number(match[1]) * (powers[unit] || 1);
+    }
+    return Number(match[1]) * (factors[unit] || 1);
+  }
+  function compatiblePV(resource, template, storageClass = "") {
+    if (!resource || resource.kind !== "PersistentVolume" || !template) return false;
+    if (String(resource.state || "") !== "Available") return false;
+    const details = resource.details || {};
+    if (details.claim) return false;
+    if (String(details.reclaimPolicy || "") && String(details.reclaimPolicy) !== "Retain") return false;
+    const wantedClass = String(storageClass || template.storageClass || "");
+    if (!wantedClass || String(details.storageClass || "") !== wantedClass) return false;
+    const volumeMode = String(details.volumeMode || "Filesystem");
+    if (template.volumeMode && volumeMode !== String(template.volumeMode)) return false;
+    // Inventory projects access modes as a comma-separated safe string; a
+    // future structured projection is also accepted. Backend sources, paths
+    // and handles never appear here.
+    const modes = (Array.isArray(details.accessModes) ? details.accessModes : String(details.accessModes || "").split(",")).map(value => String(value).trim()).filter(Boolean);
+    const wantedModes = Array.isArray(template.pvAccessModes) ? template.pvAccessModes.map(String) : [];
+    if (wantedModes.length) {
+      // The backend compares the complete access-mode set, not an
+      // intersection. Missing observation metadata, a missing extra mode and
+      // an additional superset mode are all incompatible with the template.
+      if (!modes.length || modes.length !== wantedModes.length) return false;
+      const observed = new Set(modes);
+      if (!wantedModes.every(mode => observed.has(mode)) || !modes.every(mode => wantedModes.includes(mode))) return false;
+    }
+    const capacity = quantityBytes(details.capacity);
+    const requested = quantityBytes(template.pvcRequest);
+    // An existing compatible PV may be larger than the template's default
+    // capacity. Only the reviewed PVC request must fit; a larger volume is a
+    // valid binding target.
+    if (capacity !== null && requested !== null && requested > capacity) return false;
+    // The backend's safe inventory projection names the unique registration
+    // template that the observed volume matches. A different template is not
+    // a valid target even when class and size happen to agree.
+    if (details.registrationTemplate && String(details.registrationTemplate) !== String(template.name)) return false;
+    return true;
+  }
+  function compatiblePVs(resources, template, storageClass = "") {
+    return (Array.isArray(resources) ? resources : []).filter(resource => compatiblePV(resource, template, storageClass));
+  }
+  function podDefaultSuggestion(template, claimName) {
+    const name = String(claimName || "");
+    const base = String(template?.podDefaultMountPathPrefix || "/home/jovyan").replace(/\/+$/, "");
+    return {
+      name: String(template?.podDefaultName || (name ? "mount-" + name : "")),
+      mountPath: name ? `${base}/${name}` : ""
+    };
+  }
+  function storageActionError(kind, values = {}) {
+    if (kind === "pv.create.static") {
+      if (!String(values.name || "").trim()) return "A new PersistentVolume name is required.";
+      const template = values.template;
+      if (!template) return "Select an approved registration template for the new PersistentVolume.";
+      if (templateKind(template) === "nfs") return nfsPathError(values.nfsPath, template.nfsRoots);
+      if (templateKind(template) === "beegfs") return beeGFSHandleError(values.beeGFSPath, template.beegfsPrefix);
+      return "The selected template has no supported backend kind.";
+    }
+    if (kind === "pvc.create" || kind === "pvc.create.dynamic") {
+      if (!String(values.namespace || "").trim()) return "Select the namespace for the new PersistentVolumeClaim.";
+      if (!String(values.name || "").trim()) return "A new PersistentVolumeClaim name is required.";
+      if (values.podDefault) {
+        const nameError = podDefaultNameError(values.podDefault.name);
+        if (nameError) return nameError;
+        if (!String(values.podDefault.mountPath || "").trim()) return "A PodDefault mount path is required when PodDefault creation is enabled.";
+        const mountError = mountPathError(values.podDefault.mountPath);
+        if (mountError) return mountError;
+        if (values.podDefault.collision && values.podDefault.overwrite !== true) return "An observed PodDefault with this name already exists. Review the overwrite warning and check the explicit overwrite acknowledgement, or choose another name.";
+      }
+      return "";
+    }
+    if (kind === "pvc.create.bound") {
+      if (!String(values.namespace || "").trim()) return "Select the namespace for the new PersistentVolumeClaim.";
+      if (!String(values.name || "").trim()) return "A new PersistentVolumeClaim name is required.";
+      const template = values.template;
+      if (!template) return "Select an approved registration template for the claim.";
+      if (!String(values.pvName || "").trim()) return "Select the Available PersistentVolume to bind.";
+      if (templateKind(template) === "nfs") {
+        // pvc.create.bound never accepts an NFS path: the selected volume
+        // already carries its fixed backend path. Only the two reviewed
+        // directory ID annotations are supplied.
+        const uidError = directoryIDError(values.directoryUID);
+        if (uidError) return "Directory UID: " + uidError;
+        const gidError = directoryIDError(values.directoryGID);
+        if (gidError) return "Directory GID: " + gidError;
+      }
+      if (values.podDefault) {
+        const nameError = podDefaultNameError(values.podDefault.name);
+        if (nameError) return nameError;
+        if (!String(values.podDefault.mountPath || "").trim()) return "A PodDefault mount path is required when PodDefault creation is enabled.";
+        const mountError = mountPathError(values.podDefault.mountPath, undefined, template?.podDefaultMountPathPrefix || "");
+        if (mountError) return mountError;
+        if (values.podDefault.collision && values.podDefault.overwrite !== true) return "An observed PodDefault with this name already exists. Review the overwrite warning and check the explicit overwrite acknowledgement, or choose another name.";
+      }
+      return "";
+    }
+    return "";
+  }
+
   const logic = {
     buildAction, scopedResources, containerNames, previewFields,
     queryPodFilters, podNodeHref, podMatchesFilters, runningPodsOnNode,
-    storageActionKind, storageTargetKey,
+    storageActionKind, storageTargetKey, storageTemplateKinds,
+    canonicalAbsolutePath, canonicalRelativePath, nfsPathError, beeGFSPathError, beeGFSHandleError, utf8Length, directoryIDError, mountPathError, podDefaultNameError, podDefaultNameMaxLength,
+    templateKind, templateLabel, templatesForKind, quantityBytes, compatiblePV, compatiblePVs, podDefaultSuggestion, storageActionError,
     quantityValue, timeValue, severityValue, readyValue, naturalCompare, isMissing,
     sortRows, searchMatch, filterRows, paginate,
     parseTarget, actorLabel, groupAudit,
@@ -852,6 +1167,7 @@
     profileNameMaxLength, profileNameValidation, profileFormValues, profileQuotaValues, profileDeleteValidation, visibleResourceDetails,
     builtinQuotaKeys, deviceQuotaKey, profileQuotaKind, profileQuotaCounts, isWholeQuotaCountValue, bareDeviceQuotaKeys, profileDeviceQuotaWarning,
     namespaceResources, formatAge, workspaceHealthSummary,
+    mutationReceipts, receiptOutcomeLabel,
     routeFor, queryNamespace, hrefFor, historyHref, needsRefresh,
     notificationID, shouldRememberDismissals, dismissalStorageKey,
     defaultTableState, nextSort, withPage, viewRows

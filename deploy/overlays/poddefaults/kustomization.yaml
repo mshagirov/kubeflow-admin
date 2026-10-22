@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - rbac.yaml
+# Permissions only; features.podDefaults, writesEnabled and the matching PVC
+# workflow gates remain false/independent. For a composed site overlay, copy
+# rbac.yaml into deploy/site/ and list it there; do not include the base twice.
+# A disposable pilot may bind a namespace-scoped Role instead of this
+# cluster-wide binding after reviewing the exact namespaces.

@@ -35,7 +35,7 @@ const (
 	// pass a shorter deadline, never a longer effective one.
 	DefaultCleanupTimeout = 500 * time.Millisecond
 
-	retentionBatchAudit      = 500
+	retentionBatchAudit = 500
 	// Keep the write batch comfortably inside DefaultCleanupTimeout even under
 	// race-detector or slow-storage load. A timed-out transaction rolls back, so
 	// an oversized batch could otherwise prevent retention progress entirely.
@@ -421,16 +421,17 @@ func (s *Store) cleanupOperations(ctx context.Context, p HistoryPolicy, now time
 		}
 		if !op.HistoryExpired {
 			compact := model.Operation{
-				ID:             op.ID,
-				PlanID:         op.PlanID,
-				Actor:          op.Actor,
-				ActorDisplay:   op.ActorDisplay,
-				HistoryExpired: true,
-				Target:         op.Target,
-				Action:         op.Action,
-				State:          op.State,
-				CreatedAt:      op.CreatedAt,
-				UpdatedAt:      op.UpdatedAt,
+				ID:               op.ID,
+				PlanID:           op.PlanID,
+				Actor:            op.Actor,
+				ActorDisplay:     op.ActorDisplay,
+				HistoryExpired:   true,
+				Target:           op.Target,
+				Action:           op.Action,
+				State:            op.State,
+				MutationReceipts: append([]model.MutationReceipt(nil), op.MutationReceipts...),
+				CreatedAt:        op.CreatedAt,
+				UpdatedAt:        op.UpdatedAt,
 			}
 			value, err := json.Marshal(compact)
 			if err != nil {

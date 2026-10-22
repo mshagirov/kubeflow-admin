@@ -182,7 +182,7 @@ async function buildFixture() {
 // offline by construction: the fixture never opens a kubeconfig and never
 // talks to a cluster. A fixed port keeps the base URL stable; an occupied
 // port falls back to an ephemeral one.
-async function startFixture({ artifact, writes = true, deletion = true, contract = true, storageEditing = true, storageDeletion = true, port } = {}) {
+async function startFixture({ artifact, writes = true, deletion = true, contract = true, storageEditing = true, storageDeletion = true, podDefaults = true, port } = {}) {
   const launch = async requestedPort => {
     const child = spawn(artifact, [], {
       env: {
@@ -193,6 +193,7 @@ async function startFixture({ artifact, writes = true, deletion = true, contract
         KF_ADMIN_NOTEBOOK_CONTRACT: contract ? "1" : "0",
         KF_ADMIN_STORAGE_EDITING: storageEditing ? "1" : "0",
         KF_ADMIN_STORAGE_DELETION: storageDeletion ? "1" : "0",
+        KF_ADMIN_POD_DEFAULTS: podDefaults ? "1" : "0",
         KF_ADMIN_PORT: requestedPort || ""
       },
       stdio: ["ignore", "pipe", "pipe"]
@@ -1460,12 +1461,18 @@ async function checkCollidingResourceRows(context) {
   await gotoTable(page, context.base, "/storage", "storage");
   const rows = page.locator('[data-table="storage"] tbody tr');
   const nameOf = async row => (await row.locator('.resource-name > span, .resource-name > button.link-button').first().innerText()).trim();
-  const claimCell = rows.getByRole("cell", { name: "PersistentVolumeClaim", exact: true }).first();
-  const volumeCell = rows.getByRole("cell", { name: "PersistentVolume", exact: true }).first();
-  assert.ok(await volumeCell.count(), "the storage table does not show the PersistentVolume row");
-  assert.ok(await claimCell.count(), "the storage table does not show the PersistentVolumeClaim row");
-  const claimRow = claimCell.locator("xpath=ancestor::tr");
-  const volumeRow = volumeCell.locator("xpath=ancestor::tr");
+  const findStorageRow = async kind => {
+    for (let index = 0; index < await rows.count(); index++) {
+      const row = rows.nth(index);
+      if (await rowKind(row) !== kind) continue;
+      if (await nameOf(row) === "data") return row;
+    }
+    return null;
+  };
+  const claimRow = await findStorageRow("PersistentVolumeClaim");
+  const volumeRow = await findStorageRow("PersistentVolume");
+  assert.ok(volumeRow, "the storage table does not show the PersistentVolume row named data");
+  assert.ok(claimRow, "the storage table does not show the PersistentVolumeClaim row named data");
   assert.equal(await nameOf(claimRow), "data", "the colliding claim row does not show the name data");
   assert.equal(await nameOf(volumeRow), "data", "the colliding volume row does not show the name data");
   const label = await claimRow.locator("button.link-button").first().getAttribute("aria-label");
@@ -1778,6 +1785,7 @@ async function checkStorageDeletePayload(context) {
   assert.match(await drawer.locator("#storage-delete-form .form-error").innerText(), /does not match/i,
     "the exact confirmation mismatch is not explained");
   await drawer.locator("#storage-delete-confirm").fill("data");
+  await drawer.locator("#storage-delete-pod-default-ack").check();
   await drawer.locator('button[type="submit"]').click();
   await assertLivePlan(context, capture, before + 1);
   const plan = capture.plans[before];
@@ -1791,6 +1799,7 @@ async function checkStorageDeletePayload(context) {
   assert.equal(plan.body.force, undefined, "the deletion carries a force flag");
   assert.equal(plan.body.storageYAML, undefined, "the deletion carries a YAML projection");
   assert.equal(plan.body.dataLossAck, undefined, "the browser acknowledgement reached the plan API");
+  assert.equal(plan.body.confirmPodDefaultCleanup, true, "the related PodDefault cleanup acknowledgement is not submitted");
   // The fixture only records a pending operation.
   const operationsBefore = capture.operations.length;
   await page.locator("#confirm-plan").check();
@@ -1843,6 +1852,230 @@ async function checkStorageDeletePayload(context) {
   assert.equal(pvPlan.body.namespace, undefined, "a PV deletion carries a namespace");
   assert.equal(pvPlan.body.confirmName, "spare-volume");
   await page.locator("#cancel-plan").click();
+}
+
+// The right-side drawer header (title and subtitle) keeps a deliberate gap
+// from the first form entry at both the phone and desktop widths.
+async function checkStorageHeaderSpacing(context) {
+  const { page } = context;
+  await page.goto(context.base + "/storage", { waitUntil: "domcontentloaded" });
+  await page.locator('[data-open-drawer="storage"]').click();
+  const drawer = page.locator("#storage-drawer");
+  await drawer.waitFor({ state: "visible" });
+  const geometry = await drawer.evaluate(node => {
+    const title = node.querySelector(".drawer-head h2").getBoundingClientRect();
+    const subtitle = node.querySelector(".drawer-head .eyebrow").getBoundingClientRect();
+    const first = node.querySelector("#storage-form label").getBoundingClientRect();
+    const head = node.querySelector(".drawer-head").getBoundingClientRect();
+    return {
+      titleToEntry: first.top - title.bottom,
+      subtitleToEntry: first.top - subtitle.bottom,
+      bodyTop: first.top - head.bottom
+    };
+  });
+  assert.ok(geometry.titleToEntry >= 32, "the drawer title is too close to the first entry: " + JSON.stringify(geometry));
+  assert.ok(geometry.subtitleToEntry >= 32, "the drawer subtitle is too close to the first entry: " + JSON.stringify(geometry));
+  assert.ok(geometry.bodyTop >= 12, "the drawer header has no separating padding: " + JSON.stringify(geometry));
+  await page.keyboard.press("Escape");
+}
+
+// The separate PV registration and bound-PVC workflows produce the exact typed
+// action. The synthetic fixture records the request only; it never mutates a
+// cluster.
+async function checkStorageRegistrationPayloads(context) {
+  const { page, capture } = context;
+  const openNew = async () => {
+    await page.goto(context.base + "/storage", { waitUntil: "domcontentloaded" });
+    await page.locator('[data-open-drawer="storage"]').click();
+    const drawer = page.locator("#storage-drawer");
+    await drawer.waitFor({ state: "visible" });
+    return drawer;
+  };
+  let drawer = await openNew();
+  await drawer.locator("#storage-kind").selectOption("pv.create.static");
+  await page.waitForFunction(() => {
+    const select = document.querySelector("#storage-registration-template");
+    return select && [...select.options].some(option => option.value === "nfs-template");
+  });
+  await drawer.locator("#storage-registration-template").selectOption("nfs-template");
+  await page.waitForFunction(() => document.querySelector("#storage-class").value === "nfs-csi");
+  const facts = (await drawer.locator("#storage-template-facts").innerText()).trim();
+  for (const text of ["nfs-template", "2400Gi", "ReadWriteMany", "Retain", "nfs.example.test", "/exports/kubeflow"]) {
+    assert.ok(facts.includes(text), "the read-only registration template facts are missing: " + text);
+  }
+  assert.equal(await drawer.locator("#storage-nfs-path").isVisible(), true, "the NFS path is not offered for a new PV");
+  assert.equal(await drawer.locator("#storage-directory-uid").isVisible(), false, "a new PV asks for NFS directory IDs");
+  await drawer.locator('#storage-pv-name').fill("browser-nfs-pv");
+  await drawer.locator("#storage-nfs-path").fill("/exports/kubeflow/browser");
+  await drawer.locator('#storage-form [name="reason"]').fill("Register the synthetic NFS volume");
+  let before = capture.plans.length;
+  await drawer.locator('#storage-form button[type="submit"]').click();
+  await assertLivePlan(context, capture, before + 1);
+  const nfsPlan = capture.plans[before].body;
+  assert.equal(nfsPlan.kind, "pv.create.static");
+  assert.equal(nfsPlan.name, "browser-nfs-pv", "the entered PV name was not submitted as name");
+  assert.equal(nfsPlan.storageClass, "nfs-csi");
+  assert.equal(nfsPlan.template, "nfs-template");
+  assert.equal(nfsPlan.nfsPath, "/exports/kubeflow/browser");
+  assert.equal(nfsPlan.beeGFSPath, undefined);
+  assert.equal(nfsPlan.namespace, undefined);
+  assert.equal(nfsPlan.pvName, undefined);
+  assert.equal(nfsPlan.podDefault, undefined);
+  await page.locator("#cancel-plan").click();
+
+  drawer = await openNew();
+  await drawer.locator("#storage-kind").selectOption("pv.create.static");
+  await drawer.locator("#storage-registration-template").selectOption("beegfs-template");
+  await page.waitForFunction(() => document.querySelector("#storage-class").value === "beegfs-csi");
+  assert.equal(await drawer.locator("#storage-beegfs-path").isVisible(), true, "the BeeGFS suffix is not offered for a new PV");
+  assert.equal(await drawer.locator("#storage-nfs-path").isVisible(), false, "an NFS path is offered for a BeeGFS template");
+  await drawer.locator('#storage-pv-name').fill("browser-beegfs-pv");
+  await drawer.locator("#storage-beegfs-path").fill("example.user/browser");
+  await drawer.locator('#storage-form [name="reason"]').fill("Register the synthetic BeeGFS volume");
+  before = capture.plans.length;
+  await drawer.locator('#storage-form button[type="submit"]').click();
+  await assertLivePlan(context, capture, before + 1);
+  const beegfsPlan = capture.plans[before].body;
+  assert.equal(beegfsPlan.kind, "pv.create.static");
+  assert.equal(beegfsPlan.beeGFSPath, "example.user/browser");
+  assert.equal(beegfsPlan.nfsPath, undefined);
+  assert.equal(beegfsPlan.directoryUID, undefined);
+  await page.locator("#cancel-plan").click();
+
+  // A bound claim submits the selected PV identity and optional PodDefault,
+  // never a backend path.
+  drawer = await openNew();
+  await drawer.locator("#storage-kind").selectOption("pvc.create.bound");
+  await drawer.locator("#storage-registration-template").selectOption("nfs-template");
+  await drawer.locator('#storage-form [name="namespace"]').selectOption("team-alpha");
+  await drawer.locator('#storage-claim-name').fill("browser-bound-claim");
+  await page.waitForFunction(() => [...document.querySelectorAll("#bound-pv-selector option")].some(option => option.value === "nfs-registered"));
+  await drawer.locator("#bound-pv-selector").selectOption("nfs-registered");
+  assert.equal(await drawer.locator("#storage-nfs-path").isVisible(), false, "a bound claim still offers an NFS path");
+  assert.equal(await drawer.locator("#storage-beegfs-path").isVisible(), false, "a bound claim still offers a BeeGFS path");
+  await drawer.locator("#storage-directory-uid").fill("1000");
+  await drawer.locator("#storage-directory-gid").fill("2000");
+  await drawer.locator("#storage-pod-default-enable").check();
+  await page.waitForFunction(() => document.querySelector("#storage-pod-default-name").value === "mount-toast");
+  await drawer.locator("#storage-pod-default-mount-path").fill("/home/jovyan/browser-bound-claim");
+  await drawer.locator('#storage-form [name="reason"]').fill("Bind the synthetic reviewed volume");
+  before = capture.plans.length;
+  await drawer.locator('#storage-form button[type="submit"]').click();
+  await page.waitForTimeout(300);
+  assert.equal(capture.plans.length, before, "a same-namespace PodDefault collision reached the plan API without overwrite");
+  assert.match(await drawer.locator("#storage-form .form-error").innerText(), /overwrite/i, "the collision does not require explicit overwrite");
+  assert.equal(await drawer.locator("#storage-pod-default-warning").isVisible(), true, "the overwrite warning is not visible");
+  await drawer.locator("#storage-pod-default-overwrite").check();
+  await drawer.locator('#storage-form button[type="submit"]').click();
+  await assertLivePlan(context, capture, before + 1);
+  const boundPlan = capture.plans[before].body;
+  assert.equal(boundPlan.kind, "pvc.create.bound");
+  assert.equal(boundPlan.namespace, "team-alpha");
+  assert.equal(boundPlan.name, "browser-bound-claim");
+  assert.equal(boundPlan.pvName, "nfs-registered");
+  assert.equal(boundPlan.targetUID, "uid-pv-nfs-registered");
+  assert.equal(boundPlan.targetResourceVersion, "77");
+  assert.equal(boundPlan.directoryUID, "1000");
+  assert.equal(boundPlan.directoryGID, "2000");
+  assert.equal(boundPlan.nfsPath, undefined);
+  assert.equal(boundPlan.beeGFSPath, undefined);
+  assert.deepEqual(boundPlan.podDefault, { name: "mount-toast", mountPath: "/home/jovyan/browser-bound-claim", overwrite: true });
+  await page.locator("#cancel-plan").click();
+
+  // Dynamic PVC creation also offers the optional PodDefault while keeping
+  // the Pending/WaitForFirstConsumer boundary visible.
+  drawer = await openNew();
+  await drawer.locator("#storage-kind").selectOption("pvc.create");
+  await drawer.locator('#storage-form [name="namespace"]').selectOption("team-alpha");
+  await drawer.locator('#storage-claim-name').fill("browser-dynamic-claim");
+  await drawer.locator("#storage-class").selectOption({ index: 1 });
+  await drawer.locator('#storage-form [name="size"]').fill("7Gi");
+  await drawer.locator('#storage-form [name="accessMode"]').selectOption("ReadWriteOnce");
+  const dynamicHint = (await drawer.locator("#storage-size-hint").innerText()).trim();
+  assert.ok(dynamicHint.includes("WaitForFirstConsumer") && dynamicHint.includes("Pending"), "the dynamic form does not explain the pending provisioning boundary");
+  await drawer.locator("#storage-pod-default-enable").check();
+  await drawer.locator("#storage-pod-default-name").fill("mount-dynamic-browser");
+  await drawer.locator("#storage-pod-default-mount-path").fill("/home/jovyan/browser-dynamic-claim");
+  await drawer.locator('#storage-form [name="reason"]').fill("Create the synthetic dynamic claim");
+  before = capture.plans.length;
+  await drawer.locator('#storage-form button[type="submit"]').click();
+  await assertLivePlan(context, capture, before + 1);
+  const dynamicPlan = capture.plans[before].body;
+  assert.equal(dynamicPlan.kind, "pvc.create.dynamic");
+  assert.equal(dynamicPlan.podDefault.name, "mount-dynamic-browser");
+  assert.equal(dynamicPlan.nfsPath, undefined);
+  assert.equal(dynamicPlan.beeGFSPath, undefined);
+  await page.locator("#cancel-plan").click();
+
+  // A same-named PodDefault in another namespace is not a collision.
+  drawer = await openNew();
+  await drawer.locator("#storage-kind").selectOption("pvc.create.bound");
+  await drawer.locator("#storage-registration-template").selectOption("nfs-template");
+  await drawer.locator('#storage-form [name="namespace"]').selectOption("team-beta");
+  await drawer.locator('#storage-claim-name').fill("browser-bound-beta");
+  await page.waitForFunction(() => [...document.querySelectorAll("#bound-pv-selector option")].some(option => option.value === "nfs-registered"));
+  await drawer.locator("#bound-pv-selector").selectOption("nfs-registered");
+  await drawer.locator("#storage-directory-uid").fill("1000");
+  await drawer.locator("#storage-directory-gid").fill("2000");
+  await drawer.locator("#storage-pod-default-enable").check();
+  await drawer.locator("#storage-pod-default-name").fill("mount-toast");
+  await drawer.locator("#storage-pod-default-mount-path").fill("/home/jovyan/browser-bound-beta");
+  assert.equal(await drawer.locator("#storage-pod-default-warning").isVisible(), false, "a PodDefault in another namespace is treated as a collision");
+
+  // A template switch clears every dependent target field.
+  await drawer.locator("#storage-registration-template").selectOption("beegfs-template");
+  assert.equal(await drawer.locator("#bound-pv-selector").inputValue(), "", "a template switch kept the old PV selected");
+  assert.equal(await drawer.locator("#storage-directory-uid").inputValue(), "", "a template switch kept the old directory UID");
+  assert.equal(await drawer.locator("#storage-directory-gid").inputValue(), "", "a template switch kept the old directory GID");
+  await page.keyboard.press("Escape");
+}
+
+async function checkStoragePodDefaultGated(context) {
+  const { page } = context;
+  await page.goto(context.base + "/storage", { waitUntil: "domcontentloaded" });
+  await page.locator('[data-open-drawer="storage"]').click();
+  const drawer = page.locator("#storage-drawer");
+  await drawer.waitFor({ state: "visible" });
+  await drawer.locator("#storage-kind").selectOption("pvc.create.bound");
+  await page.waitForFunction(() => {
+    const select = document.querySelector("#storage-registration-template");
+    return select && [...select.options].some(option => option.value === "nfs-template");
+  });
+  await drawer.locator("#storage-registration-template").selectOption("nfs-template");
+  assert.equal(await drawer.locator("#storage-pod-default").isVisible(), false, "the optional PodDefault block is offered while its gate is off");
+  assert.equal(await drawer.locator("#storage-pod-default-enable").isDisabled(), true, "the gated PodDefault switch is actionable");
+  await page.keyboard.press("Escape");
+}
+
+// Durable mutation receipts are visible in the existing History → Operations
+// row detail. They show only actual, safe identities and stay distinct from the
+// planned changes; a needs-review operation keeps that state explicit.
+async function checkMutationReceipts(context) {
+  const { page } = context;
+  await page.goto(context.base + "/history", { waitUntil: "domcontentloaded" });
+  const table = page.locator('[data-table="historyOperations"]');
+  await table.waitFor({ state: "visible" });
+  const details = table.locator(".receipt-details");
+  await details.first().waitFor({ state: "attached", timeout: 10000 });
+  assert.equal(await details.count(), 2, "the fixture receipts are not rendered as row details");
+  const summaries = await details.locator("summary").evaluateAll(nodes => nodes.map(node => (node.textContent || "").trim()));
+  assert.ok(summaries.some(text => text.includes("Created")), "the PVC creation receipt is not summarized");
+  assert.ok(summaries.some(text => text.includes("Deleted")), "the PodDefault deletion receipt is not summarized");
+  const created = details.filter({ hasText: "Created" }).first();
+  await created.locator("summary").click();
+  const createdBody = await created.locator(".receipt-body").innerText();
+  for (const text of ["PersistentVolumeClaim", "partial-claim", "uid-pvc-partial-claim", "88", "needs-review", "known completed facts", "separately from planned changes", "do not prove mount or admission readiness"]) {
+    assert.ok(createdBody.includes(text), "the created receipt is missing: " + text);
+  }
+  const deleted = details.filter({ hasText: "Deleted" }).first();
+  await deleted.locator("summary").click();
+  const deletedBody = await deleted.locator(".receipt-body").innerText();
+  for (const text of ["PodDefault", "mount-review-claim", "uid-pd-team-alpha-review", "needs-review"]) {
+    assert.ok(deletedBody.includes(text), "the deletion receipt is missing: " + text);
+  }
+  for (const forbidden of ["nfsPath", "beeGFSPath", "storageYAML", "never-render"]) {
+    assert.ok(!(await table.innerText()).includes(forbidden), "the receipt flow exposes a planned or secret field: " + forbidden);
+  }
 }
 
 // The storage actions stay visible but disabled when either opt-in or writes
@@ -2353,7 +2586,7 @@ async function checkResponsive(context) {
       const noContract = await startFixture({ artifact, writes: true, deletion: false, contract: false, port: NOCONTRACT_FIXTURE_PORT });
       fixtures.push(noContract);
       noContractBase = noContract.base;
-      const storageGated = await startFixture({ artifact, writes: true, deletion: false, storageEditing: false, storageDeletion: false, port: STORAGE_GATED_FIXTURE_PORT });
+      const storageGated = await startFixture({ artifact, writes: true, deletion: false, storageEditing: false, storageDeletion: false, podDefaults: false, port: STORAGE_GATED_FIXTURE_PORT });
       fixtures.push(storageGated);
       storageGatedBase = storageGated.base;
     } catch (error) {
@@ -2420,9 +2653,14 @@ async function checkResponsive(context) {
     await run("the observed details open the right hand drawer", checkResourceDetailsDrawer);
     await run("a Node opens its exact Running Pods view", checkNodeScopedPods);
     await run("only PV and PVC details offer Edit and Delete", checkStorageDetailsActions);
+    await run("registration template PV and bound PVC forms produce the exact typed plan", checkStorageRegistrationPayloads);
+    await run("the right drawer title and subtitle keep their distance from the first entry", checkStorageHeaderSpacing, { viewport: DESKTOP });
+    await run("the right drawer title and subtitle keep their distance from the first entry at 390px", checkStorageHeaderSpacing, { viewport: MOBILE });
+    await run("durable operation receipts show actual created and deleted identities", checkMutationReceipts);
     await run("the storage YAML editor binds the exact target and submits one plan", checkStorageEditPayload);
     await run("storage deletion needs an exact confirmation and records a pending plan", checkStorageDeletePayload);
     await run("gated storage actions stay visible with the exact policy reason", checkStorageGated, { base: storageGatedBase });
+    await run("the optional PodDefault block is gated off visibly", checkStoragePodDefaultGated, { base: storageGatedBase });
     await run("read-only storage actions stay visible with the write policy reason", context => checkStorageGated(context, "writes"), { base: readonlyBase });
     await run("Manage Notebook binds the exact observed target and returns focus", checkNotebookManagementTarget);
     await run("Notebook Edit keeps blank fields and sends exactly the typed change", checkNotebookEditBlankAndPayload);

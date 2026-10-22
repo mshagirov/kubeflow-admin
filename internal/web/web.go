@@ -72,6 +72,11 @@ type pageFeatures struct {
 	// opt-in and writes must be true before the browser offers the action.
 	StorageEditing  bool
 	StorageDeletion bool
+	// PodDefaults is the separate opt-in for the optional PodDefault that can
+	// accompany a PVC-from-existing-PV creation and for reviewed PodDefault
+	// cleanup during PVC deletion. It is never implied by WritesEnabled,
+	// StaticStorage or the storage editing/deletion opt-ins.
+	PodDefaults bool
 }
 type pageNotebooks struct {
 	ControllerContractConfirmed bool
@@ -86,6 +91,11 @@ type pageStorage struct {
 	AllowedStorageClasses []string
 	NFSTemplates          []pageTemplate
 	CSITemplates          []pageTemplate
+	// RegistrationTemplates reports whether at least one approved typed
+	// registration template is configured. The template values themselves are
+	// never bootstrapped here: the browser reads the single approved
+	// inventory.storageTemplates projection after its normal inventory fetch.
+	RegistrationTemplates bool
 }
 type pageTemplate struct {
 	Name         string
@@ -122,6 +132,9 @@ func buildPageView(identity model.Identity, cfg config.Config) pageView {
 				ProfileDeletion: cfg.Features.ProfileDeletion && cfg.Features.WritesEnabled,
 				StorageEditing:  cfg.Features.StorageEditing && cfg.Features.WritesEnabled,
 				StorageDeletion: cfg.Features.StorageDeletion && cfg.Features.WritesEnabled,
+				// PodDefault support is an independent opt-in. The browser
+				// only offers the optional block when writes are enabled too.
+				PodDefaults: cfg.Features.PodDefaults && cfg.Features.WritesEnabled,
 			},
 			Notebooks: pageNotebooks{
 				ControllerContractConfirmed: cfg.Notebooks.ControllerContractConfirmed,
@@ -144,6 +157,7 @@ func buildPageView(identity model.Identity, cfg config.Config) pageView {
 	for _, t := range cfg.Storage.CSITemplates {
 		v.Config.Storage.CSITemplates = append(v.Config.Storage.CSITemplates, pageTemplate{Name: t.Name, StorageClass: t.StorageClass})
 	}
+	v.Config.Storage.RegistrationTemplates = cfg.Features.WritesEnabled && cfg.Features.StaticStorage && len(cfg.Storage.RegistrationTemplates) > 0
 	return v
 }
 
@@ -399,6 +413,8 @@ func (s *server) inventory(list string) http.HandlerFunc {
 			}
 		}
 		v.Resources = resources
+		// Inventory.storageTemplates is the single approved template
+		// projection. The web layer never re-derives or duplicates it.
 		respond(w, 200, v)
 	}
 }

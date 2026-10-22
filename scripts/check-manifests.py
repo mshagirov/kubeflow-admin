@@ -13,6 +13,10 @@ ROOT = Path(__file__).resolve().parent.parent
 READ_RESOURCES = {
     ("kubeflow.org", "profiles"),
     ("kubeflow.org", "notebooks"),
+    # PVC deletion must detect namespace-local PodDefault references even when
+    # optional PodDefault creation is disabled. This read-only grant is in the
+    # base role; the mutation verbs stay in the separate poddefaults overlay.
+    ("kubeflow.org", "poddefaults"),
     ("", "persistentvolumes"),
     ("", "persistentvolumeclaims"),
     *(("", r) for r in (
@@ -26,6 +30,10 @@ ALLOWED = {
     **{key: {"get", "list"} for key in READ_RESOURCES},
     ("kubeflow.org", "profiles"): {"get", "list", "create", "patch", "delete"},
     ("kubeflow.org", "notebooks"): {"get", "list", "patch"},
+    # PodDefault mutation is a separate false-by-default capability used only
+    # inside reviewed PVC creation/cleanup operations. Never add wildcards,
+    # Secret/exec access or unrelated resources here.
+    ("kubeflow.org", "poddefaults"): {"get", "list", "create", "patch", "delete"},
     ("", "persistentvolumes"): {"get", "list", "create", "patch", "delete"},
     ("", "persistentvolumeclaims"): {"get", "list", "create", "patch", "delete"},
     # GPU notebook planning must read the referenced RuntimeClass; get only.
@@ -58,11 +66,17 @@ EXPECTED_ROLES = {
         ("", "persistentvolumes"): {"delete"},
         ("", "persistentvolumeclaims"): {"delete"},
     },
+    # Optional, separately reviewed PodDefault create/overwrite/cleanup used
+    # only as a substep of reviewed PVC operations. Base read stays get/list.
+    "kubeflow-admin-poddefaults": {
+        ("kubeflow.org", "poddefaults"): {"get", "list", "create", "patch", "delete"},
+    },
 }
 # Destructive grants remain separately opt-in and resource-specific; they
 # must not enter base, writes or the all-features overlay implicitly.
 DELETE_PATHS = {
     ("kubeflow.org", "profiles"): "profile-deletion",
+    ("kubeflow.org", "poddefaults"): "poddefaults",
     ("", "persistentvolumes"): "storage-deletion",
     ("", "persistentvolumeclaims"): "storage-deletion",
 }
@@ -74,6 +88,7 @@ EXPECTED_VARIANTS = {
     "local-storage",
     "node-cordon",
     "pod-restarts",
+    "poddefaults",
     "pvc-expansion",
     "profile-deletion",
     "static-storage",
@@ -99,6 +114,9 @@ def check(path):
                             assert path.name == "pod-restarts", "eviction grant must stay separately opt-in"
                         if resource == "nodes" and "patch" in rule["verbs"]:
                             assert path.name == "node-cordon", "node cordon grant must stay separately opt-in"
+                        if (group, resource) == ("kubeflow.org", "poddefaults"):
+                            assert path.name == "poddefaults" or set(rule["verbs"]) <= {"get", "list"}, \
+                                "PodDefault mutation must stay in the separate poddefaults overlay"
                         if resource.endswith("/finalizers"):
                             assert not ({"patch", "update", "delete"} & set(rule["verbs"])), rule
                         for verb in rule["verbs"]:

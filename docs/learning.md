@@ -235,23 +235,51 @@ tests are not presented as proof of the installed controller's behavior.
 
 **Goal:** narrow storage/workload actions with explicit irreversible boundaries.
 
-**Implement:** dynamic PVC creation; approved prepared NFS/CSI static registration
-and PV reservation; CSI-compatible upward-only PVC expansion. Restricted Edit
-allows console labels, Available/unclaimed PV reclaim policy and gated PVC growth.
-Omitted/null labels preserve; explicit `{}` clears only console labels. Delete
-requires separate gates/RBAC, exact confirmation/reason, fresh identity and unused
-checks including stopped Notebook references. Profile Delete waits for its owned
-namespace too. Pod restart is a PDB-aware normal eviction of a supported Notebook
-StatefulSet Pod; Node cordon patches scheduling only, never drains workloads.
+**Implement:** dynamic PVC creation; standalone template-based static PV
+registration and PVC creation bound to a selected existing PV; approved prepared
+NFS/CSI legacy registration and PV reservation; CSI-compatible upward-only PVC
+expansion. Read-only template values supply PV/PVC capacity, access modes,
+reclaim/volume mode, mount options and driver/prefix details **only for the two
+new registration kinds**; the legacy combined static, reservation and dynamic
+contracts intentionally keep their existing size/access-mode inputs. New NFS
+templates accept their approved root or a descendant and require nonzero UID/GID
+annotations that are intent-only metadata — prepare and verify the actual
+directory/ownership externally. BeeGFS accepts only a canonical relative suffix
+under the fixed prefix, and the joined final handle must be at most 128 bytes.
+Keep legacy templates and workflows unchanged. Restricted Edit allows console
+labels, Available/unclaimed PV reclaim policy and gated PVC growth. Omitted/null
+labels preserve; explicit `{}` clears only console labels. PVC creation may
+optionally create or explicitly overwrite one dedicated PodDefault when its
+false-by-default gate/RBAC is enabled; the final name is capped at 52 bytes and
+there is no standalone PodDefault page or mutation endpoint. For dynamic PVCs
+the PodDefault is attempted only after the PVC object exists; a
+WaitForFirstConsumer claim may still be Pending, and PodDefault acceptance is
+not binding/mount readiness. PVC Delete may clean related namespace-local
+PodDefaults (at most 32) only after Pod/stopped-Notebook checks, a shared/external
+warning review and explicit acknowledgement. Delete requires separate
+gates/RBAC, exact confirmation/reason, fresh identity and unused checks including
+stopped Notebook references. Profile Delete waits for its owned namespace too.
+Pod restart is a PDB-aware normal eviction of a supported Notebook StatefulSet
+Pod; Node cordon patches scheduling only, never drains workloads.
 
-**Test/verify:** references/malformed observations fail closed; wrong class/owner,
-replacement UID, bound-PV drift, shrink/no-op, PDB rejection and ambiguous writes
-never force/replay. Verify namespace fences and data-loss warnings. Storage
-unused checks do not atomically fence external workloads or binders.
+**Test/verify:** forged read-only template fields, NFS root/descendant and BeeGFS
+escape/encoding/final-handle-bound cases, nonzero UID/GID, wrong class/owner,
+incompatible or replacement PV, referenced/malformed observations, missing CRD
+versus denied/error discovery, stale PodDefault UID/resourceVersion, shared
+warnings, the 52-byte PodDefault name and 32-object cleanup bounds, PDB rejection
+and ambiguous writes never force or replay. Verify dynamic PodDefault work after
+the PVC object with a Pending/WFFC claim, that a PodDefault failure leaves the
+actual PVC/PV in place with a truthful partial outcome, and that completion
+requires manual operator `kubectl` review with no app repair/replay endpoint.
+Verify cleanup never recreates PodDefaults or deletes another PVC, and that
+namespace fences/data-loss warnings are correct. Storage unused checks do not
+atomically fence external workloads or binders.
 
 **Done when:** each capability has its own tested gates and exact permissions;
-there is no forced deletion, finalizer removal or generic cleanup. See
-[storage](storage.md), [Pods](pods.md), [Nodes](nodes.md) and [acceptance](ui-workflow-acceptance.md).
+the base read role can detect PodDefault references while mutation stays behind
+the separate overlay; there is no standalone PodDefault API, forced deletion,
+finalizer removal or generic cleanup. See [storage](storage.md), [Pods](pods.md),
+[Nodes](nodes.md) and [acceptance](ui-workflow-acceptance.md).
 
 ## Lesson 11 — API, current dashboard and browser regressions
 
@@ -262,8 +290,13 @@ confirmation → durable result. Follow [the current UI guide](ui.md): Workspace
 Health only, simplified Pods/Nodes tables with full safe Resource Details,
 Profile information above its table, stable right-centered Notebook action,
 Node-to-Running-Pods URL filters, visible filter reset and Back/Forward behavior.
-Use compact expandable notifications: errors first, newest-first within groups,
-deduplication, safe dismissal IDs and preserved preview warnings.
+Storage forms keep template-derived capacity/modes/reclaim/server/prefix values
+read-only, expose the PV NFS/BeeGFS path only as a typed input, and expose bound
+NFS UID/GID only as typed nonzero inputs. Offer the optional PodDefault switch
+only inside PVC creation. There is no standalone PodDefault page/button; cleanup
+is a reviewed part of PVC Delete. Use compact expandable notifications: errors
+first, newest-first within groups, deduplication, safe dismissal IDs and
+preserved preview warnings.
 
 **Test/verify:** handler auth/CSRF/error boundaries, Node logic/navigation harnesses
 and configured real-Chrome synthetic fixtures. Check 390px/1280px overflow, table
@@ -304,13 +337,19 @@ single Recreate replica, hardened Pod, probes, ingress NetworkPolicy, durable
 database and a read-only OIDC Secret mount. Choose/verify DB storage from lessons
 2–3. Review each optional RBAC overlay independently; permissions do not set
 flags. Keep every flag/controller-contract gate false for the first rollout.
+Before adding `storage.registrationTemplates` or `features.podDefaults`, back up
+the stopped DB/journal set and the old config. Old binaries reject the new keys
+under strict `KnownFields`; the store schema stays version 3 with no new columns,
+but never roll back the image alone. New-action operations cannot be replayed by
+an old app; use reviewed restore/reconciliation instead.
 
-**Test/verify:** seven Python helper tests/API parity, all rendered variants and
-strict Kubernetes schemas. Replace placeholders in local site files only; pin
-the verified image index. Review render/diff/server dry-run, then apply only in
-the approved disposable context. Readiness does not prove full RBAC, login or
-controller/storage compatibility. Inspect exact ServiceAccount capabilities,
-not merely `can-i create` without a resource.
+**Test/verify:** Python helper tests/API parity, all rendered variants (including
+the separate `poddefaults` overlay) and strict Kubernetes schemas. Replace
+placeholders in local site files only; pin the verified image index. Review
+render/diff/server dry-run, then apply only in the approved disposable context.
+Readiness does not prove full RBAC, login or controller/storage compatibility.
+Inspect exact ServiceAccount capabilities, not merely `can-i create` without a
+resource.
 
 **Done when:** read-only inventory matches selected observations, optional write
 bindings are absent/revoked, and one base supplies no duplicate resources.
@@ -342,10 +381,13 @@ integration. Turning flags off/revoking bindings is not rollback of prior writes
 
 **Implement:** stopped-directory backup of the complete database/journal set,
 checksums, encryption, off-node retention and rehearsed restore on a disposable
-copy. Record release/config/schema and actual cluster state. Preserve needs-review
-locks; never replay a stale DB as Kubernetes rollback. Only Profile deletion has
-the narrow stopped-app reconciliation tool; storage has no generic unlock or
-force cleanup. Bound private file logging separately from database History.
+copy. Back up the matching configuration too: a failed new-config rollout cannot
+be fixed by restoring an old image alone because old binaries reject the new
+keys, and new-action operations cannot be replayed by them. Record
+release/config/schema and actual cluster state. Preserve needs-review locks;
+never replay a stale DB as Kubernetes rollback. Only Profile deletion has the
+narrow stopped-app reconciliation tool; storage has no generic unlock or force
+cleanup. Bound private file logging separately from database History.
 
 **Test/verify:** restore/integrity drills, node-loss procedure, compatible schema,
 session/plan handling, corrupted-copy refusal and no second writer. Rerun release

@@ -94,9 +94,22 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 	}
 	for _, v := range pv.Items {
 		cap := v.Spec.Capacity.Storage()
-		d := map[string]string{"capacity": cap.String(), "storageClass": v.Spec.StorageClassName, "reclaimPolicy": string(v.Spec.PersistentVolumeReclaimPolicy), "filesystemUsage": "not available", "backendCapacity": "not available"}
+		d := map[string]string{
+			"capacity": cap.String(), "storageClass": v.Spec.StorageClassName,
+			"reclaimPolicy":   string(v.Spec.PersistentVolumeReclaimPolicy),
+			"filesystemUsage": "not available", "backendCapacity": "not available",
+			// The exact current identity is needed for the reviewed binding
+			// action. Access modes and the matching template name are safe
+			// selection metadata; backend sources/paths/handles remain hidden.
+			"uid": string(v.UID), "resourceVersion": v.ResourceVersion,
+			"accessModes": joinAccessModes(v.Spec.AccessModes),
+			"volumeMode":  volumeModeName(v.Spec.VolumeMode),
+		}
 		if v.Spec.ClaimRef != nil {
 			d["claim"] = v.Spec.ClaimRef.Namespace + "/" + v.Spec.ClaimRef.Name
+		}
+		if templateName, ok := s.registrationTemplateForPV(&v); ok {
+			d["registrationTemplate"] = templateName
 		}
 		add("PersistentVolume", "", v.Name, string(v.UID), string(v.Status.Phase), d)
 	}
@@ -117,6 +130,38 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 			}
 		}
 		add("PersistentVolumeClaim", v.Namespace, v.Name, string(v.UID), string(v.Status.Phase), d)
+	}
+	// PodDefault inventory is read-only and carries only safe names and PVC
+	// references. A discovery/list failure is reported as a warning here; the
+	// destructive PVC deletion path independently fails closed.
+	if s.Config.Features.PodDefaults {
+		present, apiErr := s.podDefaultAPI(ctx, false)
+		if apiErr != nil {
+			out.Warnings = append(out.Warnings, "PodDefault inventory is unavailable; reference detection for PVC deletion still fails closed.")
+		} else if !present {
+			out.Warnings = append(out.Warnings, "The PodDefault API is not installed; PodDefault creation and cleanup are unavailable.")
+		} else {
+			pds, listErr := s.Dynamic.Resource(PodDefaults).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+			if listErr != nil || pds == nil || pds.GetContinue() != "" {
+				out.Warnings = append(out.Warnings, "PodDefault inventory could not be listed completely; no PodDefault details are shown.")
+			} else {
+				for i := range pds.Items {
+					pd := &pds.Items[i]
+					usage, err := podDefaultUsageFrom(pd)
+					if err != nil {
+						out.Warnings = append(out.Warnings, "A PodDefault has an unsupported structure and its inventory details are hidden.")
+						continue
+					}
+					details := map[string]string{
+						"claims":             strings.Join(usage.Claims, ","),
+						"shared":             strconv.FormatBool(len(usage.Claims) > 1 || usage.Additional),
+						"externalManaged":    strconv.FormatBool(usage.External),
+						"additionalSettings": strconv.FormatBool(usage.Additional),
+					}
+					add("PodDefault", pd.GetNamespace(), pd.GetName(), string(pd.GetUID()), "", details)
+				}
+			}
+		}
 	}
 	sc, err := s.Typed.StorageV1().StorageClasses().List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -234,8 +279,27 @@ func (s *Service) Inventory(ctx context.Context) (model.Inventory, error) {
 		d["controlPlane"] = strconv.FormatBool(isControlPlaneNode(&v))
 		add("Node", "", v.Name, string(v.UID), nodeState(&v), d)
 	}
-	out.Warnings = []string{"Filesystem usage and storage-backend capacity are not available from Kubernetes inventory.", "Notebook CR dry-run does not validate controller-generated Pod admission or scheduling."}
+	out.StorageTemplates = s.StorageRegistrationTemplates()
+	out.Warnings = append(out.Warnings, "Filesystem usage and storage-backend capacity are not available from Kubernetes inventory.", "Notebook CR dry-run does not validate controller-generated Pod admission or scheduling.")
+	if len(out.StorageTemplates) > 0 {
+		out.Warnings = append(out.Warnings, "The registration-template projection contains approved read-only storage values only. Existing PV backend paths, handles, attributes, Secrets and unmanaged driver details remain hidden.")
+	}
 	return out, nil
+}
+
+func joinAccessModes(modes []corev1.PersistentVolumeAccessMode) string {
+	out := make([]string, 0, len(modes))
+	for _, mode := range modes {
+		out = append(out, string(mode))
+	}
+	return strings.Join(out, ",")
+}
+
+func volumeModeName(mode *corev1.PersistentVolumeMode) string {
+	if mode == nil {
+		return string(corev1.PersistentVolumeFilesystem)
+	}
+	return string(*mode)
 }
 
 // profileDetails projects the safe, editable facts of a Profile: the API

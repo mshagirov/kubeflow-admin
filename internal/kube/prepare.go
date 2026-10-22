@@ -18,14 +18,15 @@ import (
 )
 
 type work struct {
-	prepared model.Prepared
-	ev       evidence
-	notebook *unstructured.Unstructured
-	profile  *unstructured.Unstructured
-	pvc      *corev1.PersistentVolumeClaim
-	pv       *corev1.PersistentVolume
-	ops      []patchOp
-	delayed  bool
+	prepared   model.Prepared
+	ev         evidence
+	notebook   *unstructured.Unstructured
+	profile    *unstructured.Unstructured
+	pvc        *corev1.PersistentVolumeClaim
+	pv         *corev1.PersistentVolume
+	ops        []patchOp
+	delayed    bool
+	podDefault *podDefaultPlan
 
 	// profileOwner and profileQuota capture the exact owner identity and hard
 	// quota map reviewed for a Profile update, so the live object can be
@@ -61,6 +62,9 @@ func (s *Service) Prepare(ctx context.Context, a model.Action) (model.Prepared, 
 	if a.Kind == "pv.delete" || a.Kind == "pvc.delete" {
 		return s.prepareStorageDelete(ctx, a)
 	}
+	if isStorageRegistrationKind(a.Kind) {
+		return s.prepareStorageRegistration(ctx, a)
+	}
 	w, err := s.build(ctx, a)
 	if err != nil {
 		return model.Prepared{}, err
@@ -73,6 +77,9 @@ func (s *Service) Prepare(ctx context.Context, a model.Action) (model.Prepared, 
 func (s *Service) build(ctx context.Context, a model.Action) (*work, error) {
 	if !s.Config.Features.WritesEnabled {
 		return nil, errors.New("writes are disabled")
+	}
+	if err := unsupportedRegistrationFields(a); err != nil {
+		return nil, err
 	}
 	// A Profile name is also its namespace name and has its own grammar. It is
 	// checked first so an over-long or otherwise invalid Profile name is
@@ -492,6 +499,9 @@ func (s *Service) Execute(ctx context.Context, p model.Prepared, cp func(string)
 	}
 	if p.Action.Kind == "pv.delete" || p.Action.Kind == "pvc.delete" {
 		return s.executeStorageDelete(ctx, p, cp)
+	}
+	if isStorageRegistrationKind(p.Action.Kind) {
+		return s.executeStorageRegistration(ctx, p, cp)
 	}
 	if p.Action.Kind == "pod.restart" {
 		return s.executePodRestart(ctx, p, cp)

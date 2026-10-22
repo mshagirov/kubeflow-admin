@@ -19,6 +19,17 @@
   const storageDeletionFeature = meta("storage-deletion") === "true" && writes;
   const notificationScope = meta("notification-scope");
   const logic = globalThis.DashboardLogic;
+  // The PodDefault capability is an independent opt-in and is only offered
+  // when writes are enabled. The registry below carries only the approved,
+  // non-secret registration-template projection.
+  const podDefaultsFeature = meta("pod-defaults") === "true" && writes;
+  // The approved registration templates come from the single server-owned
+  // inventory.storageTemplates projection. No second bootstrap copy exists.
+  let storageTemplates = [];
+  // The approved class list is captured once, after the deferred script sees
+  // the parsed template, before any action narrows it. Switching between a
+  // registration action and a legacy action restores the full list.
+  let allowedStorageClasses = null;
 
   const pageTitles = {
     overview: ["Overview", ""],
@@ -397,6 +408,23 @@
     node.append(el("small", [resource.kind, resource.namespace].filter(Boolean).join(" · ")));
     return node;
   }
+  function operationReceiptDetails(operation) {
+    const receipts = logic.mutationReceipts(operation);
+    if (!receipts.length) return null;
+    const details = el("details", undefined, "receipt-details");
+    const known = receipts.map(receipt => logic.receiptOutcomeLabel(receipt.outcome)).join(", ");
+    details.append(el("summary", `${receipts.length} recorded mutation receipt${receipts.length === 1 ? "" : "s"} · ${known}`));
+    const body = el("div", undefined, "receipt-body");
+    body.append(el("p", "Mutation receipts record accepted API writes or verified observations, separately from planned changes. They can describe a partial operation and do not prove mount or admission readiness.", "hint"));
+    if (String(operation.state || "") === "needs-review") {
+      body.append(el("p", "The current operation stage remains needs-review. These receipts are known completed facts only; they do not prove that the whole operation succeeded.", "warning"));
+    }
+    simpleTable(body, ["Recorded outcome", "Kind", "Namespace", "Name", "UID", "Resource version"], receipts.map(receipt => [
+      logic.receiptOutcomeLabel(receipt.outcome), receipt.kind, receipt.namespace || "—", receipt.name, receipt.uid || "—", receipt.resourceVersion || "—"
+    ]));
+    details.append(body);
+    return details;
+  }
   function operationStateCell(operation) {
     const wrap = el("div", undefined, "state-cell");
     wrap.append(badge(operation.state));
@@ -426,6 +454,8 @@
       slot.append(button, tooltip);
     }
     wrap.append(slot);
+    const receipts = operationReceiptDetails(operation);
+    if (receipts) wrap.append(receipts);
     return wrap;
   }
   function nodeCordonButton(resource) {
@@ -614,7 +644,8 @@
         const target = logic.parseTarget(operation.target);
         return {
           namespace: target.namespace || (target.kind === "profile" ? target.name : ""),
-          search: [operation.id, operation.planID, target.kind, target.namespace, target.name, operation.action, operation.state, operation.step, operation.error, logic.actorLabel(operation)].filter(Boolean).join(" "),
+          search: [operation.id, operation.planID, target.kind, target.namespace, target.name, operation.action, operation.state, operation.step, operation.error, logic.actorLabel(operation),
+            logic.mutationReceipts(operation).map(receipt => [logic.receiptOutcomeLabel(receipt.outcome), receipt.kind, receipt.namespace, receipt.name, receipt.uid].filter(Boolean).join(" ")).join(" ")].filter(Boolean).join(" "),
           sort: { time: operation.updatedAt || operation.createdAt, actor: logic.actorLabel(operation), kind: target.kind, namespace: target.namespace, name: target.name, action: operation.action, state: operation.state },
           cellFactory: () => [formatTime(operation.updatedAt || operation.createdAt), actorCell(operation), target.kind || "—", target.namespace || "—", target.name || "—", operation.action || "—", operationStateCell(operation)]
         };
@@ -1002,6 +1033,7 @@
   async function loadInventory() {
     const data = await api("inventory");
     inventory = data; inventoryAt = monotonicNow(); rowCache = {};
+    storageTemplates = approvedStorageTemplates(data.storageTemplates);
     updateTimestamp(); selectors(); renderPage();
     // The open details drawer follows the observed resource. A refresh never
     // rewrites a form the administrator is working in.
@@ -1301,6 +1333,7 @@
       const confirmName = String($("#profile-delete-confirm")?.value || "");
       return logic.profileDeleteValidation(name, { reason, confirmName }).message;
     }
+    if (form.id === "storage-form") return storageCreateError();
     if (form.id === "storage-edit-form" || form.id === "storage-delete-form") return storageSubmitError(form);
     return "";
   }
@@ -1738,6 +1771,170 @@
     if (event.key === "Enter" && event.target.tagName === "INPUT" && event.target.type !== "submit") event.preventDefault();
   }));
 
+  // ---- Static provisioning template registry ------------------------------
+  // The server embeds only the approved registration-template fields. The
+  // browser never invents a template, a class, a backend prefix or a capacity.
+  function approvedStorageTemplates(value) {
+    if (!Array.isArray(value)) return [];
+    return value.filter(template => template && template.name && template.storageClass).map(template => ({
+      name: String(template.name || ""),
+      kind: logic.templateKind(template),
+      storageClass: String(template.storageClass || ""),
+      pvCapacity: String(template.pvCapacity || ""),
+      pvAccessModes: Array.isArray(template.pvAccessModes) ? template.pvAccessModes.map(String) : [],
+      pvcRequest: String(template.pvcRequest || ""),
+      pvcAccessModes: Array.isArray(template.pvcAccessModes) ? template.pvcAccessModes.map(String) : [],
+      reclaimPolicy: String(template.reclaimPolicy || "Retain"),
+      volumeMode: String(template.volumeMode || "Filesystem"),
+      nfsServer: String(template.nfsServer || ""),
+      nfsRoots: Array.isArray(template.nfsRoots) ? template.nfsRoots.map(String) : [],
+      nfsMountOptions: Array.isArray(template.nfsMountOptions) ? template.nfsMountOptions.map(String) : [],
+      requireDirectoryUIDGID: template.requireDirectoryUIDGID === true,
+      beegfsDriver: String(template.beegfsDriver || ""),
+      beegfsPrefix: String(template.beegfsPrefix || ""),
+      podDefaultName: String(template.podDefaultName || ""),
+      podDefaultMountPathPrefix: String(template.podDefaultMountPathPrefix || "")
+    }));
+  }
+  function storageTemplateByName(name) {
+    return storageTemplates.find(template => template.name === String(name || "")) || null;
+  }
+  function selectedStorageTemplate() {
+    const select = $("#storage-registration-template");
+    return select ? storageTemplateByName(select.value) : null;
+  }
+  function present(value) { return String(value ?? "").trim() !== ""; }
+  function selectedObservedPV() {
+    const name = String($("#bound-pv-selector")?.value || "");
+    if (!name) return null;
+    return (inventory?.resources || []).find(resource => resource.kind === "PersistentVolume" && resource.name === name) || null;
+  }
+  function relatedPodDefaults(resource) {
+    if (!resource || resource.kind !== "PersistentVolumeClaim") return [];
+    const namespace = String(resource.namespace || "");
+    const claim = String(resource.name || "");
+    return (inventory?.resources || []).filter(candidate => {
+      if (candidate.kind !== "PodDefault" || (candidate.namespace || "") !== namespace) return false;
+      const claims = String(candidate.details?.claims || "").split(",").map(value => value.trim()).filter(Boolean);
+      return claims.includes(claim);
+    });
+  }
+  function storagePodDefaultCollision(name, namespace) {
+    const value = String(name || "").trim();
+    const scope = String(namespace ?? storageFormValue('#storage-form [name="namespace"]') ?? "");
+    if (!value) return null;
+    // PodDefaults are namespace-local. A same-named object in another
+    // namespace is not a conflict for this claim.
+    const observed = (inventory?.resources || []).filter(resource =>
+      resource.kind === "PodDefault" && resource.name === value && (resource.namespace || "") === scope);
+    return observed[0] || null;
+  }
+  function fillStorageClassOptions(classes) {
+    const select = $("#storage-class");
+    if (!select) return;
+    const wanted = [...new Set(classes.filter(Boolean))];
+    if (!wanted.length) return;
+    const current = String(select.value || "");
+    select.replaceChildren(new Option("Select an allowed class", ""));
+    wanted.forEach(name => select.append(new Option(name, name)));
+    if (wanted.includes(current)) select.value = current;
+  }
+  function fillStorageTemplateSelect(select, templates) {
+    if (!select) return;
+    const current = String(select.value || "");
+    select.replaceChildren(new Option("Select an applicable template", ""));
+    templates.forEach(template => select.append(new Option(`${template.name} · ${logic.templateKind(template) === "beegfs" ? "BeeGFS" : logic.templateKind(template).toUpperCase()} · ${template.storageClass}`, template.name)));
+    if (templates.some(template => template.name === current)) select.value = current;
+  }
+  function renderStorageTemplateFacts(template, kind) {
+    const facts = $("#storage-template-facts"), list = $("#storage-template-facts-list");
+    if (!facts || !list) return;
+    if (!template) { facts.hidden = true; list.replaceChildren(); return; }
+    const rows = [];
+    const add = (label, value) => { if (present(value)) rows.push([label, String(value)]); };
+    add("Template", template.name);
+    add("Backend", logic.templateKind(template) === "beegfs" ? "BeeGFS" : "NFS");
+    add("Storage class", template.storageClass);
+    add("PV capacity (read-only)", template.pvCapacity);
+    add("PV access modes (read-only)", template.pvAccessModes.join(", "));
+    add("Volume mode (read-only)", template.volumeMode);
+    add("Reclaim policy (read-only)", template.reclaimPolicy);
+    add("NFS server (read-only)", template.nfsServer);
+    add("Approved NFS roots (read-only)", template.nfsRoots.join(", "));
+    add("NFS mount options (read-only)", template.nfsMountOptions.join(", "));
+    add("BeeGFS driver (read-only)", template.beegfsDriver);
+    add("BeeGFS fixed prefix (read-only)", template.beegfsPrefix);
+    add("PVC request (read-only)", template.pvcRequest);
+    add("PVC access modes (read-only)", template.pvcAccessModes.join(", "));
+    list.replaceChildren();
+    rows.forEach(([label, value]) => list.append(el("dt", label), el("dd", value)));
+    facts.hidden = false;
+  }
+  function storageTemplateOptionsFor(kind) {
+    if (!logic.storageTemplateKinds.has(kind)) return [];
+    return logic.templatesForKind(storageTemplates, kind);
+  }
+  // A dependent field must never travel with another action or template. A
+  // new action clears the PV, path, UID/GID and PodDefault values; changing
+  // only the template keeps the typed name/reason but clears the target.
+  function clearStorageTargets() {
+    const bound = $("#bound-pv-selector"); if (bound) { bound.replaceChildren(new Option("Select an Available PV", "")); bound.value = ""; }
+    ["#storage-nfs-path", "#storage-beegfs-path", "#storage-directory-uid", "#storage-directory-gid"].forEach(selector => { const input = $(selector); if (input) input.value = ""; });
+    const enable = $("#storage-pod-default-enable"); if (enable) enable.checked = false;
+    const fields = $("#storage-pod-default-fields"); if (fields) fields.hidden = true;
+    const name = $("#storage-pod-default-name"); if (name) name.value = "";
+    const mount = $("#storage-pod-default-mount-path"); if (mount) mount.value = "";
+    const overwrite = $("#storage-pod-default-overwrite"); if (overwrite) overwrite.checked = false;
+    storagePodDefaultFeedback();
+  }
+  function storagePodDefaultFeedback() {
+    const warning = $("#storage-pod-default-warning");
+    const observedHint = $("#storage-pod-default-observed");
+    const enable = $("#storage-pod-default-enable");
+    if (!warning || !observedHint || !enable) return;
+    const active = !enable.disabled && enable.checked;
+    const collision = storagePodDefaultCollision($("#storage-pod-default-name")?.value || "", storageFormValue('#storage-form [name="namespace"]'));
+    const visible = active && !!collision;
+    warning.hidden = !visible;
+    if (visible) {
+      warning.textContent = `An observed PodDefault named ${collision.name}${collision.namespace ? " in namespace " + collision.namespace : ""} already exists. Creating this plan overwrites its dedicated spec only after the server revalidates its UID/resourceVersion. Its current selector and all other injected PVC mounts and settings are replaced. External management such as Helm or GitOps may reconcile it again; this console does not claim exclusive ownership. Secret-bearing values are never shown here.`;
+    }
+    const hint = active && !collision
+      ? "No PodDefault with this name is in the current observation. The server still revalidates the exact name and reports a collision at plan time."
+      : "";
+    observedHint.hidden = !hint;
+    observedHint.textContent = hint;
+  }
+  function syncStoragePodDefaultSuggestion() {
+    const enable = $("#storage-pod-default-enable");
+    const container = $("#storage-pod-default");
+    if (!enable || !container || container.hidden || !enable.checked) return;
+    const template = selectedStorageTemplate();
+    const claim = storageNameValue();
+    const suggestion = logic.podDefaultSuggestion(template, claim);
+    const name = $("#storage-pod-default-name"), mount = $("#storage-pod-default-mount-path");
+    if (name && !name.value) name.value = suggestion.name;
+    if (mount && !mount.value) mount.value = suggestion.mountPath;
+  }
+  function syncStoragePodDefaultFields() {
+    const enable = $("#storage-pod-default-enable");
+    const container = $("#storage-pod-default");
+    const fields = $("#storage-pod-default-fields");
+    if (!enable || !container || !fields) return;
+    const kind = $("#storage-kind")?.value || "";
+    const template = selectedStorageTemplate();
+    const offered = podDefaultsFeature && (kind === "pvc.create" || kind === "pvc.create.bound");
+    container.hidden = !offered;
+    enable.disabled = !offered;
+    if (!offered) enable.checked = false;
+    fields.hidden = !offered || !enable.checked;
+    $$("input", fields).forEach(input => { input.disabled = !offered || !enable.checked; });
+    if (offered && enable.checked) syncStoragePodDefaultSuggestion();
+    const overwrite = $("#storage-pod-default-overwrite");
+    if (overwrite) overwrite.disabled = !offered || !enable.checked;
+    storagePodDefaultFeedback();
+  }
+
   // ---- Forms and plan workflow --------------------------------------------
   function selectors(applyFilter = false) {
     const resources = inventory?.resources || [];
@@ -1759,6 +1956,9 @@
     }
     $("#claim-names").replaceChildren(...resources.filter(resource => resource.kind === "PersistentVolumeClaim" && (!namespaceContext || resource.namespace === namespaceContext)).map(resource => new Option(resource.name, resource.name)));
     fillSelect($("#pv-selector"), resources.filter(resource => resource.kind === "PersistentVolume" && resource.state === "Available" && !resource.details?.claim && resource.details?.reclaimPolicy === "Retain").map(resource => resource.name), "Select an available Retain PV");
+    // The registration-template and compatible-PV selectors are refreshed from
+    // the same observation. A refresh never discards a still-valid selection.
+    storageFields();
     notebookOptions();
   }
   function notebookOptions() {
@@ -1776,13 +1976,227 @@
   function storageFields() {
     const kind = $("#storage-kind").value;
     $$('[data-storage]').forEach(label => { const visible = label.dataset.storage.split(" ").includes(kind); label.hidden = !visible; $$("input,select", label).forEach(input => { input.disabled = !visible; }); });
-    const template = $("#storage-template").selectedOptions[0];
-    if (kind === "pv.nfs.create" && template?.dataset.type === "csi") { $("#subdirectory-field").hidden = true; $("#subdirectory-field input").disabled = true; }
-    $('#storage-form [name="size"]').required = true;
+    const legacy = $("#storage-template").selectedOptions?.[0];
+    const registrationSelect = $("#storage-registration-template");
+    const eligible = storageTemplateOptionsFor(kind);
+    if (registrationSelect) {
+      const previous = String(registrationSelect.value || "");
+      fillStorageTemplateSelect(registrationSelect, eligible);
+      if (!eligible.some(template => template.name === previous)) registrationSelect.value = "";
+      registrationSelect.required = logic.storageTemplateKinds.has(kind);
+    }
+    const currentTemplate = selectedStorageTemplate();
+    // The approved class list is narrowed to classes with an eligible
+    // registration template for the active registration action. Legacy flows
+    // keep their complete allowed list.
+    if (allowedStorageClasses === null) allowedStorageClasses = $$("#storage-class option").map(option => String(option.value ?? "")).filter(Boolean);
+    fillStorageClassOptions(logic.storageTemplateKinds.has(kind) ? eligible.map(template => template.storageClass) : allowedStorageClasses);
+    const templateClass = currentTemplate?.storageClass || legacy?.dataset.class || "";
+    if (templateClass) $("#storage-class").value = templateClass;
+    // A registration template fixes the class. The select remains visible for
+    // review but is not an editable override; the server would refuse any
+    // different class anyway.
+    if (logic.storageTemplateKinds.has(kind) && currentTemplate) $("#storage-class").disabled = true;
+    $('#storage-form [name="size"]').required = ["pvc.create", "pv.nfs.create", "pv.reserve"].includes(kind);
     $("#pv-selector").required = kind === "pv.reserve";
-    $("#storage-template").required = kind === "pv.nfs.create";
-    $("#subdirectory-field input").required = kind === "pv.nfs.create" && template?.dataset.type !== "csi";
-    $("#storage-class").required = kind === "pvc.create";
+    $("#pv-selector").disabled = kind !== "pv.reserve";
+    $("#storage-template").disabled = kind !== "pv.nfs.create";
+    $("#bound-pv-selector").required = kind === "pvc.create.bound";
+    $("#storage-class").required = ["pvc.create", "pvc.create.bound", "pv.create.static", "pv.reserve"].includes(kind);
+    const nfs = !!currentTemplate && logic.templateKind(currentTemplate) === "nfs";
+    const beegfs = !!currentTemplate && logic.templateKind(currentTemplate) === "beegfs";
+    // A new PV enters its backend path. A bound PVC never accepts a path: the
+    // selected PV already carries its fixed backend path, so the fields stay
+    // disabled and are excluded from the payload.
+    const staticPath = kind === "pv.create.static";
+    $("#storage-nfs-path").required = staticPath && nfs;
+    $("#storage-nfs-path").disabled = !(staticPath && nfs);
+    $("#storage-beegfs-path").required = staticPath && beegfs;
+    $("#storage-beegfs-path").disabled = !(staticPath && beegfs);
+    // Only the path input for the selected backend kind is rendered. The
+    // generic data-storage visibility above cannot know the template kind.
+    const nfsField = $("#storage-nfs-path-field"); if (nfsField) nfsField.hidden = !(staticPath && nfs);
+    const nfsHint = $("#storage-nfs-path-hint"); if (nfsHint) nfsHint.hidden = !(staticPath && nfs);
+    const beegfsField = $("#storage-beegfs-path-field"); if (beegfsField) beegfsField.hidden = !(staticPath && beegfs);
+    const beegfsHint = $("#storage-beegfs-path-hint"); if (beegfsHint) beegfsHint.hidden = !(staticPath && beegfs);
+    ["#storage-directory-uid", "#storage-directory-gid"].forEach(selector => { const input = $(selector); if (input) { input.required = kind === "pvc.create.bound" && nfs; input.disabled = !(kind === "pvc.create.bound" && nfs); } });
+    renderStorageTemplateFacts(currentTemplate, kind);
+    syncStorageBoundPVs(kind, currentTemplate);
+    syncStoragePodDefaultFields();
+    return { kind, template: currentTemplate, legacy };
+  }
+  // The selected PV is narrowed by the same observable facts the server
+  // revalidates. Missing observation metadata does not hide a PV: the server
+  // performs the authoritative compatibility check.
+  function syncStorageBoundPVs(kind, template) {
+    const select = $("#bound-pv-selector");
+    if (!select) return;
+    if (kind !== "pvc.create.bound") return;
+    const classValue = String($("#storage-class")?.value || "");
+    const compatible = logic.compatiblePVs(inventory?.resources || [], template, classValue);
+    const current = String(select.value || "");
+    select.replaceChildren(new Option(compatible.length ? "Select an Available PV" : "No compatible Available PV", ""));
+    compatible.forEach(resource => {
+      const details = resource.details || {};
+      const suffix = [details.storageClass, details.capacity].filter(Boolean).join(" · ");
+      select.append(new Option(suffix ? `${resource.name} · ${suffix}` : resource.name, resource.name));
+    });
+    if (compatible.some(resource => resource.name === current)) select.value = current;
+    else select.value = "";
+  }
+  function storageTemplateChanged() {
+    clearStorageTargets();
+    storageFields();
+  }
+
+  // ---- Template-driven plan binding ---------------------------------------
+  // The registration actions reuse the typed plan workflow. These helpers
+  // collect only the fields the action defines, resolve the selected observed
+  // PV identity at submission time and perform browser-side early validation.
+  // The server remains authoritative for every rule.
+  function storageFormValue(selector) { return String($(selector)?.value ?? ""); }
+  // Two distinct controls exist for the new claim name and the new PV name.
+  // Only the active action owns one of them; never read the hidden duplicate.
+  function storageNameInput() {
+    const kind = storageFormValue("#storage-kind");
+    const id = kind === "pv.create.static" ? "#storage-pv-name" : "#storage-claim-name";
+    return $(id) || $('#storage-form [name="name"]:not([disabled])') || $('#storage-form [name="name"]');
+  }
+  function storageNameValue() { return String(storageNameInput()?.value ?? ""); }
+  function storageBoundSelection() {
+    const template = selectedStorageTemplate();
+    const pv = selectedObservedPV();
+    return {
+      kind: storageFormValue("#storage-kind"),
+      name: storageNameValue(),
+      namespace: storageFormValue('#storage-form [name="namespace"]'),
+      class: storageFormValue("#storage-class"),
+      template,
+      pv,
+      resourceVersion: String(pv?.resourceVersion || pv?.details?.resourceVersion || ""),
+      nfsPath: storageFormValue("#storage-nfs-path"),
+      beeGFSPath: storageFormValue("#storage-beegfs-path"),
+      directoryUID: storageFormValue("#storage-directory-uid"),
+      directoryGID: storageFormValue("#storage-directory-gid")
+    };
+  }
+  function storagePodDefaultRequest(bound) {
+    if (!podDefaultsFeature) return null;
+    if (bound.kind !== "pvc.create" && bound.kind !== "pvc.create.bound") return null;
+    const enable = $("#storage-pod-default-enable");
+    if (!enable?.checked) return null;
+    return {
+      name: storageFormValue("#storage-pod-default-name").trim(),
+      mountPath: storageFormValue("#storage-pod-default-mount-path"),
+      overwrite: !!$("#storage-pod-default-overwrite")?.checked,
+      collision: !!storagePodDefaultCollision(storageFormValue("#storage-pod-default-name"), bound.namespace)
+    };
+  }
+  function storageCreateError() {
+    const bound = storageBoundSelection();
+    if (logic.storageTemplateKinds.has(bound.kind)) {
+      if (!bound.template) return "Select an approved registration template.";
+      if (!storageTemplateOptionsFor(bound.kind).some(template => template.name === bound.template.name)) {
+        return "The selected template is not eligible for this action. Select a template again.";
+      }
+      if (bound.class && bound.class !== bound.template.storageClass) {
+        return `The selected template requires StorageClass ${bound.template.storageClass}. Select that class or change the template.`;
+      }
+      if (!bound.class) return "Select the approved StorageClass for this template.";
+    }
+    if (bound.kind === "pvc.create.bound") {
+      if (!bound.pv) return "Select the observed Available PersistentVolume to bind.";
+      if (!logic.compatiblePV(bound.pv, bound.template, bound.class)) {
+        return "The selected PersistentVolume is not an Available, unclaimed volume compatible with this template and class. Refresh the observation and select it again.";
+      }
+      if (!String(bound.pv.uid || "")) return "The selected PersistentVolume has no stable observed UID. Refresh inventory and select it again.";
+      if (!bound.resourceVersion) return "The selected PersistentVolume has no observed resourceVersion. Refresh inventory and select it again.";
+    }
+    const error = logic.storageActionError(bound.kind, {
+      name: bound.name,
+      namespace: bound.namespace,
+      pvName: bound.pv?.name || "",
+      template: bound.template,
+      // Paths are only entered for a new PV. A bound claim must never send a
+      // path field: the selected volume already carries its fixed backend path.
+      nfsPath: bound.kind === "pv.create.static" ? bound.nfsPath : "",
+      beeGFSPath: bound.kind === "pv.create.static" ? bound.beeGFSPath : "",
+      directoryUID: bound.directoryUID,
+      directoryGID: bound.directoryGID,
+      podDefault: storagePodDefaultRequest(bound)
+    });
+    if (error) return error;
+    if (bound.kind === "pvc.create.bound" && bound.template && logic.templateKind(bound.template) === "nfs") {
+      if (!bound.template.requireDirectoryUIDGID) return "The selected NFS template is not configured for the required directory UID/GID.";
+    }
+    return "";
+  }
+  // The exact action fields are assembled here, never from unchecked hidden
+  // controls or controls of another action. Existing dynamic/legacy actions
+  // keep their existing fields and never acquire a path from a registration
+  // template.
+  function storageCreateContext() {
+    const bound = storageBoundSelection();
+    const podDefault = storagePodDefaultRequest(bound);
+    return {
+      kind: bound.kind, name: bound.name, namespace: bound.namespace,
+      template: bound.template?.name || "", class: bound.class,
+      pv: bound.pv?.name || "", pvUID: String(bound.pv?.uid || ""),
+      nfsPath: bound.nfsPath, beeGFSPath: bound.beeGFSPath,
+      directoryUID: bound.directoryUID, directoryGID: bound.directoryGID,
+      podDefault: podDefault ? [podDefault.name, podDefault.mountPath, podDefault.overwrite] : null
+    };
+  }
+  function storageCreateContextCurrent(context) {
+    if (!context) return true;
+    const current = storageCreateContext();
+    return current.kind === context.kind && current.name === context.name &&
+      current.namespace === context.namespace && current.template === context.template &&
+      current.class === context.class && current.pv === context.pv && current.pvUID === context.pvUID &&
+      current.nfsPath === context.nfsPath && current.beeGFSPath === context.beeGFSPath &&
+      current.directoryUID === context.directoryUID && current.directoryGID === context.directoryGID &&
+      JSON.stringify(current.podDefault) === JSON.stringify(context.podDefault);
+  }
+  function enforceStorageAction(action) {
+    if (!action) return action;
+    if (action.kind === "pvc.delete") {
+      if ($("#storage-delete-pod-default-ack")?.checked) action.confirmPodDefaultCleanup = true;
+      else delete action.confirmPodDefaultCleanup;
+      return action;
+    }
+    if (action.kind === "pvc.create.dynamic" || action.kind === "pvc.create") {
+      const podDefault = action.podDefault || storagePodDefaultRequest(storageBoundSelection());
+      const keep = ["kind", "namespace", "name", "reason", "storageClass", "size", "accessMode"];
+      for (const key of Object.keys(action)) if (!keep.includes(key)) delete action[key];
+      if (podDefault) action.podDefault = { name: podDefault.name, mountPath: podDefault.mountPath, overwrite: podDefault.overwrite };
+      return action;
+    }
+    if (!logic.storageTemplateKinds.has(action.kind)) return action;
+    const bound = storageBoundSelection();
+    const podDefault = action.podDefault || storagePodDefaultRequest(bound);
+    const keep = ["kind", "reason"];
+    for (const key of Object.keys(action)) {
+      if (!keep.includes(key)) delete action[key];
+    }
+    action.name = bound.name.trim();
+    action.reason = String(action.reason || "").trim();
+    action.template = bound.template?.name || "";
+    action.storageClass = bound.class;
+    if (action.kind === "pv.create.static") {
+      if (bound.template && logic.templateKind(bound.template) === "nfs") action.nfsPath = bound.nfsPath;
+      if (bound.template && logic.templateKind(bound.template) === "beegfs") action.beeGFSPath = bound.beeGFSPath;
+    } else if (action.kind === "pvc.create.bound") {
+      action.namespace = bound.namespace;
+      action.pvName = bound.pv?.name || "";
+      action.targetUID = String(bound.pv?.uid || "");
+      action.targetResourceVersion = bound.resourceVersion;
+      if (bound.template && logic.templateKind(bound.template) === "nfs") {
+        action.directoryUID = bound.directoryUID.trim();
+        action.directoryGID = bound.directoryGID.trim();
+      }
+      if (podDefault) action.podDefault = { name: podDefault.name, mountPath: podDefault.mountPath, overwrite: podDefault.overwrite };
+    }
+    return action;
   }
   function notebookFields() {
     const edit = $("#notebook-kind").value === "notebook.edit"; $("#notebook-edit").hidden = !edit;
@@ -2135,6 +2549,30 @@
     } else {
       const confirm = $("#storage-delete-confirm"); if (confirm) confirm.value = "";
       const ack = $("#storage-delete-ack"); if (ack) ack.checked = false;
+      const podDefaultAck = $("#storage-delete-pod-default-ack"); if (podDefaultAck) podDefaultAck.checked = false;
+      // Related PodDefault cleanup only applies to claims. The server lists
+      // the exact reviewed dependencies in the plan; this section states the
+      // boundary and requires the separate acknowledgement up front.
+      const cleanup = $("#storage-delete-pod-default");
+      const cleanupLabel = $("#storage-delete-pod-default-ack-label");
+      const cleanupHint = $("#storage-delete-pod-default-hint");
+      const claim = found.kind === "PersistentVolumeClaim";
+      const related = relatedPodDefaults(found);
+      if (cleanup) {
+        cleanup.hidden = !claim;
+        if (claim && related.length) {
+          const shared = related.filter(item => item.details?.shared === "true" || item.details?.externalManaged === "true");
+          const names = related.map(item => `${item.namespace}/${item.name}`).join(", ");
+          const primary = cleanup.querySelector("p");
+          if (primary) primary.textContent = `${related.length} related PodDefault${related.length === 1 ? "" : "s"} observed: ${names}. They are removed before the claim, with their own UID/resourceVersion preconditions. Any shared or externally managed object loses its other injected mounts and settings from future matching Pods; existing Pod mounts are never removed. The reviewed cleanup is bounded to 32 objects.`;
+          const extra = cleanup.querySelectorAll("p")[1];
+          if (extra) extra.hidden = !shared.length;
+        }
+      }
+      if (cleanupLabel) cleanupLabel.hidden = !claim;
+      if (cleanupHint) cleanupHint.hidden = !claim;
+      if (podDefaultAck) podDefaultAck.disabled = !claim || !writes;
+      if (podDefaultAck) podDefaultAck.checked = false;
       const warning = $("#storage-delete-warning"); if (warning) { warning.textContent = storageDeleteWarning(found); warning.hidden = false; }
     }
     // Opening a new drawer is a new operation context. openDrawer may close a
@@ -2188,6 +2626,12 @@
     if (!confirm) return `Type "${operation.name}" to confirm the deletion.`;
     if (confirm !== operation.name) return `The confirmation does not match "${operation.name}". Type it exactly.`;
     if (!acknowledged) return "Acknowledge that deleting this storage object can lead to data loss before preparing the deletion plan.";
+    if (operation.kind === "PersistentVolumeClaim") {
+      const related = relatedPodDefaults({ kind: operation.kind, namespace: operation.namespace, name: operation.name });
+      if (related.length && !$("#storage-delete-pod-default-ack")?.checked) {
+        return "Acknowledge that the observed related PodDefaults listed in this drawer are deleted with this claim before preparing the deletion plan.";
+      }
+    }
     return "";
   }
   // A storage plan request is bound to the exact drawer epoch, mode and
@@ -2603,12 +3047,16 @@
     return [...new FormData(form)].map(([name, value]) => [formFieldNames[name] || name, value]);
   }
   function actionFrom(form) {
-    return logic.buildAction(actionEntries(form), {
+    const bound = form.id === "storage-form" ? storageBoundSelection() : null;
+    const action = logic.buildAction(actionEntries(form), {
       restart: !!$('[name="restart"]', form)?.checked,
       force: !!$('[name="force"]', form)?.checked,
       replaceMounts: form.id === "notebook-form" && $("#replace-mounts").checked,
-      mounts: $$(".mount-row").map(row => Object.fromEntries($$("[data-field]", row).map(input => [input.dataset.field, input.type === "checkbox" ? input.checked : input.value])))
+      mounts: $$(".mount-row").map(row => Object.fromEntries($$("[data-field]", row).map(input => [input.dataset.field, input.type === "checkbox" ? input.checked : input.value]))),
+      podDefault: bound ? storagePodDefaultRequest(bound) : null
     });
+    if (form.id === "storage-delete-form" && $("#storage-delete-pod-default-ack")?.checked) action.confirmPodDefaultCleanup = true;
+    return action;
   }
   function simpleTable(target, headings, rows) {
     const wrap = el("div", undefined, "table-scroll compact"), table = el("table"), head = el("thead"), headRow = el("tr"), body = el("tbody");
@@ -2667,14 +3115,20 @@
       return;
     }
     let storageContext = null;
+    let storageCreate = null;
     try {
       storageContext = storagePlanContext(form);
+      if (form.id === "storage-form") storageCreate = storageCreateContext();
       if (storageContext) {
         storageOperation.planning = true;
         syncStorageSubmitButtons();
       }
-      const plan = await api("plans", actionFrom(form));
+      const plan = await api("plans", enforceStorageAction(actionFrom(form)));
       if (storageContext && !storagePlanContextCurrent(storageContext)) return;
+      // A late answer for a form whose action, target, template or class was
+      // changed while the request was in flight is discarded before it can
+      // open a plan for a different review.
+      if (storageCreate && !storageCreateContextCurrent(storageCreate)) return;
       if (storageContext) storageOperation.planning = false;
       clearFormError(form);
       currentPlan = plan; submitKey = crypto.randomUUID(); preview(plan);
@@ -2686,9 +3140,18 @@
       // must never close the new drawer or inject the old target's error into
       // the new form.
       if (storageContext && !storagePlanContextCurrent(storageContext)) return;
+      if (storageCreate && !storageCreateContextCurrent(storageCreate)) return;
       if (storageContext && storageOperation && storageOperation.epoch === storageContext.epoch) storageOperation.planning = false;
       // The drawer-scoped error is never suppressed by a dismissed toast and
       // survives until the user retries or closes the drawer.
+      if (form.id === "storage-delete-form" && /related PodDefaults|cleanup acknowledgement/i.test(String(error.message || ""))) {
+        const podDefaultAck = $("#storage-delete-pod-default-ack");
+        if (podDefaultAck) { podDefaultAck.disabled = false; podDefaultAck.checked = false; podDefaultAck.focus(); }
+      }
+      if (form.id === "storage-form" && /PodDefault.*exists|overwrite acknowledgement/i.test(String(error.message || ""))) {
+        const overwrite = $("#storage-pod-default-overwrite");
+        if (overwrite) { overwrite.disabled = false; overwrite.checked = false; overwrite.focus(); }
+      }
       showFormError(form, error.message);
       notify("error", error.message, "action", { persist: false });
     }
@@ -2731,7 +3194,38 @@
     syncOverviewTable();
     if (overviewTableExpanded) renderTable("overview");
   });
-  $("#storage-kind").addEventListener("change", storageFields);
+  $("#storage-kind").addEventListener("change", () => {
+    // A new action is a new provisioning context: no template, class, PV,
+    // path, UID/GID or PodDefault value from the previous action may travel.
+    clearStorageTargets();
+    const registration = $("#storage-registration-template");
+    if (registration) registration.value = "";
+    storageFields();
+    clearFormError($("#storage-form"));
+  });
+  $("#storage-registration-template").addEventListener("change", storageTemplateChanged);
+  $("#storage-class").addEventListener("change", () => { syncStorageBoundPVs($("#storage-kind")?.value || "", selectedStorageTemplate()); });
+  $("#bound-pv-selector").addEventListener("change", () => {
+    const volume = selectedObservedPV();
+    // The visible selection is the only target; the plan reads the exact
+    // observed UID/resourceVersion at submission time and refuses a changed
+    // observation instead of reusing a stale identity.
+    if (volume) $("#storage-class").value = volume.details?.storageClass || $("#storage-class").value;
+    clearFormError($("#storage-form"));
+  });
+  $("#storage-pod-default-enable").addEventListener("change", syncStoragePodDefaultFields);
+  $("#storage-pod-default-name").addEventListener("input", storagePodDefaultFeedback);
+  $("#storage-pod-default-overwrite").addEventListener("change", storagePodDefaultFeedback);
+  [...new Set([storageNameInput(), $("#storage-pv-name"), $("#storage-claim-name")].filter(Boolean))].forEach(input => {
+    input.addEventListener("input", () => { syncStoragePodDefaultSuggestion(); });
+  });
+  $('#storage-form [name="namespace"]')?.addEventListener("change", () => {
+    // PodDefault collision detection is namespace-local; a namespace change
+    // must re-evaluate the warning without discarding the still-compatible PV.
+    syncStoragePodDefaultSuggestion();
+    syncStoragePodDefaultFields();
+    clearFormError($("#storage-form"));
+  });
   $("#notebook-kind").addEventListener("change", notebookFields);
   $("#profile-kind").addEventListener("change", profileFields);
   // The typed name is validated as it is typed. The suggestion is only

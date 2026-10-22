@@ -6,9 +6,9 @@ import (
 )
 
 func TestStorageDeleteReviewGuidanceIsTypedAndNonReplaying(t *testing.T) {
-	for _, kind := range []string{"pv.delete", "pvc.delete"} {
+	for kind, want := range map[string]string{"pv.delete": storageDeleteReviewGuidance, "pvc.delete": pvcDeleteReviewGuidance} {
 		got := reviewGuidance(kind)
-		if got != storageDeleteReviewGuidance {
+		if got != want {
 			t.Fatalf("%s did not get typed storage guidance: %s", kind, got)
 		}
 		if !strings.Contains(got, "Do not retry") || !strings.Contains(got, "finalizers") || !strings.Contains(got, "No rollback or automatic replay") {
