@@ -4,6 +4,13 @@ Records what has been **proven locally** and what still requires the operator's 
 
 ## 0.4.2 refresh — responsive Nodes table (22 October 2026)
 
+**Latest alias:** `docker.io/muratshagirov/kubeflow-admin:latest` and `:0.4.2`
+were both verified to resolve to the refreshed index
+`sha256:01761b157722b02f90a99a8262cfc1f4dec14c31f56649d8002acc42dfa2055e`.
+The alias was promoted by digest without rebuilding or changing versioned tags.
+`make image-push` now publishes version and `latest` together in one build;
+publishing-helper tests cover both tags, registry ports and invalid inputs.
+
 The operator authorized reusing `0.4.2` for this follow-up. The tag now points to
 the refreshed digest below; existing deployments pinned to the original digest
 stay unchanged. The original receipt in the following section is historical.

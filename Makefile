@@ -23,7 +23,7 @@ check: test vet manifests
 image:
 	docker buildx build --platform linux/$(shell $(GO) env GOARCH) --load -t $(IMAGE) .
 image-push:
-	docker buildx build --platform $(PLATFORMS) --provenance=true --sbom=true --push -t $(IMAGE) .
+	sh scripts/publish-image.sh "$(IMAGE)" "$(PLATFORMS)"
 security:
 	govulncheck ./...
 	trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 .

@@ -121,6 +121,15 @@ make image-push IMAGE=registry.example.org/platform/kubeflow-admin:YOUR_RELEASE
 kustomize build deploy/site > rendered.yaml
 ```
 
+`make image-push` publishes the explicit version tag **and `latest`** from the
+same multi-platform build, with provenance and SBOM on both. The helper rejects
+untagged, digest-only or `latest`-only input so a version tag is not accidentally
+omitted. Use this target for future releases; if publishing with Buildx directly,
+include both `-t repository:VERSION` and `-t repository:latest`. Promote `latest`
+only with the reviewed current release, not when rebuilding historical versions.
+Verify that both registry tags resolve to the recorded release index digest.
+Tags are mutable; continue pinning the immutable digest in deployment overlays.
+
 Buildx publishes `linux/amd64,linux/arm64` (cluster currently amd64), provenance and SBOM. Use a Buildx `docker-container` builder for multi-platform publication (`docker buildx create --driver docker-container --use` if needed). Docker uses digest-pinned Go 1.27.3 (module minimum remains 1.26), pure-Go SQLite, `CGO_ENABLED=0`, read-only module resolution, trimmed paths, no VCS/build ID; runtime is digest-pinned distroless static nonroot with CA roots and UID/GID 65532. Identical pinned inputs produce reproducible binary inputs; registry attestations/image metadata can differ between builds. Maintain the toolchain/image digests for security updates, scan before promotion, and configure registry pull credentials externally if needed. `make image` builds/loads only the local host architecture. Do not commit rendered site manifests/discovery output.
 
 Review rendered resources for the real image digest, real group/host/issuer, node affinity, storage and RBAC. Unconfigured `.invalid` URLs and `REPLACE` values must be gone. `make manifests` checks repository invariants, **not** live site compatibility.
