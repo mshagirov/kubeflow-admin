@@ -35,12 +35,7 @@ p{color:var(--muted);line-height:1.6;margin:6px 0 15px}
 .toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;background:#fff;border:1px solid var(--line);border-radius:9px;padding:14px 19px;margin-bottom:24px;flex-wrap:wrap}
 .toolbar-note{font-size:11px;margin:0;max-width:46ch}
 .freshness{display:flex;align-items:center;gap:14px;color:var(--muted);font-size:11px;flex-wrap:wrap}
-.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px;margin-bottom:25px}
-.metric,.panel{background:white;border:1px solid var(--line);border-radius:10px;box-shadow:0 3px 9px #11284803}
-.metric{padding:22px}
-.metric small{display:block;color:var(--muted);font-size:12px}
-.metric strong{display:block;font-size:32px;margin:12px 0 8px;font-weight:600;letter-spacing:-1px}
-.metric span{font-size:11px;color:#6f859c}
+.panel{background:white;border:1px solid var(--line);border-radius:10px;box-shadow:0 3px 9px #11284803}
 .panel{margin-bottom:24px;min-width:0;overflow:hidden}
 .panel-heading{padding:22px 24px;display:flex;justify-content:space-between;align-items:center;gap:12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 h2{font-size:16px;margin:0;font-weight:650}
@@ -50,8 +45,13 @@ h3{font-size:14px}
 .policy-hint{margin:0;max-width:52ch;text-align:right;align-self:center}
 .control-field{display:flex;flex-direction:column;gap:5px;margin:0;font-size:9px;letter-spacing:.8px;text-transform:uppercase;color:#74849a;font-weight:650}
 .control-field.inline-control select{margin:0;min-width:200px;padding:8px 10px;font-size:12px;letter-spacing:normal;text-transform:none;font-weight:400}
-.health-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;padding:20px 24px}
+.health-summary{display:grid;grid-template-columns:minmax(0,1.3fr) repeat(3,minmax(0,1fr));gap:14px;padding:20px 24px}
 .health-card{border:1px solid var(--line);border-radius:9px;background:#fbfcff;padding:15px 16px;min-width:0}
+.health-card-nodes{grid-row:span 2;padding:22px}
+.health-card-nodes .health-card-head{margin-bottom:24px}
+.health-card-nodes .health-card-head h3{font-size:15px}
+.health-card-nodes .health-card-head strong{font-size:40px}
+.health-card-nodes .health-states{gap:14px}
 .health-card-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:11px}
 .health-card-head h3{font-size:12px;margin:0;color:#53647c}
 .health-card-head strong{font-size:24px;line-height:1;letter-spacing:-.5px;color:#1d3560}
@@ -89,6 +89,8 @@ footer img{vertical-align:middle;max-width:100%}
 
 /* Notifications: non-modal, accessible, never a substitute for plan warnings. */
 .notifications{position:fixed;bottom:18px;right:18px;width:min(430px,calc(100vw - 36px));z-index:30;display:grid;gap:10px;max-height:50vh;overflow:auto;pointer-events:none}
+.notification-toggle{pointer-events:auto;justify-self:end;border:1px solid var(--line);background:#fff;color:#213147;box-shadow:0 3px 12px #101e341a;padding:7px 11px;font-size:11px}
+.notifications.is-expanded .notification-toggle{position:sticky;top:0;z-index:1}
 .notification{pointer-events:auto;display:flex;gap:12px;align-items:flex-start;background:#fff;border:1px solid var(--line);border-left:5px solid #7b98ff;border-radius:9px;box-shadow:0 10px 28px #101e3426;padding:13px 14px}
 .notification-body{min-width:0;flex:1}
 .notification strong{display:block;font-size:11px;letter-spacing:.7px;text-transform:uppercase;margin-bottom:5px}
@@ -233,7 +235,7 @@ dialog h2{font-size:22px;margin:10px 0 15px}
 body.signed-out main{margin-left:0;margin-right:auto;max-width:760px;padding:37px 24px}
 [hidden]{display:none!important}
 
-@media(max-width:1200px){main{padding:28px 24px}.split{grid-template-columns:1fr}.account{display:block;text-align:right}.metrics{gap:10px}.toolbar{gap:14px}}
+@media(max-width:1200px){main{padding:28px 24px}.split{grid-template-columns:1fr}.account{display:block;text-align:right}.toolbar{gap:14px}.health-summary{grid-template-columns:repeat(3,minmax(0,1fr))}.health-card-nodes{grid-column:1/-1;grid-row:auto}}
 @media(max-width:800px){
   .sidebar{position:static;width:100%;padding:16px}
   .brand{font-size:17px}
@@ -243,7 +245,6 @@ body.signed-out main{margin-left:0;margin-right:auto;max-width:760px;padding:37p
   main{margin:0;padding:22px 16px}
   header{gap:12px;flex-wrap:wrap}
   h1{font-size:25px}
-  .metrics{grid-template-columns:1fr 1fr}
   .health-summary{grid-template-columns:1fr 1fr;padding:16px}
   .panel-tools{width:100%;align-items:stretch}
   .policy-hint{text-align:left;max-width:none}

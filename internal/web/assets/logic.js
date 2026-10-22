@@ -725,6 +725,9 @@
     const scoped = scopedResources(all, namespace);
     const healthText = resource => String(resource?.state ?? "").trim().toLowerCase();
     return {
+      Profiles: stateToneCount([
+        { label: "Unprotected", tone: "neutral" }, { label: "Protected", tone: "warn" }
+      ], resource => healthText(resource) === "protected" ? "Protected" : "Unprotected", "Profile", scoped),
       Notebooks: stateToneCount([
         { label: "Running", tone: "good" }, { label: "Stopped", tone: "warn" },
         { label: "Transitioning", tone: "warn" }, { label: "Errors", tone: "bad" }

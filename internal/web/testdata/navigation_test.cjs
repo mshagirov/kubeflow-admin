@@ -663,7 +663,8 @@ async function bootHarness(options = {}) {
     setInterval(fn) { intervals.push(fn); }, setTimeout() { return 0; }, clearTimeout() {},
     sessionStorage: { getItem() { return null; }, setItem(key) { writes.push(key); } }
   });
-  vm.runInContext(app, context);
+  // Expose notification entry points only in this isolated test runtime.
+  vm.runInContext(app.replace("  // ---- API and shared helpers", "  globalThis.testNotifications = { notify, removeNotification };\n  // ---- API and shared helpers"), context);
   const settle = async () => { for (let index = 0; index < 16; index++) await new Promise(setImmediate); };
   await settle();
   function walk(node, predicate, found = []) {
@@ -677,6 +678,7 @@ async function bootHarness(options = {}) {
     return [node._text || "", ...(node.children || []).map(textOf)].join(" ");
   }
   return {
+    notices: context.testNotifications,
     get, calls, writes, bodies, drawers, openers, closers, tabs, forms, error: sharedError, location, handlers, textOf, walk,
     profileQuotaInputs, profileControls, windowHandlers,
     get activeElement() { return document.activeElement; },
@@ -725,6 +727,33 @@ async function bootHarness(options = {}) {
 }
 
 (async () => {
+  const stackTest = await bootHarness();
+  const stackRoot = stackTest.get("#notifications");
+  const stackNotices = () => stackRoot.children.filter(node => node.tagName === "ARTICLE");
+  for (const node of stackNotices()) stackTest.notices.removeNotification(node.dataset.notificationId);
+  stackTest.notices.notify("warning", "Older warning");
+  stackTest.notices.notify("error", "Older error");
+  stackTest.notices.notify("info", "Newer information");
+  stackTest.notices.notify("error", "Newest error");
+  assert.deepEqual(stackNotices().map(node => stackTest.textOf(node.children[0].children[1]).trim()), ["Newest error", "Older error", "Newer information", "Older warning"], "errors lead and both priority groups sort newest-first");
+  assert.equal(stackNotices().filter(node => !node.hidden).length, 1, "notification stack defaults to a single visible card");
+  const stackToggle = stackRoot.children[0];
+  assert.ok(stackTest.textOf(stackToggle).includes("4 notifications (2 errors)"));
+  stackToggle.click();
+  assert.equal(stackToggle.attributes["aria-expanded"], "true");
+  assert.equal(stackNotices().filter(node => !node.hidden).length, 4, "expanding exposes every message");
+  stackTest.notices.notify("warning", "Older warning");
+  assert.equal(stackNotices().length, 4, "recurring notifications stay deduplicated");
+  assert.ok(stackTest.textOf(stackNotices()[2]).includes("Older warning"), "repeat updates recency without displacing errors");
+  stackToggle.click();
+  const top = stackNotices()[0];
+  top.children[1].focus();
+  top.children[1].click();
+  assert.ok(stackTest.textOf(stackNotices().find(node => !node.hidden)).includes("Older error"), "dismissing reveals the next highest-priority notification");
+  assert.equal(stackTest.activeElement, stackToggle, "dismissal returns focus to the visible stack toggle");
+  for (const node of stackNotices()) stackTest.notices.removeNotification(node.dataset.notificationId);
+  assert.equal(stackToggle.hidden, true, "empty stack has no visible controls");
+
   const appTest = await bootHarness({ plansFailures: 2 });
   assert.equal(appTest.calls.filter(url => url.endsWith("inventory")).length, 1, "initial boot reads inventory once");
   assert.ok(appTest.get("#notifications").children.length >= 1, "inventory warnings become notifications");
@@ -737,6 +766,12 @@ async function bootHarness(options = {}) {
   // Workspace Health dashboard cards respect scope and the detailed table is opt-in.
   await appTest.click("overview");
   const healthText = appTest.textOf(appTest.get("#workspace-health-summary"));
+  const healthCards = appTest.get("#workspace-health-summary").children;
+  assert.deepEqual(Array.from(healthCards, card => appTest.textOf(card.children[0].children[0])), ["Nodes", "Profiles", "Notebooks", "Pods", "PVCs", "PVs", "Events"], "Nodes leads Profiles and the six-card grid in display order");
+  assert.ok(healthCards[0].classList.contains("health-card-nodes"), "Nodes uses the larger health card");
+  assert.ok(healthText.includes("Unprotected") && healthText.includes("Protected"), "Profile summary describes policy scope rather than inventing readiness");
+  assert.equal(html.includes('id="metrics"'), false, "Overview has no separate metrics row");
+  assert.equal(app.includes("renderMetrics"), false, "removed metrics are not rendered");
   assert.ok(healthText.includes("Pods") && healthText.includes("Notebooks") && healthText.includes("PVCs") && healthText.includes("PVs") && healthText.includes("Events"), "dashboard cards cover each resource category");
   assert.ok(healthText.includes("Running") && healthText.includes("Warning") && healthText.includes("Errors"));
   const overviewTable = appTest.get("#overview-table");

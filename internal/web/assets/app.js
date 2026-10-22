@@ -21,7 +21,7 @@
   const logic = globalThis.DashboardLogic;
 
   const pageTitles = {
-    overview: ["Overview", "A clear view of your Kubeflow workspace."],
+    overview: ["Overview", "Cluster at a Glance"],
     profiles: ["Profiles", "Manage ownership, namespaces and resource quotas."],
     namespaces: ["Namespaces", "Observed namespaces and the resources they contain."],
     storage: ["Storage", "Provision and grow persistent storage with explicit safeguards."],
@@ -116,7 +116,41 @@
   const dismissed = loadDismissed();
   const visibleNotifications = new Map();
   const notificationTimers = new Map();
+  let notificationSequence = 0;
+  let notificationsExpanded = false;
+  let notificationToggle = null;
   const noticeLabels = { info: "Information", success: "Success", warning: "Warning", error: "Error" };
+
+  function renderNotificationStack() {
+    const root = $("#notifications");
+    const notices = [...visibleNotifications.values()].sort((a, b) =>
+      Number(b.dataset.level === "error") - Number(a.dataset.level === "error") ||
+      Number(b.dataset.recency) - Number(a.dataset.recency));
+    if (!notificationToggle) {
+      notificationToggle = el("button", undefined, "notification-toggle");
+      notificationToggle.type = "button";
+      notificationToggle.addEventListener("click", () => {
+        notificationsExpanded = !notificationsExpanded;
+        renderNotificationStack();
+      });
+    }
+    if (notices.length <= 1) notificationsExpanded = false;
+    const focused = document.activeElement;
+    const restoreFocus = root.contains(focused);
+    notificationToggle.hidden = notices.length <= 1;
+    notificationToggle.textContent = notificationsExpanded
+      ? `Collapse notifications (${notices.length})`
+      : `Show ${notices.length} notifications (${notices.filter(node => node.dataset.level === "error").length} errors)`;
+    notificationToggle.setAttribute("aria-expanded", String(notificationsExpanded));
+    root.classList.toggle("is-expanded", notificationsExpanded);
+    notices.forEach((node, index) => { node.hidden = !notificationsExpanded && index > 0; });
+    root.replaceChildren(notificationToggle, ...notices);
+    if (restoreFocus) {
+      const target = !focused.hidden && !focused.closest("[hidden]") ? focused
+        : notices[0]?.querySelector("button") || $("#refresh");
+      target?.focus();
+    }
+  }
 
   function loadDismissed() {
     const remembered = new Set();
@@ -143,11 +177,13 @@
     const timer = notificationTimers.get(id);
     if (timer) clearTimeout(timer);
     notificationTimers.delete(id);
+    renderNotificationStack();
     if (remember && logic.shouldRememberDismissals(notificationScope)) { dismissed.add(id); persistDismissed(); }
     if (hadFocus) {
       const open = openDrawers();
       const drawerButton = open.length ? open[open.length - 1].querySelector("button[data-close-drawer]") : null;
-      const target = drawerButton || $("#notifications button") || $("#refresh");
+      const target = drawerButton || (!notificationToggle.hidden ? notificationToggle : null) ||
+        [...visibleNotifications.values()].find(node => !node.hidden)?.querySelector("button") || $("#refresh");
       if (target) target.focus();
     }
   }
@@ -156,10 +192,18 @@
     if (!text) return;
     const persist = options.persist === undefined ? persistableCode(code) : !!options.persist;
     const id = logic.notificationID(level, code, text);
-    if ((persist && dismissed.has(id)) || visibleNotifications.has(id)) return;
+    if (persist && dismissed.has(id)) return;
+    const existing = visibleNotifications.get(id);
+    if (existing) {
+      existing.dataset.recency = String(++notificationSequence);
+      renderNotificationStack();
+      return;
+    }
     const article = el("article", undefined, "notification " + level);
     article.dataset.notificationId = id;
     article.dataset.persist = persist ? "1" : "0";
+    article.dataset.level = level;
+    article.dataset.recency = String(++notificationSequence);
     article.setAttribute("role", level === "error" || level === "warning" ? "alert" : "status");
     const body = el("div", undefined, "notification-body");
     body.append(el("strong", noticeLabels[level] || "Notice"), el("p", text));
@@ -168,8 +212,8 @@
     close.setAttribute("aria-label", "Dismiss " + text.slice(0, 90));
     close.addEventListener("click", () => removeNotification(id, persist));
     article.append(body, close);
-    $("#notifications").append(article);
     visibleNotifications.set(id, article);
+    renderNotificationStack();
     if (level === "success" || level === "info") notificationTimers.set(id, setTimeout(() => removeNotification(id), 10000));
   }
 
@@ -887,15 +931,6 @@
     const note = historyNote(stateKey);
     if (note) container.append(el("p", note, "table-note"));
   }
-  function renderMetrics() {
-    const scoped = logic.scopedResources(inventory?.resources || [], namespaceContext);
-    const groups = [["Profiles", "Profile", "Workspace ownership"], ["Notebooks", "Notebook", "Desired and observed lifecycle"], ["Volume claims", "PersistentVolumeClaim", "Persistent workspace storage"], ["Pods", "Pod", "Observed workload state"]];
-    $("#metrics").replaceChildren(...groups.map(([label, kind, caption]) => {
-      const metric = el("div", undefined, "metric");
-      metric.append(el("small", label), el("strong", String(scoped.filter(resource => resource.kind === kind).length)), el("span", caption));
-      return metric;
-    }));
-  }
   function renderWorkspaceHealth() {
     const summaryRoot = $("#workspace-health-summary");
     const select = $("#overview-namespace");
@@ -909,10 +944,11 @@
     }
     if (!summaryRoot) return;
     const summary = logic.workspaceHealthSummary(inventory?.resources || [], namespaceContext);
-    const cards = [["Pods", "Pods"], ["Notebooks", "Notebooks"], ["Nodes", "Nodes"], ["PersistentVolumeClaims", "PVCs"], ["PersistentVolumes", "PVs"], ["Events", "Events"]];
+    const cards = [["Nodes", "Nodes"], ["Profiles", "Profiles"], ["Notebooks", "Notebooks"], ["Pods", "Pods"], ["PersistentVolumeClaims", "PVCs"], ["PersistentVolumes", "PVs"], ["Events", "Events"]];
     summaryRoot.replaceChildren(...cards.map(([key, label]) => {
       const data = summary[key] || { total: 0, states: [] };
       const card = el("article", undefined, "health-card");
+      if (key === "Nodes") card.classList.add("health-card-nodes");
       const head = el("div", undefined, "health-card-head");
       head.append(el("h3", label), el("strong", String(data.total)));
       const states = el("ul", undefined, "health-states");
@@ -934,7 +970,7 @@
     }
   }
   function renderPage() {
-    if (page === "overview") { renderMetrics(); renderWorkspaceHealth(); syncOverviewTable(); if (overviewTableExpanded) renderTable("overview"); }
+    if (page === "overview") { renderWorkspaceHealth(); syncOverviewTable(); if (overviewTableExpanded) renderTable("overview"); }
     else if (page === "profiles") renderTable("profiles");
     else if (page === "namespaces") renderTable("namespaces");
     else if (page === "storage") renderTable("storage");

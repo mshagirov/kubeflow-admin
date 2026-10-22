@@ -371,6 +371,8 @@ assert.equal(logic.formatAge(undefined, Date.parse("2026-01-15T00:00:00Z")), "â€
 
 // Workspace health summary classifies each resource into exactly one state.
 const healthResources = [
+  {kind:"Profile",name:"team",state:""},
+  {kind:"Profile",name:"protected-team",state:"Protected"},
   {kind:"Notebook",name:"running",namespace:"team",state:"Running / Ready"},
   {kind:"Notebook",name:"stopped",namespace:"team",state:"Stopped"},
   {kind:"Notebook",name:"broken",namespace:"team",state:"Failed"},
@@ -391,6 +393,11 @@ const healthResources = [
   {kind:"Event",name:"e2",namespace:"team",state:"Warning"}
 ];
 const health = logic.workspaceHealthSummary(healthResources, "");
+assert.deepEqual(health.Profiles.states.map(state => [state.label,state.count,state.tone]), [["Unprotected",1,"neutral"],["Protected",1,"warn"]]);
+assert.equal(health.Profiles.total, 2);
+assert.equal(logic.workspaceHealthSummary(healthResources, "team").Profiles.total, 1, "Profile cards follow namespace scope by Profile name");
+assert.equal(logic.workspaceHealthSummary(healthResources, "missing").Profiles.total, 0);
+assert.equal(logic.workspaceHealthSummary([], "").Profiles.total, 0);
 assert.equal(health.Notebooks.total, 3);
 assert.deepEqual(health.Notebooks.states.map(state => [state.label,state.count,state.tone]), [["Running",1,"good"],["Stopped",1,"warn"],["Transitioning",0,"warn"],["Errors",1,"bad"]]);
 assert.deepEqual(health.Pods.states.map(state => [state.label,state.count]), [["Running",1],["Warning",2],["Errors",1]]);

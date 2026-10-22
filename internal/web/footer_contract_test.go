@@ -345,17 +345,17 @@ func TestFooterSchemeRelativeImageIsNormalized(t *testing.T) {
 }
 
 // The Overview page no longer carries the static explanation panels, and the
-// rest of the page is untouched.
+// observed Workspace Health content remains without a separate metrics row.
 func TestOverviewExplanationPanelsAreRemoved(t *testing.T) {
 	s, _, _ := fixture()
 	body := request(handler(s), "GET", "/", "").Body.String()
-	for _, gone := range []string{"Review before you apply", "Observed, not assumed", "info-grid"} {
+	for _, gone := range []string{"Review before you apply", "Observed, not assumed", "info-grid", `id="metrics"`} {
 		if strings.Contains(body, gone) {
 			t.Fatalf("the removed Overview panel is still rendered: %q", gone)
 		}
 	}
 	// The Overview page itself keeps its observed content.
-	for _, kept := range []string{`id="overview" class="page"`, `id="metrics"`, `id="workspace-health-summary"`, `id="overview-table" data-table="overview"`} {
+	for _, kept := range []string{`id="overview" class="page"`, `id="workspace-health-summary"`, `id="overview-table" data-table="overview"`} {
 		if !strings.Contains(body, kept) {
 			t.Fatalf("the Overview page lost %q", kept)
 		}

@@ -1796,8 +1796,31 @@ async function checkStorageDeletePayload(context) {
   await page.locator("#submit-plan").click();
   await page.waitForFunction(() => {
     const notices = document.querySelector("#notifications");
-    return !!(notices && notices.innerText.includes("accepted (Pending)"));
+    return !!(notices && notices.textContent.includes("accepted (Pending)"));
   }, null, { timeout: 10000 });
+  // Once the drawer and confirmation dialog have closed, the accumulated
+  // validation errors lead the compact stack, ahead of the acceptance notice.
+  const noticeStack = page.locator("#notifications");
+  assert.equal(await noticeStack.locator(".notification:visible").count(), 1);
+  assert.equal(await noticeStack.locator(".notification:visible").getAttribute("data-level"), "error");
+  const stackToggle = noticeStack.locator(".notification-toggle");
+  await stackToggle.click();
+  assert.equal(await stackToggle.getAttribute("aria-expanded"), "true");
+  const noticeOrder = await noticeStack.locator(".notification:visible").evaluateAll(nodes => nodes.map(node => ({
+    error: node.dataset.level === "error", recency: Number(node.dataset.recency)
+  })));
+  assert.ok(noticeOrder.length > 1, "expanding shows the accumulated notifications");
+  for (let index = 1; index < noticeOrder.length; index++) {
+    const beforeNotice = noticeOrder[index - 1], afterNotice = noticeOrder[index];
+    assert.ok(!afterNotice.error || beforeNotice.error, "errors precede non-errors");
+    if (beforeNotice.error === afterNotice.error) assert.ok(beforeNotice.recency > afterNotice.recency, "each group is newest-first");
+  }
+  await stackToggle.click();
+  assert.equal(await noticeStack.locator(".notification:visible").count(), 1);
+  const notificationToggle = page.locator("#notifications .notification-toggle");
+  if (await notificationToggle.isVisible() && await notificationToggle.getAttribute("aria-expanded") === "false") {
+    await notificationToggle.click();
+  }
   const operationsBeforeAfter = capture.operations.length;
   assert.ok(operationsBeforeAfter > operationsBefore, "the confirmed deletion was not submitted as an operation");
   const notice = (await page.locator("#notifications").innerText()).trim();
@@ -2209,6 +2232,23 @@ async function checkResponsive(context) {
       results.push(`${viewport.width}px ${route}: overflow ${overflow.document}/${overflow.body}px`);
       assert.ok(overflow.document <= 1, `${route} overflows the ${viewport.width}px viewport by ${overflow.document}px`);
       assert.ok(overflow.body <= 1, `${route} overflows the ${viewport.width}px viewport by ${overflow.body}px`);
+      if (route === "/") {
+        assert.equal(await page.locator("#metrics").count(), 0, "Overview has no legacy metrics row");
+        const cards = await page.locator("#workspace-health-summary .health-card").evaluateAll(nodes => nodes.map(node => {
+          const rect = node.getBoundingClientRect();
+          return { label: node.querySelector("h3").textContent, x: rect.x, y: rect.y, width: rect.width, height: rect.height, bottom: rect.bottom };
+        }));
+        assert.deepEqual(cards.map(card => card.label), ["Nodes", "Profiles", "Notebooks", "Pods", "PVCs", "PVs", "Events"]);
+        if (viewport.width > 1200) {
+          const [nodes, profiles, notebooks, pods, pvcs, pvs, events] = cards;
+          assert.ok(nodes.width > profiles.width && nodes.height > profiles.height, "Nodes is larger than the other health cards");
+          assert.ok(nodes.x < profiles.x && profiles.x < notebooks.x && notebooks.x < pods.x, "Nodes sits beside the top row of three cards");
+          assert.ok(Math.abs(profiles.y - notebooks.y) < 1 && Math.abs(profiles.y - pods.y) < 1, "top row is aligned");
+          assert.ok(Math.abs(pvcs.y - pvs.y) < 1 && Math.abs(pvcs.y - events.y) < 1 && pvcs.y > profiles.y, "bottom row is aligned below the top row");
+          assert.ok(Math.abs(profiles.x - pvcs.x) < 1 && Math.abs(notebooks.x - pvs.x) < 1 && Math.abs(pods.x - events.x) < 1, "six cards form three columns");
+          assert.ok(Math.abs(nodes.bottom - events.bottom) < 1, "Nodes spans both rows");
+        }
+      }
     }
   }
   console.log("      measured overflow: " + results.join(", "));
