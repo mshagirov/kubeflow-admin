@@ -765,7 +765,7 @@ async function bootHarness(options = {}) {
 
   // Workspace Health dashboard cards respect scope and the detailed table is opt-in.
   await appTest.click("overview");
-  assert.equal(appTest.textOf(appTest.get("#page-eyebrow")), "Cluster at a Glance", "Overview uses the requested eyebrow text");
+  assert.equal(appTest.textOf(appTest.get("#page-eyebrow")), "CLUSTER AT A GLANCE", "Overview uses the requested uppercase eyebrow text");
   assert.equal(html.includes('id="page-subtitle"'), false, "initial Overview markup has no subtitle paragraph");
   const healthText = appTest.textOf(appTest.get("#workspace-health-summary"));
   const healthCards = appTest.get("#workspace-health-summary").children;

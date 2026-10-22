@@ -9,7 +9,9 @@ digest, while existing deployments pinned to the original digest stay unchanged.
 Publication of the refresh is pending; the original receipt below is historical.
 
 - Personal review confirmed the changes affect only Nodes table CSS and its
-  browser assertion. The old 1560px minimum is replaced by an 800px narrow-view
+  browser assertion, plus the requested uppercase Overview eyebrow and its tests.
+  Overview now reads "CLUSTER AT A GLANCE" in both initial and navigated views.
+  The old 1560px minimum is replaced by an 800px narrow-view
   fallback; above 1200px the eight-column table uses the available width, smaller
   horizontal padding, explicit column proportions and wrapping. No columns,
   Resource Details, actions, backend behavior, permissions or feature flags change.

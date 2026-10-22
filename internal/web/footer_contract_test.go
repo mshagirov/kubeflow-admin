@@ -355,7 +355,7 @@ func TestOverviewExplanationPanelsAreRemoved(t *testing.T) {
 		}
 	}
 	// The Overview page itself keeps its observed content.
-	for _, kept := range []string{`id="overview" class="page"`, `id="workspace-health-summary"`, `id="overview-table" data-table="overview"`, `id="page-eyebrow" class="eyebrow">Cluster at a Glance</div>`} {
+	for _, kept := range []string{`id="overview" class="page"`, `id="workspace-health-summary"`, `id="overview-table" data-table="overview"`, `id="page-eyebrow" class="eyebrow">CLUSTER AT A GLANCE</div>`} {
 		if !strings.Contains(body, kept) {
 			t.Fatalf("the Overview page lost %q", kept)
 		}

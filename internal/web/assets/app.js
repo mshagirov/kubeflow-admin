@@ -1148,7 +1148,7 @@
     applyPodFilters(location.search);
     applyResourceScope(location.search);
     $("#page-title").textContent = pageTitles[page]?.[0] || "Overview";
-    $("#page-eyebrow").textContent = page === "overview" ? "Cluster at a Glance" : "CLUSTER ADMINISTRATION";
+    $("#page-eyebrow").textContent = page === "overview" ? "CLUSTER AT A GLANCE" : "CLUSTER ADMINISTRATION";
     let subtitle = $("#page-subtitle");
     if (page === "overview") {
       subtitle?.remove();

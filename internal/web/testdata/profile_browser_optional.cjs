@@ -2254,7 +2254,7 @@ async function checkResponsive(context) {
         await page.keyboard.press("Escape");
       }
       if (route === "/") {
-        assert.equal(await page.locator("#page-eyebrow.eyebrow").textContent(), "Cluster at a Glance", "Overview retains the existing eyebrow class");
+        assert.equal(await page.locator("#page-eyebrow.eyebrow").textContent(), "CLUSTER AT A GLANCE", "Overview retains the existing eyebrow class with uppercase text");
         assert.equal(await page.locator("#page-subtitle").count(), 0, "Overview has no subtitle paragraph");
         assert.equal(await page.locator("#metrics").count(), 0, "Overview has no legacy metrics row");
         const cards = await page.locator("#workspace-health-summary .health-card").evaluateAll(nodes => nodes.map(node => {
