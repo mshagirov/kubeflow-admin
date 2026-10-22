@@ -119,7 +119,7 @@ footer img{vertical-align:middle;max-width:100%}
 .table-scroll>table{min-width:700px}
 [data-table="profiles"] .table-scroll>table{min-width:760px}
 [data-table="namespaces"] .table-scroll>table{min-width:460px}
-[data-table="nodes"] .table-scroll>table{min-width:1560px}
+[data-table="nodes"] .table-scroll>table{min-width:800px}
 [data-table="storage"] .table-scroll>table{min-width:900px}
 [data-table="notebooks"] .table-scroll>table{min-width:800px}
 [data-table="pods"] .table-scroll>table{min-width:1180px}
@@ -235,6 +235,19 @@ dialog h2{font-size:22px;margin:10px 0 15px}
 body.signed-out main{margin-left:0;margin-right:auto;max-width:760px;padding:37px 24px}
 [hidden]{display:none!important}
 
+@media(min-width:1201px){
+  [data-table="nodes"] .table-scroll>table{min-width:0;table-layout:fixed}
+  [data-table="nodes"] th,[data-table="nodes"] td{padding-left:10px;padding-right:10px}
+  [data-table="nodes"] th,[data-table="nodes"] .sort-button{white-space:normal;overflow-wrap:anywhere}
+  [data-table="nodes"] .link-button,[data-table="nodes"] .badge,[data-table="nodes"] td button{max-width:100%;overflow-wrap:anywhere}
+  [data-table="nodes"] th:nth-child(1){width:18%}
+  [data-table="nodes"] th:nth-child(2){width:16%}
+  [data-table="nodes"] th:nth-child(3){width:12%}
+  [data-table="nodes"] th:nth-child(4){width:6%}
+  [data-table="nodes"] th:nth-child(5){width:10%}
+  [data-table="nodes"] th:nth-child(6),[data-table="nodes"] th:nth-child(7){width:12%}
+  [data-table="nodes"] th:nth-child(8){width:14%}
+}
 @media(max-width:1200px){main{padding:28px 24px}.split{grid-template-columns:1fr}.account{display:block;text-align:right}.toolbar{gap:14px}.health-summary{grid-template-columns:repeat(3,minmax(0,1fr))}.health-card-nodes{grid-column:1/-1;grid-row:auto}}
 @media(max-width:800px){
   .sidebar{position:static;width:100%;padding:16px}

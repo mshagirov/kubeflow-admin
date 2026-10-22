@@ -2,7 +2,27 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
-## 0.4.2 — Overview, notifications and simplified tables (22 October 2026)
+## 0.4.2 refresh — responsive Nodes table (22 October 2026)
+
+The operator authorized reusing `0.4.2` for this follow-up; the tag will change
+digest, while existing deployments pinned to the original digest stay unchanged.
+Publication of the refresh is pending; the original receipt below is historical.
+
+- Personal review confirmed the changes affect only Nodes table CSS and its
+  browser assertion. The old 1560px minimum is replaced by an 800px narrow-view
+  fallback; above 1200px the eight-column table uses the available width, smaller
+  horizontal padding, explicit column proportions and wrapping. No columns,
+  Resource Details, actions, backend behavior, permissions or feature flags change.
+- Node regressions, full serialized Go 1.27.3 race suite, vet, build, module
+  verification, whitespace checks and `govulncheck` passed (no vulnerabilities).
+- Real-Chrome synthetic acceptance passed **32/32**, with no JavaScript errors
+  or page overflow at 390px/1280px. A new assertion verifies the Nodes table itself
+  has no horizontal scroll at the wide viewport, not just the surrounding page.
+
+No cluster deployment was performed. The refreshed immutable digest will be
+recorded after runtime scans, CI and registry verification.
+
+## Original 0.4.2 — Overview, notifications and simplified tables (22 October 2026)
 
 Published and registry-verified as `docker.io/muratshagirov/kubeflow-admin:0.4.2`.
 

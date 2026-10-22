@@ -2240,6 +2240,10 @@ async function checkResponsive(context) {
           ? ["Pod", "Ready", "Restarts", "State", "Node", "Owner", "Restart"]
           : ["Name", "Status", "Roles", "Age", "Version", "Internal-IP", "External-IP", "Cordon / Uncordon"];
         assert.deepEqual(headers.map(text => text.replace(/[↕▲▼]/g, "").trim()), expected, `${key} has only the simplified columns`);
+        if (key === "nodes" && viewport.width > 1200) {
+          const widths = await table.locator(".table-scroll").evaluate(node => ({ available: node.clientWidth, content: node.scrollWidth }));
+          assert.ok(widths.content <= widths.available + 1, "Nodes table fits its wide-screen container without horizontal scrolling");
+        }
         const rowLengths = await table.locator("tbody tr").evaluateAll(rows => rows.map(row => row.children.length));
         assert.ok(rowLengths.every(length => length === expected.length), `${key} cells match their headers`);
         const details = await clickResourceName(page, key, key === "pods" ? "team-alpha-notebook-0-0" : "node-a");
