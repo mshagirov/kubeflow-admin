@@ -551,6 +551,8 @@ const (
 // retry, a force delete or a finalizer removal.
 const storageDeleteReviewGuidance = "The storage deletion may already have been accepted. Inspect the exact PersistentVolume or PersistentVolumeClaim UID named by this operation, any replacement object under the same name, current Pod and Notebook references, binding claim references and remaining finalizers. Do not retry the deletion, do not delete a replacement object and do not remove finalizers or force cleanup. The storage target remains locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
 
+const pvReclaimReviewGuidance = "The PersistentVolume reclaim may already have removed the stale claimRef. Inspect the exact reviewed PV UID, its current phase, claimRef and any new claims. Existing backend data is not erased and may now be bindable. Do not retry, restore claimRef blindly, remove finalizers or mutate a replacement volume. The PV remains locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
+
 // An uncertain edit may have changed future data reclamation or started a
 // resize, even though the operation did not observe a durable outcome.
 const storageEditReviewGuidance = "The storage edit may already have been applied. Inspect the reviewed PersistentVolume or PersistentVolumeClaim UID and the accepted before/after changes, not a replacement object under the same name. A PersistentVolume reclaim policy may now be Delete, allowing backing data to be destroyed on a later claim release or volume deletion. A PersistentVolumeClaim resize may still be pending in the CSI controller or filesystem. Do not retry, force cleanup, shrink storage, remove finalizers or delete a replacement object. The storage target remains locked pending explicit operator reconciliation. No rollback or automatic replay was performed."
@@ -578,6 +580,9 @@ const pvcDeleteReviewGuidance = "The PVC deletion and any reviewed PodDefault cl
 // outcome is unknown. A restart never resumes or replays any action. The typed
 // storage actions get guidance that names the object and possible effects.
 func recoveryGuidance(action string) string {
+	if action == "pv.reclaim" {
+		return "Application restarted before a durable outcome; no action was replayed and nothing will be resumed automatically. " + pvReclaimReviewGuidance
+	}
 	if action == pvDeleteKind {
 		return "Application restarted before a durable outcome. A storage deletion may already have been accepted. Inspect the exact PersistentVolume UID, any replacement object, its references and finalizers; no action was replayed and nothing will be resumed automatically."
 	}
@@ -607,6 +612,8 @@ func recoveryGuidance(action string) string {
 // existing unrelated actions keep the generic wording unchanged.
 func reviewGuidance(action string) string {
 	switch action {
+	case "pv.reclaim":
+		return pvReclaimReviewGuidance
 	case profileDeleteKind:
 		return profileDeleteReviewGuidance
 	case pvDeleteKind:

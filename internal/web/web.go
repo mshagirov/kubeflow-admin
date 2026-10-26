@@ -467,13 +467,20 @@ func resourceList(kind string) string {
 // resourceVersion, a restricted YAML projection and optional warnings. A full
 // manifest is never read or echoed, and an error never carries backend source.
 func (s *server) storageDocument(w http.ResponseWriter, r *http.Request) {
-	if !s.cfg.Features.WritesEnabled || (!s.cfg.Features.StorageEditing && !s.cfg.Features.StorageDeletion) {
+	if !s.cfg.Features.WritesEnabled || (!s.cfg.Features.StorageEditing && !s.cfg.Features.StorageDeletion && !s.cfg.Features.PVReclaim) {
 		fail(w, 403, "Storage document access is disabled by server policy.")
 		return
 	}
 	q := r.URL.Query()
 	kind, namespace, name := strings.TrimSpace(q.Get("kind")), strings.TrimSpace(q.Get("namespace")), strings.TrimSpace(q.Get("name"))
 	canonical, ok := canonicalStorageKind(kind)
+	if kind == "pv.reclaim" {
+		if !s.cfg.Features.PVReclaim {
+			fail(w, 403, "PV reclaim is disabled.")
+			return
+		}
+		canonical, ok = "PersistentVolume", true
+	}
 	if !ok {
 		fail(w, 400, "Unsupported storage kind.")
 		return
@@ -499,7 +506,11 @@ func (s *server) storageDocument(w http.ResponseWriter, r *http.Request) {
 		fail(w, 503, "Storage document access is unavailable.")
 		return
 	}
-	doc, err := docs.StorageDocument(r.Context(), canonical, namespace, name)
+	backendKind := canonical
+	if kind == "pv.reclaim" {
+		backendKind = kind
+	}
+	doc, err := docs.StorageDocument(r.Context(), backendKind, namespace, name)
 	if err != nil {
 		// The document read is a controlled, strict server-authored
 		// projection. Only exact reviewed storage policy messages may surface
@@ -575,6 +586,11 @@ func (s *server) plan(w http.ResponseWriter, r *http.Request) {
 	// A refused request never reaches the plan manager; the backend repeats
 	// every identity, scope and eligibility check.
 	switch a.Kind {
+	case "pv.reclaim":
+		if !s.cfg.Features.PVReclaim {
+			fail(w, 403, "PV reclaim is disabled by server policy.")
+			return
+		}
 	case "pv.edit", "pvc.edit":
 		if !s.cfg.Features.StorageEditing {
 			fail(w, 403, "Storage editing is disabled by server policy.")

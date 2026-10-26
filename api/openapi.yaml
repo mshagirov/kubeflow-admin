@@ -171,11 +171,14 @@ paths:
         manifests, backend addresses, volume handles, CSI attributes, annotations,
         finalizers or status. No Kubernetes mutation is performed. Server-side
         capability, namespace and StorageClass policies still apply.
+        With kind=pv.reclaim, verifies a Released Retain PV and its absent
+        previous claim and returns identity/warnings for standalone reclaim;
+        the YAML placeholder is not editable and contains no backend fields.
       parameters:
         - name: kind
           in: query
           required: true
-          schema: {type: string, enum: [PersistentVolume, PersistentVolumeClaim]}
+          schema: {type: string, enum: [PersistentVolume, PersistentVolumeClaim, pv.reclaim]}
         - name: name
           in: query
           required: true
@@ -458,6 +461,12 @@ components:
             document. pv.delete and pvc.delete require storageDeletion plus
             writes, current identity, reason and exact confirmName. Referenced
             PVCs and bound/reserved PVs are refused; no forced cleanup exists.
+            pv.reclaim explicitly reclaims an already Released Retain PV whose
+            old claim is absent, with pvReclaim, writes, isolated class and PV
+            patch RBAC. It requires targetUID, targetResourceVersion, reason and
+            exact confirmName. It removes only stale spec.claimRef and verifies
+            Available, never patches status or deletes anything. Uncertain
+            writes end needs-review with no rollback or automatic replay.
             Only with confirmPVReclaim, the separate pvReclaim feature and an
             operator-confirmed isolated StorageClass, a pvc.delete whose bound
             PV has reclaim policy Retain also removes
@@ -496,7 +505,7 @@ components:
             recreation. Resolve a partial PodDefault step only by manual operator
             review with authorized kubectl; there is no standalone app repair,
             replay or unlock endpoint.
-          enum: [profile.create, profile.quota.change, profile.update, profile.delete, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pv.create.static, pvc.create.bound, pvc.expand, pv.edit, pvc.edit, pv.delete, pvc.delete, notebook.start, notebook.stop, notebook.edit, pod.restart, node.cordon, node.uncordon]
+          enum: [profile.create, profile.quota.change, profile.update, profile.delete, pvc.create.dynamic, storage.create.static, pv.reserve-and-claim, pv.create.static, pvc.create.bound, pvc.expand, pv.edit, pvc.edit, pv.delete, pvc.delete, pv.reclaim, notebook.start, notebook.stop, notebook.edit, pod.restart, node.cordon, node.uncordon]
         namespace:
           type: string
           description: >-
@@ -520,7 +529,7 @@ components:
         reason:
           type: string
           maxLength: 500
-          description: 'Administrator input only; required and nonblank for pod.restart, node.cordon, node.uncordon, profile.delete, pv.delete and pvc.delete; optional for storage edits'
+          description: 'Administrator input only; required and nonblank for pod.restart, node.cordon, node.uncordon, profile.delete, pv.delete, pvc.delete and pv.reclaim; optional for storage edits'
         confirmName:
           type: string
           maxLength: 253
@@ -528,7 +537,7 @@ components:
             Raw exact target name typed back by the administrator as a second
             confirmation: the value is compared to the target object name
             exactly, without trimming or case folding. Required for
-            profile.delete, pv.delete and pvc.delete, which also require a nonempty reason; ignored by
+            profile.delete, pv.delete, pvc.delete and pv.reclaim, which also require a nonempty reason; ignored by
             every other kind.
         baseConfigDigest:
           type: string
@@ -559,7 +568,7 @@ components:
         targetUID:
           type: string
           description: >-
-            Required current UID for pv.edit, pvc.edit, pv.delete and pvc.delete.
+            Required current UID for pv.edit, pvc.edit, pv.delete, pvc.delete and pv.reclaim.
             pvc.create.bound also requires the selected PV's current UID so the
             plan cannot bind to a replacement or concurrently changed volume.
         targetResourceVersion:

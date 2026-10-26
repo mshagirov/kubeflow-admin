@@ -105,6 +105,13 @@ func (s *Service) reclaimRetainedVolume(ctx context.Context, plan *storageDelete
 	if err := s.rejectReclaimClaims(ctx, t); err != nil {
 		return err
 	}
+	return s.patchAndVerifyReclaim(ctx, t, pv)
+}
+
+// Shared by explicit reclaim of an old Released PV and optional post-delete
+// reclaim. Callers must durably checkpoint and revalidate before entering;
+// every error here is conservatively treated as a possibly applied mutation.
+func (s *Service) patchAndVerifyReclaim(ctx context.Context, t *storageReclaimTarget, pv *corev1.PersistentVolume) error {
 	body, err := json.Marshal(conditional(string(pv.UID), pv.ResourceVersion, storageReclaimOps(t)))
 	if err != nil {
 		return errors.New("PersistentVolume reclaim patch could not be encoded")

@@ -260,7 +260,7 @@ func validateKnownDependencyLocks(ctx context.Context, q sqlQueryer) error {
 // fields keep the subset rule.
 func strictDependencyLocks(a model.Action) bool {
 	switch a.Kind {
-	case "pv.create.static", "pvc.create.bound":
+	case "pv.create.static", "pvc.create.bound", "pv.reclaim":
 		return true
 	case "pvc.create.dynamic":
 		return a.PodDefault != nil

@@ -12,7 +12,7 @@
   const storageEditKinds = new Set(["pv.edit", "pvc.edit"]);
   const storageDeleteKinds = new Set(["pv.delete", "pvc.delete"]);
   function storageActionKind(kind, verb) {
-    if (kind === "PersistentVolume") return verb === "edit" ? "pv.edit" : verb === "delete" ? "pv.delete" : "";
+    if (kind === "PersistentVolume") return verb === "edit" ? "pv.edit" : verb === "delete" ? "pv.delete" : verb === "reclaim" ? "pv.reclaim" : "";
     if (kind === "PersistentVolumeClaim") return verb === "edit" ? "pvc.edit" : verb === "delete" ? "pvc.delete" : "";
     return "";
   }
@@ -108,7 +108,7 @@
       delete action.force;
       if (!action.namespace) delete action.namespace;
     }
-    if (storageDeleteKinds.has(action.kind)) {
+    if (storageDeleteKinds.has(action.kind) || action.kind === "pv.reclaim") {
       // The exact typed name is the second confirmation. The browser-side
       // data-loss acknowledgement is deliberately not an action field: it is
       // never sent and it is never a security gate.
@@ -281,6 +281,12 @@
       }
       fields.push(["Confirmation", `The confirmation name must match "${action.name}" character for character. The browser-side data-loss acknowledgement is only a safeguard and is never sent as an action field.`]);
       fields.push(["Needs review", "If the result is needs-review, do not retry. Inspect Operations and History and ask the operator to review the target."]);
+    }
+    if (action.kind === "pv.reclaim") {
+      fields.push(["Reclaim scope", "Removes only the stale claimRef of the exact reviewed Released Retain PV. The previous claim must already be absent. No PVC/PV is created or deleted; Kubernetes, not the console, updates status to Available."]);
+      fields.push(["Retained data", "Existing data is not erased and any matching claim can access it once the PV is Available. Independently enforced StorageClass isolation is required."]);
+      fields.push(["Confirmation", `The reason and exact typed PV name "${action.name}" are required; UID and resourceVersion are revalidated before the one patch.`]);
+      fields.push(["Needs review", "If the patch or convergence is uncertain, do not retry or restore claimRef blindly. The PV stays locked for operator reconciliation; no rollback or replay is performed."]);
     }
     if (action.kind === "pvc.create.dynamic") {
       fields.push(["Provisioning", "Dynamic provisioning asks the approved StorageClass to provision storage. With WaitForFirstConsumer the claim stays Pending until a consuming Pod is scheduled; Pending is not proof that provisioning or backend capacity will succeed."]);

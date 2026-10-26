@@ -1,4 +1,4 @@
-# Explicit post-delete reclaim permission, separate from storage deletion.
+# Explicit standalone/post-delete reclaim permission, separate from deletion.
 # RBAC cannot restrict patch fields: enforce admission and protect this identity.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

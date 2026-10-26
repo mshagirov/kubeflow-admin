@@ -454,6 +454,33 @@ back or recreates a PVC/PodDefault.
 
 ### Retain volume reclaim after PVC deletion
 
+#### Reclaim an already-Released PV
+
+On Storage, open an existing Released PV and choose **Reclaim PV**. This is a
+standalone `pv.reclaim` operation; it does not delete the PV or create/delete a
+PVC. Enable the existing `pvReclaim` opt-in (and its writes/storage-deletion
+prerequisites), install the separate `pv-reclaim` grant, and enforce isolation
+for its approved class before listing it in `storage.isolatedStorageClasses`.
+Shared tenant classes must not simply be added to bypass this safety gate.
+
+The drawer fetches fresh identity and eligibility evidence. Provide a reason,
+type the exact PV name, acknowledge the retained-data exposure and review the
+plan. The PV must be Released, Retain, nonterminating and have a complete stale
+claimRef with namespace/name/UID. The old claim name must be absent; replacement,
+referencing and unbound matching-class claims block reclaim, including beta
+class-annotation aliases. Protected/out-of-scope old claim namespaces are refused.
+
+Execution revalidates after the durable checkpoint, removes only the exact stale
+claimRef with UID/resourceVersion preconditions and observes the same PV become
+Available with no claimRef. Kubernetes, not this app, updates status. Completion
+records an `available` PV receipt; ambiguous writes retain the PV lock and become
+`needs-review` without rollback or replay. Available exposes existing data to a
+matching claim and is not a wipe. Refresh afterward to reuse the volume or issue
+a separate reviewed Delete operation. A new image containing this action is
+required: `1.0.0` contains the standalone action; `0.4.5` does not.
+
+#### Optional reclaim during PVC deletion
+
 When the deleted PVC is bound to a PV with reclaim policy `Retain`, Kubernetes
 leaves that PV `Released` with a stale `spec.claimRef`, which blocks every new
 binding. **This remains the default.** Optional post-delete reclaim requires

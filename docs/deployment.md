@@ -66,6 +66,7 @@ need for `cluster-admin`, and destructive testing remains disposable-only.
 | Restricted PV/PVC Edit | `features.storageEditing`; request growth additionally needs `pvcExpansion` | `storage-editing` overlay |
 | Unused-only PV/PVC Delete (Retain stays Released by default) | `features.storageDeletion` | `storage-deletion` overlay (PV/PVC `delete` only) |
 | Explicit post-delete Retain PV reclaim | `features.pvReclaim`, storage deletion, per-plan acknowledgement, operator-enforced `storage.isolatedStorageClasses` | Separate `pv-reclaim` PV `patch` overlay; never implied by deletion |
+| Standalone `pv.reclaim` for an old Released Retain PV | Same `pvReclaim` feature and isolated-class controls; reason and typed PV name | Same separate `pv-reclaim` PV `patch` grant; no delete/create permission used |
 | PVC-associated PodDefault create/overwrite | `features.podDefaults`, applicable PVC creation gates | Separate `poddefaults` overlay |
 | Related PodDefault cleanup with PVC Delete | `features.podDefaults` + `features.storageDeletion` | Both `poddefaults` and `storage-deletion` grants; explicit cleanup confirmation |
 | Profile Delete | `features.profileDeletion` | `profile-deletion` overlay |

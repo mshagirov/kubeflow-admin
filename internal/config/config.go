@@ -173,7 +173,7 @@ type Features struct {
 	// PersistentVolume or PersistentVolumeClaim. It is a separate destructive
 	// opt-in and is never implied by WritesEnabled or StorageEditing.
 	StorageDeletion bool `yaml:"storageDeletion"`
-	// PVReclaim separately enables explicitly acknowledged post-delete reclaim.
+	// PVReclaim enables explicit standalone and acknowledged post-delete reclaim.
 	PVReclaim bool `yaml:"pvReclaim"`
 	// PodDefaults is the separate, false-by-default opt-in for the optional
 	// dedicated PodDefault substep of a PVC creation and for removing reviewed

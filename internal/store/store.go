@@ -592,7 +592,7 @@ func PrimaryTarget(a model.Action) string {
 		return "notebook:" + a.Namespace + "/" + a.Name
 	case strings.HasPrefix(a.Kind, "profile."):
 		return "profile:" + a.Name
-	case a.Kind == "pv.create.static" || a.Kind == "pv.edit" || a.Kind == "pv.delete":
+	case a.Kind == "pv.create.static" || a.Kind == "pv.edit" || a.Kind == "pv.delete" || a.Kind == "pv.reclaim":
 		// PersistentVolumes are cluster scoped: the canonical target never
 		// carries a namespace, even when another field does.
 		return "pv:" + a.Name
@@ -725,7 +725,7 @@ func validateStorageTarget(a model.Action) error {
 		return ErrInvalidTarget
 	}
 	switch a.Kind {
-	case "pv.edit", "pv.delete":
+	case "pv.edit", "pv.delete", "pv.reclaim":
 		if a.Namespace != "" {
 			return ErrInvalidTarget
 		}
@@ -979,7 +979,7 @@ func (s *Store) createOperation(ctx context.Context, op model.Operation, plan mo
 		if err := validateStorageEdit(plan.Prepared.Action); err != nil {
 			return model.Operation{}, false, err
 		}
-	case "pv.delete", "pvc.delete":
+	case "pv.delete", "pvc.delete", "pv.reclaim":
 		if err := validateStorageDelete(plan.Prepared.Action); err != nil {
 			return model.Operation{}, false, err
 		}

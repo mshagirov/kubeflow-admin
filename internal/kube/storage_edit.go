@@ -102,6 +102,12 @@ type storageProjectionRequests struct {
 // API identity, UID, resourceVersion, console-owned labels and the one
 // approved editable value. Warnings explain what is hidden and preserved.
 func (s *Service) StorageDocument(ctx context.Context, kind, namespace, objectName string) (model.StorageDocument, error) {
+	if kind == "pv.reclaim" {
+		if namespace != "" {
+			return model.StorageDocument{}, errors.New("PersistentVolume is cluster scoped; namespace must be empty")
+		}
+		return s.pvReclaimDocument(ctx, objectName)
+	}
 	if !s.Config.Features.WritesEnabled || (!s.Config.Features.StorageEditing && !s.Config.Features.StorageDeletion) {
 		return model.StorageDocument{}, errors.New("storage editing and deletion are disabled")
 	}

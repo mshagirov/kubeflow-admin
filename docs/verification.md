@@ -2,6 +2,44 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
+## 1.0.0 — standalone Released-PV reclaim (26 October 2026)
+
+Release-source verification; registry publication receipt is added after the
+exact built artifacts pass their scan and verification gates. No live cluster
+mutation or deployment is performed by these checks.
+
+- Storage details offer a separately gated **Reclaim PV** action for old
+  Released PVs. The typed `pv.reclaim` plan requires a reason, exact PV-name
+  confirmation, current UID/resourceVersion, Retain policy and absent old claim.
+  The drawer also requires a retained-data exposure acknowledgement.
+- Existing writes/`pvReclaim`, isolated-class attestation and PV patch RBAC
+  remain required. No safety gate is bypassed for shared tenant classes.
+  Current/replacement/referencing and pending matching claims (including beta
+  class aliases) block reclaim; protected old claim namespaces are refused.
+- After an authorized checkpoint, the exact PV and dependencies are re-read.
+  Final metadata-only RV drift is refused before the one conditioned claimRef
+  removal. Kubernetes updates status; success requires observing Available and
+  recording its receipt. No status/backend/finalizer edits or resource deletion.
+- Policy refusals return nonretryable validation errors; incomplete/failed
+  reference checks return an explicit nonretryable unavailable response. The
+  standalone warnings do not imply PVC deletion. Uncertain writes retain the
+  PV lock, with no rollback/replay and typed restart guidance.
+- The optional post-delete reclaim reuses the same patch/convergence helper
+  without changing its opt-ins. The new operation shares the `pv:<name>` lock
+  with existing edit/delete/binding operations.
+
+Local verification includes Go 1.27.3 tests/race/vet/build and vulnerability
+checks, Node logic/navigation regressions, 16 Python/API parity tests, OpenAPI
+validation and 13 manifest variants. All 37 real Chrome baseline acceptance
+checks passed after updating the synthetic fixture's feature projection; the
+new reclaim drawer/payload is covered by dedicated navigation and HTTP tests,
+not by a claim of real-cluster or full real-browser reclaim acceptance.
+Claude Opus 5.5/high effort reviewed the diff; its refusal-classification,
+final-RV and standalone-warning findings were fixed with regression tests.
+The final Opus 5.5/high recheck returned **PASS** with no remaining security or
+correctness blocker. Definite single-patch API rejections deliberately remain
+conservative needs-review outcomes, with no automatic retry or lock release.
+
 ## 0.4.5 — explicit Retain reclaim and security isolation (26 October 2026)
 
 **Published and registry-verified:** `0.4.5` and `latest` resolve to the same

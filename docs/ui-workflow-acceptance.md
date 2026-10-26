@@ -84,6 +84,13 @@ behavior on your storage backend.
   operation unresolved; retain locks and investigate. Never remove finalizers
   to make this test pass. Coordinate external writers because separate unused
   checks and Kubernetes writes are not atomic.
+- [ ] **SD5** On a disposable already-Released Retain PV with its old claim gone,
+  choose Reclaim PV, supply reason, exact typed name and exposure acknowledgement.
+  With gates off or class isolation missing it is refused. Verify the exact PV
+  becomes Available with only claimRef removed and an available receipt. Existing
+  or replacement claims, pending matching claims (including beta annotations),
+  stale UID/RV, Delete policy and non-Released phases refuse. A patch timeout or
+  uncertain convergence becomes needs-review with the PV locked and no replay.
 - [ ] **SY6** Close/Escape return focus to the visible exact resource-name
   control. Switching resources or late document responses cannot overwrite
   another target's form. Merely opening Edit/Delete sends no mutation.

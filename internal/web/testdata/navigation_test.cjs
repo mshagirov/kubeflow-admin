@@ -377,13 +377,13 @@ async function bootHarness(options = {}) {
   });
   const sections = ["overview", "profiles", "namespaces", "storage", "notebooks", "pods", "nodes", "history"].map(id => { const section = new Element("section"); section.id = id; return section; });
   const tabs = ["operations", "audit"].map(tab => { const button = new Element("button"); button.dataset.historyTab = tab; return button; });
-  const drawers = ["profile", "storage", "notebook", "profile-summary", "pod-restart", "namespace-summary", "node-cordon", "resource-details", "profile-delete", "storage-edit", "storage-delete"].map(kind => { const drawer = get("#" + kind + "-drawer"); drawer.id = kind + "-drawer"; drawer.hidden = true; return drawer; });
+  const drawers = ["profile", "storage", "notebook", "profile-summary", "pod-restart", "namespace-summary", "node-cordon", "resource-details", "profile-delete", "storage-edit", "storage-delete", "storage-reclaim"].map(kind => { const drawer = get("#" + kind + "-drawer"); drawer.id = kind + "-drawer"; drawer.hidden = true; return drawer; });
   // The body of a summary drawer lives inside its drawer, exactly as in the
   // document. A closed drawer therefore hides its controls with it.
   for (const kind of ["profile-summary", "namespace-summary", "resource-details"]) get("#" + kind + "-drawer").append(get("#" + kind + "-body"));
   const sharedError = new Element("p"); sharedError.className = "form-error"; sharedError.hidden = true;
   const sharedSubmit = new Element("button"); sharedSubmit.type = "submit"; sharedSubmit.textContent = "Prepare plan";
-  const forms = ["profile-form", "storage-form", "notebook-form", "pod-restart-form", "profile-delete-form", "storage-edit-form", "storage-delete-form"].map(id => {
+  const forms = ["profile-form", "storage-form", "notebook-form", "pod-restart-form", "profile-delete-form", "storage-edit-form", "storage-delete-form", "storage-reclaim-form"].map(id => {
     const form = new Element("form"); form.id = id; form.append(sharedError, sharedSubmit); return form;
   });
   for (const form of forms) nodes.set("#" + form.id, form);
@@ -520,6 +520,15 @@ async function bootHarness(options = {}) {
   forms[6].controls = [...Object.values(storageDeleteControls), storageDeleteAck, storageDeletePodDefaultAck];
   get("#storage-edit-drawer").append(forms[5]);
   get("#storage-delete-drawer").append(forms[6]);
+  const reclaimSubmit = new Element("button"); reclaimSubmit.type = "submit";
+  forms[7].children = forms[7].children.filter(node => node !== sharedSubmit);
+  forms[7].append(reclaimSubmit);
+  const reclaimControls = {kind:get("#storage-reclaim-kind"), name:get("#storage-reclaim-name"), targetUID:get("#storage-reclaim-target-uid"), targetResourceVersion:get("#storage-reclaim-target-rv"), reason:get("#storage-reclaim-reason"), confirmName:get("#storage-reclaim-confirm")};
+  for (const [name, node] of Object.entries(reclaimControls)) { node.name=name; if (["kind","name","targetUID","targetResourceVersion"].includes(name)) node.type="hidden"; }
+  forms[7].controls = Object.values(reclaimControls);
+  get("#storage-reclaim-ack").type="checkbox"; get("#storage-reclaim-ack").checked=false;
+  get("#storage-reclaim-drawer").append(forms[7]);
+  get("#storage-reclaim-drawer").dataset.enabled = String(options.pvReclaim === true);
   const openers = ["profile", "storage", "notebook"].map(kind => { const button = new Element("button"); button.dataset.openDrawer = kind; return button; });
   const closers = [new Element("button")];
   const labels = ["pvc.create pvc.expand pv.nfs.create pv.reserve", "pvc.create pv.nfs.create pv.reserve", "pv.reserve", "pv.nfs.create", "pv.nfs.create"].map(value => { const label = new Element("label"); label.dataset.storage = value; return label; });
@@ -664,7 +673,8 @@ async function bootHarness(options = {}) {
     }
     if (url.includes("/storage-document")) {
       const parsed = new URL(url, "https://admin.example.invalid");
-      const kind = parsed.searchParams.get("kind") || "";
+      const requestedKind = parsed.searchParams.get("kind") || "";
+      const kind = requestedKind === "pv.reclaim" ? "PersistentVolume" : requestedKind;
       const namespace = parsed.searchParams.get("namespace") || "";
       const name = parsed.searchParams.get("name") || "";
       if (options.deferStorageDocument) await new Promise(resolve => pendingStorageDocuments.push(resolve));
@@ -1852,6 +1862,29 @@ async function bootHarness(options = {}) {
 
 
   const storageDeleteTest = await bootHarness({});
+  const oldReleasedResource = {kind:"PersistentVolume",name:"old-volume",uid:"old-volume-uid",state:"Released",details:{storageClass:"isolated",reclaimPolicy:"Retain"}};
+  const standaloneReclaimTest = await bootHarness({pvReclaim:true,resources:[oldReleasedResource]});
+  await standaloneReclaimTest.click("storage");
+  standaloneReclaimTest.walk(standaloneReclaimTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolume||old-volume" && node.tagName === "BUTTON")[0].click();
+  const standaloneReclaimButton = standaloneReclaimTest.walk(standaloneReclaimTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Reclaim PV")[0];
+  assert.ok(standaloneReclaimButton && !standaloneReclaimButton.disabled, "Released PV offers a separately gated reclaim action");
+  standaloneReclaimButton.click();
+  await standaloneReclaimTest.settle();
+  assert.equal(standaloneReclaimTest.get("#storage-reclaim-title").textContent,"Reclaim old-volume");
+  assert.equal(standaloneReclaimTest.get("#storage-reclaim-target-uid").value,"old-volume-uid");
+  standaloneReclaimTest.get("#storage-reclaim-reason").value="reviewed retained data";
+  standaloneReclaimTest.get("#storage-reclaim-confirm").value="old-volume";
+  let standaloneBefore=standaloneReclaimTest.bodies.length;
+  await standaloneReclaimTest.submitForm(7);
+  assert.equal(standaloneReclaimTest.bodies.length,standaloneBefore,"exposure acknowledgement is required");
+  standaloneReclaimTest.get("#storage-reclaim-ack").checked=true;
+  await standaloneReclaimTest.submitForm(7);
+  const standaloneBody=standaloneReclaimTest.bodies[standaloneReclaimTest.bodies.length-1];
+  assert.deepEqual(standaloneBody,{kind:"pv.reclaim",name:"old-volume",reason:"reviewed retained data",confirmName:"old-volume",targetUID:"old-volume-uid",targetResourceVersion:"41"},"standalone reclaim carries only typed exact-target fields");
+  const disabledReclaimTest = await bootHarness({pvReclaim:false,resources:[oldReleasedResource]});
+  await disabledReclaimTest.click("storage");
+  disabledReclaimTest.walk(disabledReclaimTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolume||old-volume" && node.tagName === "BUTTON")[0].click();
+  assert.equal(disabledReclaimTest.walk(disabledReclaimTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Reclaim PV")[0].disabled,true,"reclaim cannot be offered with the feature disabled");
   await storageDeleteTest.click("storage");
   storageDeleteTest.walk(storageDeleteTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
   storageDeleteTest.walk(storageDeleteTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete")[0].click();

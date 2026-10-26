@@ -23,6 +23,9 @@ for (const [form, backend] of [["profile.create","profile.create"],["profile.quo
 // can change their meaning, and each action only carries its own fields.
 assert.equal(buildAction([["kind","pv.create.static"]]).kind, "pv.create.static");
 assert.equal(buildAction([["kind","pvc.create.bound"]]).kind, "pvc.create.bound");
+const reclaimPreview = previewFields({prepared:{action:{kind:"pv.reclaim",name:"old-pv"},summary:"reclaim old PV"}});
+assert.ok(reclaimPreview.some(([label,value]) => label === "Reclaim scope" && value.includes("No PVC/PV is created or deleted")), "standalone reclaim scope is explicit");
+assert.ok(reclaimPreview.some(([label,value]) => label === "Needs review" && value.includes("do not retry")), "standalone reclaim preview explains uncertain outcomes");
 assert.deepEqual(
   buildAction([["kind","pv.create.static"],["name","nfs-new"],["storageClass","nfs-csi"],["template","nfs-template"],["nfsPath","/exports/kubeflow/team"],["podDefaultName","mount-x"]], {podDefault:{name:"mount-x",mountPath:"/home/jovyan/x",overwrite:false}}),
   {kind:"pv.create.static",name:"nfs-new",storageClass:"nfs-csi",template:"nfs-template",nfsPath:"/exports/kubeflow/team",podDefault:{name:"mount-x",mountPath:"/home/jovyan/x",overwrite:false}},

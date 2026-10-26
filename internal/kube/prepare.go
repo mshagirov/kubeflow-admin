@@ -53,6 +53,9 @@ type work struct {
 }
 
 func (s *Service) Prepare(ctx context.Context, a model.Action) (model.Prepared, error) {
+	if a.Kind == "pv.reclaim" {
+		return s.preparePVReclaim(ctx, a)
+	}
 	if a.Kind == "profile.delete" {
 		return s.prepareProfileDelete(ctx, a)
 	}
@@ -496,6 +499,9 @@ func (s *Service) Execute(ctx context.Context, p model.Prepared, cp func(string)
 	}
 	if p.Action.Kind == "pv.edit" || p.Action.Kind == "pvc.edit" {
 		return s.executeStorageEdit(ctx, p, cp)
+	}
+	if p.Action.Kind == "pv.reclaim" {
+		return s.executePVReclaim(ctx, p, cp)
 	}
 	if p.Action.Kind == "pv.delete" || p.Action.Kind == "pvc.delete" {
 		return s.executeStorageDelete(ctx, p, cp)

@@ -179,3 +179,20 @@ func TestPVCDeleteReclaimVolumeIsFenced(t *testing.T) {
 		})
 	}
 }
+
+func TestStandaloneReclaimLocksSamePVAsDelete(t *testing.T) {
+	s := database(t)
+	a := model.Action{Kind: "pv.reclaim", Name: "old-pv", TargetUID: "pv-uid", TargetResourceVersion: "7", ConfirmName: "old-pv", Reason: "reviewed old claim and retained data"}
+	if PrimaryTarget(a) != "pv:old-pv" {
+		t.Fatal("reclaim has the wrong lock target")
+	}
+	p := storageDeletePlan("pv-reclaim-plan", a)
+	if _, created, err := s.CreateOperation(context.Background(), storageDeleteOp(p, "pv-reclaim-op"), p, "pv-reclaim-key"); err != nil || !created {
+		t.Fatal(err)
+	}
+	a.Kind = "pv.delete"
+	other := storageDeletePlan("other-pv-plan", a)
+	if _, _, err := s.CreateOperation(context.Background(), storageDeleteOp(other, "other-pv-op"), other, "other-key"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("PV deletion raced reclaim: %v", err)
+	}
+}

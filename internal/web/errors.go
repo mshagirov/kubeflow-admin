@@ -72,6 +72,8 @@ func backendFailure(w http.ResponseWriter, err error, validation bool) {
 		failure(w, 503, "cluster_access_denied", "Kubernetes denied the storage request. Ask the operator to check the application's RBAC and storage admission policy.", false)
 	case "Kubernetes API rejected the storage request":
 		failure(w, 422, "cluster_validation_failed", "Kubernetes rejected the storage request. Check the approved fields, labels, admission policy and installed storage API compatibility, then refresh and prepare again.", false)
+	case "PersistentVolumeClaim reference list could not be verified", "PersistentVolumeClaim reference list is incomplete":
+		failure(w, 503, "reference_check_unavailable", "A complete PVC reference check could not be verified. No plan can be prepared safely; ask the operator to check cluster access and refresh inventory.", false)
 	case "plan belongs to a different actor":
 		failure(w, 403, "plan_actor_mismatch", "This plan belongs to another administrator. Prepare a plan in your own session.", false)
 	case "plan expired; preview again":
@@ -135,6 +137,18 @@ writes are disabled
 PV reclaim requires its separate feature and a bound Retain volume
 PV reclaim requires an operator-confirmed isolated StorageClass
 PV reclaim refuses deprecated beta StorageClass annotations
+PV reclaim is disabled
+PV reclaim requires its exact current UID and resourceVersion
+typed confirmation must exactly match the PV name
+PV reclaim requires a reason of at most 500 characters
+PV reclaim requires a stable nonterminating PersistentVolume
+PV reclaim requires a Released PersistentVolume with Retain policy
+PV reclaim requires a complete stale PersistentVolumeClaim reference
+the previous claim name still exists; PV reclaim is refused
+the deleted PersistentVolumeClaim reappeared; reclaim stopped for review
+a PersistentVolumeClaim references the retained PersistentVolume; reclaim stopped for review
+a replacement PersistentVolumeClaim with the deleted claim's namespace and name exists and could bind the retained PersistentVolume; reclaim stopped for review
+an unbound PersistentVolumeClaim can bind the retained PersistentVolume; reclaim stopped for review
 unreserved PV creation requires an operator-confirmed isolated StorageClass
 complete PVC reference list required before exposing an unreserved PV
 an unbound PVC already uses this isolated StorageClass

@@ -17,6 +17,7 @@
   // conjunction defensively and still shows the disabled action with a reason.
   const storageEditingFeature = meta("storage-editing") === "true" && writes;
   const storageDeletionFeature = meta("storage-deletion") === "true" && writes;
+  const pvReclaimFeature = $("#storage-reclaim-drawer")?.dataset.enabled === "true" && writes;
   const notificationScope = meta("notification-scope");
   const logic = globalThis.DashboardLogic;
   // The PodDefault capability is an independent opt-in and is only offered
@@ -1334,7 +1335,7 @@
       return logic.profileDeleteValidation(name, { reason, confirmName }).message;
     }
     if (form.id === "storage-form") return storageCreateError();
-    if (form.id === "storage-edit-form" || form.id === "storage-delete-form") return storageSubmitError(form);
+    if (["storage-edit-form", "storage-delete-form", "storage-reclaim-form"].includes(form.id)) return storageSubmitError(form);
     return "";
   }
   function openDrawers() { return $$(".drawer").filter(drawer => !drawer.hidden); }
@@ -1383,7 +1384,7 @@
       target = notebookReturnKey ? resourceDetailsOpener(notebookReturnKey) : null;
       if (!target) target = $("#page-title");
     }
-    if (!target && (drawer?.id === "storage-edit-drawer" || drawer?.id === "storage-delete-drawer")) {
+    if (!target && ["storage-edit-drawer", "storage-delete-drawer", "storage-reclaim-drawer"].includes(drawer?.id)) {
       // Storage actions are opened from the observed details. The Edit/Delete
       // control lives inside that now closed drawer, so the focus returns to
       // the visible name control of the exact same storage resource.
@@ -1421,7 +1422,7 @@
       notebookTarget = null;
       notebookTargetWarning("");
     }
-    if (last?.id === "storage-edit-drawer" || last?.id === "storage-delete-drawer") {
+    if (["storage-edit-drawer", "storage-delete-drawer", "storage-reclaim-drawer"].includes(last?.id)) {
       storageOperation = null;
       storageEpoch++;
     }
@@ -1541,6 +1542,14 @@
       edit.addEventListener("click", event => openStorageAction(resource, "edit", event?.currentTarget));
       remove.addEventListener("click", event => openStorageAction(resource, "delete", event?.currentTarget));
       actions.append(edit, remove);
+      if (resource.kind === "PersistentVolume" && resource.state === "Released") {
+        const reclaim = el("button", "Reclaim PV", "secondary"); reclaim.type = "button";
+        const reclaimReason = options.gone ? "This volume is no longer observed." : (!resource.uid ? "Refresh inventory to obtain a stable PV identity." : storageFeatureReason("reclaim"));
+        reclaim.disabled = !!reclaimReason; reclaim.title = reclaimReason || "Review clearing the stale claimRef and returning this Retain PV to Available.";
+        reclaim.addEventListener("click", event => openStorageAction(resource, "reclaim", event?.currentTarget));
+        actions.append(reclaim);
+        if (reclaimReason) body.append(el("p", "Reclaim is unavailable: " + reclaimReason, "hint"));
+      }
       body.append(actions);
       if (editReason) body.append(el("p", "Edit is unavailable: " + editReason, "hint"));
       if (deleteReason) body.append(el("p", "Delete is unavailable: " + deleteReason, "hint"));
@@ -2385,6 +2394,7 @@
     if (!writes) return "Changes are disabled by server policy (features.writesEnabled is false).";
     if (mode === "edit" && !storageEditingFeature) return "Storage YAML editing is disabled by server policy (features.storageEditing is false).";
     if (mode === "delete" && !storageDeletionFeature) return "Storage deletion is disabled by server policy (features.storageDeletion is false).";
+    if (mode === "reclaim" && !pvReclaimFeature) return "PV reclaim is disabled by server policy (features.pvReclaim is false).";
     return "";
   }
   function storageLabel(operation) {
@@ -2392,7 +2402,7 @@
   }
   function storageDrawer(mode) { return $(`#storage-${mode}-drawer`); }
   function storageDocumentQuery(operation) {
-    return "storage-document?kind=" + encodeURIComponent(operation.kind) +
+    return "storage-document?kind=" + encodeURIComponent(operation.mode === "reclaim" ? "pv.reclaim" : operation.kind) +
       "&name=" + encodeURIComponent(operation.name) +
       (operation.namespace ? "&namespace=" + encodeURIComponent(operation.namespace) : "");
   }
@@ -2428,7 +2438,7 @@
     return text;
   }
   function syncStorageSubmitButtons() {
-    for (const [mode, feature] of [["edit", storageEditingFeature], ["delete", storageDeletionFeature]]) {
+    for (const [mode, feature] of [["edit", storageEditingFeature], ["delete", storageDeletionFeature], ["reclaim", pvReclaimFeature]]) {
       const form = $(`#storage-${mode}-form`);
       const button = form ? $('button[type="submit"]', form) : null;
       if (!button) continue;
@@ -2548,7 +2558,7 @@
       const textarea = $("#storage-edit-yaml"); if (textarea) { textarea.value = ""; textarea.disabled = true; }
       const warnings = $("#storage-edit-warnings"); if (warnings) { warnings.textContent = ""; warnings.hidden = true; }
       const policy = $("#storage-edit-policy"); if (policy) policy.textContent = storagePolicyHint(found, mode);
-    } else {
+    } else if (mode === "delete") {
       const title = $("#storage-delete-title"); if (title) title.textContent = `Delete ${found.name}`;
       if (!$("#storage-delete-reclaim-option")) {
         const option = $("#storage-reclaim-option")?.content?.cloneNode(true);
@@ -2583,6 +2593,10 @@
       if (podDefaultAck) podDefaultAck.disabled = !claim || !writes;
       if (podDefaultAck) podDefaultAck.checked = false;
       const warning = $("#storage-delete-warning"); if (warning) { warning.textContent = storageDeleteWarning(found); warning.hidden = false; }
+    } else if (mode === "reclaim") {
+      const title = $("#storage-reclaim-title"); if (title) title.textContent = `Reclaim ${found.name}`;
+      const confirm = $("#storage-reclaim-confirm"); if (confirm) confirm.value = "";
+      const ack = $("#storage-reclaim-ack"); if (ack) ack.checked = false;
     }
     // Opening a new drawer is a new operation context. openDrawer may close a
     // previous storage drawer and clear its operation; the new binding is
@@ -2598,7 +2612,7 @@
     return true;
   }
   function storageSubmitError(form) {
-    const mode = form?.id === "storage-delete-form" ? "delete" : "edit";
+    const mode = form?.id === "storage-reclaim-form" ? "reclaim" : form?.id === "storage-delete-form" ? "delete" : "edit";
     const operation = storageOperation;
     if (!operation || operation.mode !== mode) return "Open a storage resource before preparing a change.";
     if (!operation.doc) return "Wait for the current restricted resource document to load before preparing a change.";
@@ -2627,6 +2641,13 @@
       if (!String($("#storage-edit-reason")?.value || "").trim()) return "This console requires a reason for its audit trail before preparing a storage edit.";
       return "";
     }
+    if (mode === "reclaim") {
+      if (!pvReclaimFeature) return storageFeatureReason("reclaim");
+      if (!String($("#storage-reclaim-reason")?.value || "").trim()) return "A reason is required to reclaim a PersistentVolume.";
+      if (String($("#storage-reclaim-confirm")?.value || "") !== operation.name) return `Type "${operation.name}" exactly to confirm the reclaim.`;
+      if (!$("#storage-reclaim-ack")?.checked) return "Acknowledge that retained data becomes bindable before preparing the reclaim plan.";
+      return "";
+    }
     if (!storageDeletionFeature) return storageFeatureReason("delete");
     const reason = String($("#storage-delete-reason")?.value || "").trim();
     const confirm = String($("#storage-delete-confirm")?.value || "");
@@ -2649,7 +2670,7 @@
   // reopen an old plan.
   function storagePlanContext(form) {
     const operation = storageOperation;
-    if (!operation || !form || (form.id !== "storage-edit-form" && form.id !== "storage-delete-form")) return null;
+    if (!operation || !form || !["storage-edit-form", "storage-delete-form", "storage-reclaim-form"].includes(form.id)) return null;
     return {
       mode: operation.mode, epoch: operation.epoch, kind: operation.kind,
       namespace: operation.namespace, name: operation.name, uid: operation.uid,
@@ -3105,6 +3126,7 @@
       if (form?.id === "node-cordon-form" && !nodeCordonFeature) disabled = true;
       if (form?.id === "storage-edit-form" && !storageEditingFeature) disabled = true;
       if (form?.id === "storage-delete-form" && !storageDeletionFeature) disabled = true;
+      if (form?.id === "storage-reclaim-form" && !pvReclaimFeature) disabled = true;
       button.disabled = disabled;
     });
     syncStorageSubmitButtons();

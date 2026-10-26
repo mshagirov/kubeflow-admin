@@ -31,6 +31,15 @@ failure reported as needs-review, never rolled back. No force/finalizer cleanup
 or replay is permitted. Separate observations do not atomically fence
 external workloads/binders; admission and operator coordination remain necessary.
 
+`pv.reclaim` explicitly reclaims an already-Released Retain PV without deleting
+any resource. It uses the same default-off `pvReclaim`/class-isolation controls
+and separate patch grant. A reason, exact typed PV name and reviewed UID/RV are
+required; the old claim must already be absent. Replacement, referencing and
+unbound matching claims block reclaim. The final PV resourceVersion must still
+match the reviewed one. Only stale claimRef is removed, never status or backend
+fields; Available must be observed and receipted. Any uncertain patch outcome
+retains the PV lock with typed needs-review/recovery guidance and no replay.
+
 `pvc.delete` acceptance also takes an exclusive `namespace:<name>` fence against
 other app mutations, retained on needs-review alongside the PVC target lock.
 Bound-PV and namespace/Profile dependencies contribute digested evidence; raw

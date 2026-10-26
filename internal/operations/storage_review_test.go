@@ -11,7 +11,7 @@ import (
 )
 
 func TestStorageDeleteReviewGuidanceIsTypedAndNonReplaying(t *testing.T) {
-	for kind, want := range map[string]string{"pv.delete": storageDeleteReviewGuidance, "pvc.delete": pvcDeleteReviewGuidance} {
+	for kind, want := range map[string]string{"pv.delete": storageDeleteReviewGuidance, "pvc.delete": pvcDeleteReviewGuidance, "pv.reclaim": pvReclaimReviewGuidance} {
 		got := reviewGuidance(kind)
 		if got != want {
 			t.Fatalf("%s did not get typed storage guidance: %s", kind, got)
@@ -32,7 +32,7 @@ func TestStorageDeleteReviewGuidanceIsTypedAndNonReplaying(t *testing.T) {
 }
 
 func TestStorageDeleteRecoveryNeverResumes(t *testing.T) {
-	for _, kind := range []string{"pv.delete", "pvc.delete"} {
+	for _, kind := range []string{"pv.delete", "pvc.delete", "pv.reclaim"} {
 		got := recoveryGuidance(kind)
 		if !strings.Contains(got, "no action was replayed") || !strings.Contains(got, "nothing will be resumed automatically") {
 			t.Fatalf("%s recovery guidance is unsafe: %s", kind, got)

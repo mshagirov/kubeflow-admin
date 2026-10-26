@@ -497,6 +497,7 @@ func projection(writes, deletion, notebookContract, storageEditing, storageDelet
 				"StorageEditing":  storageEditing && writes,
 				"StorageDeletion": storageDeletion && writes,
 				"PodDefaults":     podDefaults && writes,
+				"PVReclaim":       false, // standalone reclaim has dedicated logic/HTTP tests
 			},
 			"Notebooks": map[string]any{
 				"ControllerContractConfirmed": notebookContract,
@@ -504,6 +505,7 @@ func projection(writes, deletion, notebookContract, storageEditing, storageDelet
 				"AllowedImages":               []string{"kubeflownotebookswg/jupyter:1.9.0"},
 			},
 			"Storage": map[string]any{
+				"LegacyTemplates":       true,
 				"AllowedStorageClasses": []string{"standard", "nfs-csi", "beegfs-csi"},
 				"NFSTemplates":          []map[string]string{{"Name": "nfs-shared", "StorageClass": "nfs-csi"}},
 				"CSITemplates":          []map[string]string{{"Name": "csi-shared", "StorageClass": "nfs-csi"}},
