@@ -72,6 +72,7 @@ type pageFeatures struct {
 	// opt-in and writes must be true before the browser offers the action.
 	StorageEditing  bool
 	StorageDeletion bool
+	PVReclaim       bool
 	// PodDefaults is the separate opt-in for the optional PodDefault that can
 	// accompany a PVC-from-existing-PV creation and for reviewed PodDefault
 	// cleanup during PVC deletion. It is never implied by WritesEnabled,
@@ -91,6 +92,10 @@ type pageStorage struct {
 	AllowedStorageClasses []string
 	NFSTemplates          []pageTemplate
 	CSITemplates          []pageTemplate
+	// LegacyTemplates reports whether at least one approved legacy NFS or CSI
+	// template is configured. The legacy template action is only offered while
+	// the "Approved storage template" selector has at least one option.
+	LegacyTemplates bool
 	// RegistrationTemplates reports whether at least one approved typed
 	// registration template is configured. The template values themselves are
 	// never bootstrapped here: the browser reads the single approved
@@ -132,6 +137,7 @@ func buildPageView(identity model.Identity, cfg config.Config) pageView {
 				ProfileDeletion: cfg.Features.ProfileDeletion && cfg.Features.WritesEnabled,
 				StorageEditing:  cfg.Features.StorageEditing && cfg.Features.WritesEnabled,
 				StorageDeletion: cfg.Features.StorageDeletion && cfg.Features.WritesEnabled,
+				PVReclaim:       cfg.Features.PVReclaim && cfg.Features.StorageDeletion && cfg.Features.WritesEnabled,
 				// PodDefault support is an independent opt-in. The browser
 				// only offers the optional block when writes are enabled too.
 				PodDefaults: cfg.Features.PodDefaults && cfg.Features.WritesEnabled,
@@ -157,6 +163,7 @@ func buildPageView(identity model.Identity, cfg config.Config) pageView {
 	for _, t := range cfg.Storage.CSITemplates {
 		v.Config.Storage.CSITemplates = append(v.Config.Storage.CSITemplates, pageTemplate{Name: t.Name, StorageClass: t.StorageClass})
 	}
+	v.Config.Storage.LegacyTemplates = len(v.Config.Storage.NFSTemplates) > 0 || len(v.Config.Storage.CSITemplates) > 0
 	v.Config.Storage.RegistrationTemplates = cfg.Features.WritesEnabled && cfg.Features.StaticStorage && len(cfg.Storage.RegistrationTemplates) > 0
 	return v
 }

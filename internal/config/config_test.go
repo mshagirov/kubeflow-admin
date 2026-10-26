@@ -42,6 +42,25 @@ func TestDefaultsAndStrictSchema(t *testing.T) {
 		t.Fatal("multiple documents accepted")
 	}
 }
+
+func TestReclaimAndIsolationConfigurationFailsClosed(t *testing.T) {
+	cfg, err := load(t, valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Features.PVReclaim || len(cfg.Storage.IsolatedStorageClasses) != 0 {
+		t.Fatal("storage exposure gates must default off")
+	}
+	for _, body := range []string{
+		"features:\n  pvReclaim: true\n",
+		"features:\n  writesEnabled: true\n  pvReclaim: true\n",
+		"storage:\n  allowedStorageClasses: [approved]\n  isolatedStorageClasses: [unapproved]\n",
+	} {
+		if _, err := load(t, valid+body); err == nil {
+			t.Fatalf("unsafe configuration accepted: %s", body)
+		}
+	}
+}
 func TestSecurityValidation(t *testing.T) {
 	c, e := load(t, valid)
 	if e != nil {

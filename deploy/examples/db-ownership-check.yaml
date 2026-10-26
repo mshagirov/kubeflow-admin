@@ -40,6 +40,7 @@ metadata:
   name: kubeflow-admin-db-check-holder
   namespace: kubeflow-admin
 spec:
+  automountServiceAccountToken: false
   restartPolicy: Never
   nodeSelector:
     kubernetes.io/hostname: REPLACE_WITH_NODE_A
@@ -56,6 +57,13 @@ spec:
       image: muratshagirov/kubeflow-admin@sha256:REPLACE_WITH_PINNED_INDEX_DIGEST
       imagePullPolicy: IfNotPresent
       args: ['-config', '/etc/kubeflow-admin/config.yaml', '-check-db', '-hold', '20m']
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: '1'
+          memory: 512Mi
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
@@ -86,6 +94,7 @@ metadata:
   name: kubeflow-admin-db-check-attempt
   namespace: kubeflow-admin
 spec:
+  automountServiceAccountToken: false
   restartPolicy: Never
   nodeSelector:
     kubernetes.io/hostname: REPLACE_WITH_NODE_B
@@ -102,6 +111,13 @@ spec:
       image: muratshagirov/kubeflow-admin@sha256:REPLACE_WITH_PINNED_INDEX_DIGEST
       imagePullPolicy: IfNotPresent
       args: ['-config', '/etc/kubeflow-admin/config.yaml', '-check-db']
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: '1'
+          memory: 512Mi
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true

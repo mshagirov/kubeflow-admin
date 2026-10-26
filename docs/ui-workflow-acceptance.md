@@ -68,6 +68,17 @@ behavior on your storage backend.
   original UID and operation ID; success requires actual disappearance. Verify
   backing data independently according to the reviewed reclaim policy. Retain
   is not a wipe; Delete may destroy data even when no workload currently uses it.
+- [ ] **SD3a** By default delete an unused Retain-bound PVC: the PV stays Released
+  and no patch is sent. Separately enable `pvReclaim`, the `pv-reclaim` grant and
+  verified admission isolation for `storage.isolatedStorageClasses`; explicitly
+  acknowledge reclaim in the drawer. The preview names the
+  post-delete reclaim, warns that Retain leaves backend data intact and Available
+  makes the PV bindable (not a wipe). After success the PV is `Available` with no
+  `claimRef` and is immediately reusable or deletable from the UI; the PVC stays
+  deleted. A **Delete**-policy PV is never patched. Without PV `patch` RBAC, the
+  plan is refused before the PVC is deleted. If the PV is replaced, its claimRef
+  changed, any PVC names it, or the patch fails after the PVC delete, the result
+  is `needs-review` with the PVC deletion receipt kept, no recreate and no retry.
 - [ ] **SD4** A stale/replaced target, post-checkpoint drift or uncertain API
   response must not cause replay or forced cleanup. Finalizers may keep the
   operation unresolved; retain locks and investigate. Never remove finalizers
@@ -148,7 +159,7 @@ no overlay is stacked on top of another by accident.
 - [ ] **G9** Turning any gate off stops new actions; it does **not** revoke RBAC and does not undo completed mutations. Revoke optional bindings separately through the platform operator's reviewed procedure.
 - [ ] **G10** The **Profile-deletion grant** includes only `kubeflow.org/profiles` `delete`: no namespace, PV, PVC or Pod delete, and no finalizer update or patch. Narrow it with `resourceNames` on the ClusterRole for the disposable pilot Profile. This restricts the name, not fields or the namespace cascade; admission policy and namespace protection remain necessary. Storage permissions, if separately enabled, are independent grants.
 - [ ] **G11** Restricted storage editing requires writes, `features.storageEditing` and the separately reviewed `deploy/overlays/storage-editing/rbac.yaml` patch grant. PVC request growth additionally requires `features.pvcExpansion` and compatible storage; label-only edits do not require expansion.
-- [ ] **G12** Unused-only storage deletion requires writes, `features.storageDeletion` and the independently reviewed `deploy/overlays/storage-deletion/rbac.yaml` delete grant. These are not enabled by Profile-deletion RBAC, static-storage RBAC or a broad feature bundle.
+- [ ] **G12** Unused-only storage deletion requires writes, `features.storageDeletion` and the independently reviewed `deploy/overlays/storage-deletion/rbac.yaml` delete grant. Optional reclaim additionally requires `pvReclaim`, per-plan acknowledgement, verified class isolation and the separate `pv-reclaim` PV patch grant. These are not enabled by Profile deletion or a broad feature bundle.
 - [ ] **G13** Optional PodDefault creation/overwrite and related-PVC cleanup require writes, `features.podDefaults` and the separate `deploy/overlays/poddefaults/rbac.yaml` grant. Prefer a namespace-scoped equivalent for a pilot. Base get/list access detects references even when mutation is disabled. Verify the installed namespaced API and webhook contract independently; discovery denial is not API absence.
 
 ### 1.5 Notebook controller contract (independent verification)

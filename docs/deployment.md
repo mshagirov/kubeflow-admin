@@ -64,7 +64,8 @@ need for `cluster-admin`, and destructive testing remains disposable-only.
 | Separate `pv.create.static` / `pvc.create.bound` | `features.staticStorage`, approved registration template | `static-storage` PV grant; binding also needs PVC create from `writes` |
 | PVC expansion | `features.pvcExpansion`, compatible bound CSI storage | `pvc-expansion` overlay for the standalone expansion action |
 | Restricted PV/PVC Edit | `features.storageEditing`; request growth additionally needs `pvcExpansion` | `storage-editing` overlay |
-| Unused-only PV/PVC Delete | `features.storageDeletion` | `storage-deletion` overlay |
+| Unused-only PV/PVC Delete (Retain stays Released by default) | `features.storageDeletion` | `storage-deletion` overlay (PV/PVC `delete` only) |
+| Explicit post-delete Retain PV reclaim | `features.pvReclaim`, storage deletion, per-plan acknowledgement, operator-enforced `storage.isolatedStorageClasses` | Separate `pv-reclaim` PV `patch` overlay; never implied by deletion |
 | PVC-associated PodDefault create/overwrite | `features.podDefaults`, applicable PVC creation gates | Separate `poddefaults` overlay |
 | Related PodDefault cleanup with PVC Delete | `features.podDefaults` + `features.storageDeletion` | Both `poddefaults` and `storage-deletion` grants; explicit cleanup confirmation |
 | Profile Delete | `features.profileDeletion` | `profile-deletion` overlay |

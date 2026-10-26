@@ -36,6 +36,24 @@ func registrationUIConfig() config.Config {
 	}
 }
 
+func TestPVReclaimAcknowledgementIsSeparatelyGated(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, writes := range []bool{false, true} {
+			for _, deletion := range []bool{false, true} {
+				s, _, _ := fixture()
+				s.cfg.Features.PVReclaim = enabled
+				s.cfg.Features.WritesEnabled = writes
+				s.cfg.Features.StorageDeletion = deletion
+				body := request(handler(s), "GET", "/storage", "").Body.String()
+				got := strings.Contains(body, `id="storage-delete-reclaim-ack"`)
+				if got != (enabled && writes && deletion) {
+					t.Fatalf("reclaim projection enabled=%v writes=%v deletion=%v: %v", enabled, writes, deletion, got)
+				}
+			}
+		}
+	}
+}
+
 func TestStorageRegistrationInventoryProjection(t *testing.T) {
 	s, k, _ := fixture()
 	s.cfg = registrationUIConfig()
@@ -138,5 +156,55 @@ func TestStorageRegistrationPageGatedOff(t *testing.T) {
 	}
 	if !strings.Contains(body, `name="pod-defaults" content="false"`) {
 		t.Fatal("disabled PodDefault capability is not projected as false")
+	}
+}
+
+func TestStorageKindActionsRequireConfiguredTemplates(t *testing.T) {
+	const (
+		legacyAction   = `value="pv.nfs.create"`
+		reserveAction  = `value="pv.reserve"`
+		staticPVAction = `value="pv.create.static"`
+		boundPVCAction = `value="pvc.create.bound"`
+	)
+	nfs := []config.NFSTemplate{{Name: "legacy-nfs", StorageClass: "nfs-csi", AccessModes: []string{"ReadWriteMany"}}}
+	csi := []config.CSITemplate{{Name: "legacy-csi", StorageClass: "nfs-csi", AccessModes: []string{"ReadWriteMany"}}}
+	registration := []config.RegistrationTemplate{{Name: "registration-nfs", Kind: config.RegistrationKindNFS, StorageClass: "nfs-csi"}}
+	for _, tc := range []struct {
+		name             string
+		nfs              []config.NFSTemplate
+		csi              []config.CSITemplate
+		registration     []config.RegistrationTemplate
+		wantLegacy       bool
+		wantRegistration bool
+	}{
+		{"no templates", nil, nil, nil, false, false},
+		{"approved NFS template", nfs, nil, nil, true, false},
+		{"approved CSI template", nil, csi, nil, true, false},
+		{"registration template only", nil, nil, registration, false, true},
+		{"legacy and registration templates", nfs, nil, registration, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _ := fixture()
+			s.cfg = config.Config{
+				Features: config.Features{WritesEnabled: true, StaticStorage: true},
+				Storage: config.Storage{
+					NFSTemplates:          tc.nfs,
+					CSITemplates:          tc.csi,
+					RegistrationTemplates: tc.registration,
+				},
+			}
+			body := request(handler(s), "GET", "/storage", "").Body.String()
+			if !strings.Contains(body, reserveAction) {
+				t.Fatal("the template-independent reserve action is missing")
+			}
+			if got := strings.Contains(body, legacyAction); got != tc.wantLegacy {
+				t.Fatalf("legacy template action offered=%v, want %v", got, tc.wantLegacy)
+			}
+			for _, action := range []string{staticPVAction, boundPVCAction} {
+				if got := strings.Contains(body, action); got != tc.wantRegistration {
+					t.Fatalf("registration action %s offered=%v, want %v", action, got, tc.wantRegistration)
+				}
+			}
+		})
 	}
 }

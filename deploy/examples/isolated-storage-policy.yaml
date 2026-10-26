@@ -1,0 +1,40 @@
+# SITE TEMPLATE, NOT installed automatically. Replace the class names with
+# dedicated registration-only classes, and the identity with the app's actual
+# service account. Test tenant denial BEFORE listing these classes under
+# storage.isolatedStorageClasses. Existing tenant claims must be migrated first.
+# The app cannot discover/prove cluster-wide admission and RBAC isolation.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kubeflow-admin-isolated-storage
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ['']
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [persistentvolumeclaims]
+  variables:
+    - name: isolatedClasses
+      expression: "['REPLACE_WITH_DEDICATED_NFS_CLASS', 'REPLACE_WITH_DEDICATED_BEEGFS_CLASS']"
+  validations:
+    - expression: >-
+        !has(object.metadata.annotations) ||
+        !('volume.beta.kubernetes.io/storage-class' in object.metadata.annotations)
+      message: The deprecated beta storage-class annotation is forbidden; use spec.storageClassName.
+    - expression: >-
+        !has(object.spec.storageClassName) ||
+        !(object.spec.storageClassName in variables.isolatedClasses) ||
+        request.userInfo.username == 'system:serviceaccount:kubeflow-admin:kubeflow-admin' ||
+        (request.operation == 'UPDATE' && has(oldObject.spec.storageClassName) &&
+         oldObject.spec.storageClassName == object.spec.storageClassName)
+      message: Dedicated registration StorageClasses may only be selected by the storage console.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kubeflow-admin-isolated-storage
+spec:
+  policyName: kubeflow-admin-isolated-storage
+  validationActions: [Deny]

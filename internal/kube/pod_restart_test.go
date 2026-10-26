@@ -530,6 +530,9 @@ func TestPodRestartReplayDoesNotEvictTwice(t *testing.T) {
 }
 
 func TestPodRestartConvergenceRequiresDistinctReadyReplacement(t *testing.T) {
+	// Leave enough time for race-instrumented preflight reads to reach the
+	// eviction. These cases exercise post-eviction convergence, not preflight
+	// cancellation on a busy test host.
 	for _, tc := range []struct {
 		name         string
 		replacement  func(pod *corev1.Pod, st *appsv1.StatefulSet) *corev1.Pod
@@ -537,25 +540,25 @@ func TestPodRestartConvergenceRequiresDistinctReadyReplacement(t *testing.T) {
 		wantSentinel bool
 		wantConflict bool
 	}{
-		{"original never disappears", func(pod *corev1.Pod, _ *appsv1.StatefulSet) *corev1.Pod { return nil }, 40 * time.Millisecond, false, false},
+		{"original never disappears", func(pod *corev1.Pod, _ *appsv1.StatefulSet) *corev1.Pod { return nil }, time.Second, false, false},
 		{"wrong owner", func(pod *corev1.Pod, _ *appsv1.StatefulSet) *corev1.Pod {
 			next := pod.DeepCopy()
 			next.UID = "pod-2"
 			next.OwnerReferences = owner("foreign-sts", "StatefulSet", "research")
 			return next
-		}, 40 * time.Millisecond, false, true},
+		}, time.Second, false, true},
 		{"wrong revision", func(pod *corev1.Pod, _ *appsv1.StatefulSet) *corev1.Pod {
 			next := pod.DeepCopy()
 			next.UID = "pod-2"
 			next.Labels[appsv1.StatefulSetRevisionLabel] = "old-revision"
 			return next
-		}, 40 * time.Millisecond, false, false},
+		}, time.Second, false, false},
 		{"container not ready", func(pod *corev1.Pod, _ *appsv1.StatefulSet) *corev1.Pod {
 			next := pod.DeepCopy()
 			next.UID = "pod-2"
 			next.Status.ContainerStatuses[0].Ready = false
 			return next
-		}, 40 * time.Millisecond, false, false},
+		}, time.Second, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRestartFixture(t)

@@ -56,9 +56,10 @@ const (
 	storageKindPV  = "PersistentVolume"
 	storageKindPVC = "PersistentVolumeClaim"
 
-	storageEditStep   = "apply-storage-edit"
-	storageDeleteStep = "delete-storage"
-	storageAbsent     = "(absent)"
+	storageEditStep    = "apply-storage-edit"
+	storageDeleteStep  = "delete-storage"
+	storageReclaimStep = "reclaim-volume"
+	storageAbsent      = "(absent)"
 )
 
 var errStorageDocumentInvalid = errors.New("storage YAML is invalid; use the server-provided projection and approved fields only")
@@ -538,7 +539,7 @@ func storageDeleteActionConstraints(a model.Action) error {
 	if a.Kind == "pvc.delete" {
 		// Cleanup acknowledgement exists only on the PVC deletion workflow.
 		// A PV deletion carrying it is refused by the reflective allowlist.
-		allowed = append(allowed, "ConfirmPodDefaultCleanup")
+		allowed = append(allowed, "ConfirmPodDefaultCleanup", "ConfirmPVReclaim")
 	}
 	if err := storageActionFields(a, allowed...); err != nil {
 		return err
@@ -1036,7 +1037,11 @@ type storageDeletePlan struct {
 	uid         types.UID
 	rv          string
 	podDefaults []podDefaultCleanupTarget
-	ev          evidence
+	// reclaim is non-nil only for a PVC whose bound PersistentVolume uses the
+	// Retain reclaim policy. It names the exact reviewed volume whose stale
+	// claimRef is removed after the claim is confirmed deleted.
+	reclaim *storageReclaimTarget
+	ev      evidence
 }
 
 func (s *Service) prepareStorageDelete(ctx context.Context, a model.Action) (model.Prepared, error) {
@@ -1063,6 +1068,7 @@ func (s *Service) buildStorageDelete(ctx context.Context, a model.Action) (*stor
 	var rv, className, classDigest, reclaim, namespace, targetName string
 	podDefaults := []podDefaultCleanupTarget{}
 	podDefaultAPI := ""
+	var reclaimTarget *storageReclaimTarget
 	switch kind {
 	case storageKindPV:
 		pv, class, err := s.storagePVTarget(ctx, a.Name, &ev)
@@ -1082,7 +1088,7 @@ func (s *Service) buildStorageDelete(ctx context.Context, a model.Action) (*stor
 		if err := s.scope(ctx, a.Namespace, &ev); err != nil {
 			return nil, err
 		}
-		pvc, class, classDigestValue, reclaimValue, err := s.storagePVCDeleteTarget(ctx, a.Namespace, a.Name, &ev)
+		pvc, class, classDigestValue, reclaimValue, boundPV, err := s.storagePVCDeleteTarget(ctx, a.Namespace, a.Name, &ev)
 		if err != nil {
 			return nil, err
 		}
@@ -1091,6 +1097,21 @@ func (s *Service) buildStorageDelete(ctx context.Context, a model.Action) (*stor
 		}
 		uid, rv, targetName, namespace = pvc.UID, pvc.ResourceVersion, pvc.Name, pvc.Namespace
 		className, classDigest, reclaim = class, classDigestValue, reclaimValue
+		// A Retain volume is left Released with a stale claimRef once this claim
+		// is gone. The reviewed volume identity is carried into the plan so the
+		// post-delete reclaim can only ever act on this exact PersistentVolume.
+		if a.ConfirmPVReclaim && (!s.Config.Features.PVReclaim || reclaimValue != string(corev1.PersistentVolumeReclaimRetain) || boundPV == nil) {
+			return nil, errors.New("PV reclaim requires its separate feature and a bound Retain volume")
+		}
+		if a.ConfirmPVReclaim && boundPV != nil {
+			if _, legacy := boundPV.Annotations[corev1.BetaStorageClassAnnotation]; legacy {
+				return nil, errors.New("PV reclaim refuses deprecated beta StorageClass annotations")
+			}
+			if !has(s.Config.Storage.IsolatedStorageClasses, class) {
+				return nil, errors.New("PV reclaim requires an operator-confirmed isolated StorageClass")
+			}
+			reclaimTarget = newStorageReclaimTarget(boundPV, pvc)
+		}
 		// PodDefault dependencies are inspected after the Pod/Notebook unused
 		// checks above. Genuine CRD absence is explicit; every discovery, list,
 		// read or permission failure is a refusal. The helper also enforces the
@@ -1109,6 +1130,9 @@ func (s *Service) buildStorageDelete(ctx context.Context, a model.Action) (*stor
 		PodDefaultAPI: podDefaultAPI, PodDefaults: podDefaults,
 		Scope: digest(string(ev.bytes())),
 	}
+	if reclaimTarget != nil {
+		evd.ReclaimVolume, evd.ReclaimVolumeUID = reclaimTarget.name, string(reclaimTarget.uid)
+	}
 	data, err := json.Marshal(evd)
 	if err != nil {
 		return nil, errors.New("storage delete evidence could not be encoded")
@@ -1122,62 +1146,80 @@ func (s *Service) buildStorageDelete(ctx context.Context, a model.Action) (*stor
 		p.Warnings = append(storagePVWarnings(reclaim, "delete"), "Finalizers are never removed. If the delete remains pending for ten minutes the operation stops for review; it is never retried or forced.")
 	} else {
 		p.Warnings = storagePVCDeleteWarnings(reclaim)
+		if reclaim == string(corev1.PersistentVolumeReclaimRetain) && reclaimTarget == nil {
+			p.Warnings = append(p.Warnings, "The Retain volume stays Released with its claimRef after deletion. Returning it to Available requires a separate enabled and explicitly acknowledged reclaim with operator-confirmed class isolation.")
+		}
+		if reclaimTarget != nil {
+			p.Changes = append(p.Changes, storageReclaimChanges(reclaimTarget)...)
+			p.Warnings = append(p.Warnings, storageReclaimWarnings(reclaimTarget)...)
+		}
 		p.Changes = append(p.Changes, podDefaultCleanupChanges(podDefaults)...)
 		p.Warnings = append(p.Warnings, podDefaultCleanupWarnings(podDefaults, targetName, a.ConfirmPodDefaultCleanup)...)
 	}
 	if err := s.storageDeleteDryRun(ctx, kind, namespace, targetName, uid, rv); err != nil {
 		return nil, err
 	}
-	return &storageDeletePlan{prepared: p, kind: kind, namespace: namespace, name: targetName, uid: uid, rv: rv, podDefaults: podDefaults, ev: ev}, nil
+	if reclaimTarget != nil {
+		// Prove the exact conditional claimRef removal is permitted before the
+		// claim is deleted, so missing patch RBAC is caught while nothing has
+		// been changed. The dry run validates the patch against the still-bound
+		// volume; the real patch is built from the volume re-read after deletion.
+		if err := s.storageEditDryRun(ctx, storageKindPV, "", reclaimTarget.name, reclaimTarget.uid, reclaimTarget.resourceVersion, storageReclaimOps(reclaimTarget)); err != nil {
+			return nil, err
+		}
+	}
+	return &storageDeletePlan{prepared: p, kind: kind, namespace: namespace, name: targetName, uid: uid, rv: rv, podDefaults: podDefaults, reclaim: reclaimTarget, ev: ev}, nil
 }
 
 type storageDeleteEvidence struct {
-	Version         int                       `json:"version"`
-	Policy          string                    `json:"policy"`
-	Kind            string                    `json:"kind"`
-	Namespace       string                    `json:"namespace,omitempty"`
-	Name            string                    `json:"name"`
-	UID             string                    `json:"uid"`
-	ResourceVersion string                    `json:"resourceVersion"`
-	StorageClass    string                    `json:"storageClass,omitempty"`
-	ClassDigest     string                    `json:"classDigest,omitempty"`
-	ReclaimPolicy   string                    `json:"reclaimPolicy,omitempty"`
-	PodDefaultAPI   string                    `json:"podDefaultAPI,omitempty"`
-	PodDefaults     []podDefaultCleanupTarget `json:"podDefaults"`
-	Scope           string                    `json:"scope,omitempty"`
+	Version          int                       `json:"version"`
+	Policy           string                    `json:"policy"`
+	Kind             string                    `json:"kind"`
+	Namespace        string                    `json:"namespace,omitempty"`
+	Name             string                    `json:"name"`
+	UID              string                    `json:"uid"`
+	ResourceVersion  string                    `json:"resourceVersion"`
+	StorageClass     string                    `json:"storageClass,omitempty"`
+	ClassDigest      string                    `json:"classDigest,omitempty"`
+	ReclaimPolicy    string                    `json:"reclaimPolicy,omitempty"`
+	ReclaimVolume    string                    `json:"reclaimVolume,omitempty"`
+	ReclaimVolumeUID string                    `json:"reclaimVolumeUID,omitempty"`
+	PodDefaultAPI    string                    `json:"podDefaultAPI,omitempty"`
+	PodDefaults      []podDefaultCleanupTarget `json:"podDefaults"`
+	Scope            string                    `json:"scope,omitempty"`
 }
 
 // storagePVCDeleteTarget proves the unused-only PVC precondition. It allows a
 // Pending claim with no volume, or a Bound claim whose PV names this exact
 // claim; in both cases no observed Pod or Notebook may reference it, the PVC
 // may not be controller-owned and any StorageClass must be approved.
-func (s *Service) storagePVCDeleteTarget(ctx context.Context, namespace, claimName string, ev *evidence) (*corev1.PersistentVolumeClaim, string, string, string, error) {
+func (s *Service) storagePVCDeleteTarget(ctx context.Context, namespace, claimName string, ev *evidence) (*corev1.PersistentVolumeClaim, string, string, string, *corev1.PersistentVolume, error) {
 	pvc, err := s.Typed.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, claimName, metav1.GetOptions{})
 	if err != nil {
-		return nil, "", "", "", safe(err)
+		return nil, "", "", "", nil, safe(err)
 	}
 	if pvc.UID == "" || pvc.ResourceVersion == "" {
-		return nil, "", "", "", errors.New("PersistentVolumeClaim has no stable UID/resourceVersion")
+		return nil, "", "", "", nil, errors.New("PersistentVolumeClaim has no stable UID/resourceVersion")
 	}
 	if pvc.DeletionTimestamp != nil {
-		return nil, "", "", "", errors.New("PersistentVolumeClaim is terminating")
+		return nil, "", "", "", nil, errors.New("PersistentVolumeClaim is terminating")
 	}
 	for _, ref := range pvc.OwnerReferences {
 		if ref.Controller != nil && *ref.Controller {
-			return nil, "", "", "", errors.New("controller-owned PersistentVolumeClaims are refused to prevent automatic recreation")
+			return nil, "", "", "", nil, errors.New("controller-owned PersistentVolumeClaims are refused to prevent automatic recreation")
 		}
 	}
 	switch pvc.Status.Phase {
 	case corev1.ClaimBound:
 		if pvc.Spec.VolumeName == "" {
-			return nil, "", "", "", errors.New("bound PersistentVolumeClaim has no volumeName")
+			return nil, "", "", "", nil, errors.New("bound PersistentVolumeClaim has no volumeName")
 		}
 	case corev1.ClaimPending:
 		if pvc.Spec.VolumeName != "" {
-			return nil, "", "", "", errors.New("a pending PersistentVolumeClaim with a volumeName is binding and cannot be deleted here")
+			return nil, "", "", "", nil, errors.New("a pending PersistentVolumeClaim with a volumeName is binding and cannot be deleted here")
 		}
 	default:
-		return nil, "", "", "", errors.New("PersistentVolumeClaim must be Bound or Pending; lost or unknown claims are refused")
+		return nil, "", "", "", nil, errors.New("PersistentVolumeClaim must be Bound or Pending; lost or unknown claims are refused")
 	}
 	className := ""
 	classDigest := ""
@@ -1187,54 +1229,56 @@ func (s *Service) storagePVCDeleteTarget(ctx context.Context, namespace, claimNa
 	// intentionally delete-only: a safe label-only PVC edit is already bounded
 	// by the Profile ownership and namespace policy and does not need a class.
 	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
-		return nil, "", "", "", errors.New("explicit approved StorageClass required")
+		return nil, "", "", "", nil, errors.New("explicit approved StorageClass required")
 	}
 	className = *pvc.Spec.StorageClassName
 	class, err := s.class(ctx, className, ev)
 	if err != nil {
-		return nil, "", "", "", err
+		return nil, "", "", "", nil, err
 	}
 	classDigest = digest(class)
 	reclaim := ""
+	var boundPV *corev1.PersistentVolume
 	if pvc.Spec.VolumeName != "" {
 		pv, err := s.Typed.CoreV1().PersistentVolumes().Get(ctx, pvc.Spec.VolumeName, metav1.GetOptions{})
 		if err != nil {
-			return nil, "", "", "", errors.New("bound PersistentVolume could not be verified")
+			return nil, "", "", "", nil, errors.New("bound PersistentVolume could not be verified")
 		}
 		if pv.UID == "" || pv.DeletionTimestamp != nil || pv.Status.Phase != corev1.VolumeBound {
-			return nil, "", "", "", errors.New("bound PersistentVolume is not a stable Bound volume")
+			return nil, "", "", "", nil, errors.New("bound PersistentVolume is not a stable Bound volume")
 		}
 		ref := pv.Spec.ClaimRef
 		if ref == nil || ref.UID != pvc.UID || ref.Namespace != pvc.Namespace || ref.Name != pvc.Name {
-			return nil, "", "", "", errors.New("bound PersistentVolume does not name this exact claim")
+			return nil, "", "", "", nil, errors.New("bound PersistentVolume does not name this exact claim")
 		}
 		if pv.Spec.StorageClassName == "" || !has(s.Config.Storage.AllowedStorageClasses, pv.Spec.StorageClassName) {
-			return nil, "", "", "", errors.New("bound PersistentVolume StorageClass is not approved")
+			return nil, "", "", "", nil, errors.New("bound PersistentVolume StorageClass is not approved")
 		}
 		if className != pv.Spec.StorageClassName {
-			return nil, "", "", "", errors.New("PersistentVolumeClaim and PersistentVolume class mismatch")
+			return nil, "", "", "", nil, errors.New("PersistentVolumeClaim and PersistentVolume class mismatch")
 		}
 		className = pv.Spec.StorageClassName
 		class, err := s.class(ctx, className, ev)
 		if err != nil {
-			return nil, "", "", "", err
+			return nil, "", "", "", nil, err
 		}
 		classDigest = digest(class)
 		switch pv.Spec.PersistentVolumeReclaimPolicy {
 		case corev1.PersistentVolumeReclaimRetain, corev1.PersistentVolumeReclaimDelete:
 			reclaim = string(pv.Spec.PersistentVolumeReclaimPolicy)
 		default:
-			return nil, "", "", "", errors.New("bound PersistentVolume reclaim policy is unknown")
+			return nil, "", "", "", nil, errors.New("bound PersistentVolume reclaim policy is unknown")
 		}
 		ev.add("PersistentVolume", "", pv.Name, storagePVFingerprint(pv))
+		boundPV = pv
 	}
 	if err := s.rejectPVCReferences(ctx, pvc.Namespace, pvc.Name); err != nil {
-		return nil, "", "", "", err
+		return nil, "", "", "", nil, err
 	}
 	if err := s.rejectPVCReservation(ctx, pvc); err != nil {
-		return nil, "", "", "", err
+		return nil, "", "", "", nil, err
 	}
-	return pvc, className, classDigest, reclaim, nil
+	return pvc, className, classDigest, reclaim, boundPV, nil
 }
 
 // rejectPVCReservation fails closed when a PersistentVolume already reserves
@@ -1521,7 +1565,8 @@ func storagePreparedMatches(want, got model.Prepared) bool {
 		want.Action.TargetUID == got.Action.TargetUID &&
 		want.Action.TargetResourceVersion == got.Action.TargetResourceVersion &&
 		want.Action.StorageYAML == got.Action.StorageYAML &&
-		want.Action.ConfirmPodDefaultCleanup == got.Action.ConfirmPodDefaultCleanup
+		want.Action.ConfirmPodDefaultCleanup == got.Action.ConfirmPodDefaultCleanup &&
+		want.Action.ConfirmPVReclaim == got.Action.ConfirmPVReclaim
 }
 
 func (s *Service) verifyStorageEdit(ctx context.Context, plan *storageEditPlan) error {
@@ -1619,7 +1664,7 @@ func (s *Service) executeStorageDelete(ctx context.Context, p model.Prepared, cp
 		if err := s.waitForStorageDeletion(ctx, plan.kind, plan.namespace, plan.name, plan.uid); err != nil {
 			return err
 		}
-		return s.recordStorageDeletionReceipt(ctx, plan)
+		return s.completeStorageDelete(ctx, plan, cp)
 	}
 	// A reviewed cleanup is a sequence of independent writes. One checkpoint
 	// precedes every PodDefault deletion and another precedes the PVC deletion.
@@ -1686,7 +1731,7 @@ func (s *Service) executeStorageDelete(ctx context.Context, p model.Prepared, cp
 		return fmt.Errorf("the PersistentVolumeClaim changed after PodDefault cleanup: %w", ErrConflict)
 	}
 	var cleanupEv evidence
-	_, className, classDigest, _, err := s.storagePVCDeleteTarget(ctx, plan.namespace, plan.name, &cleanupEv)
+	_, className, classDigest, _, _, err := s.storagePVCDeleteTarget(ctx, plan.namespace, plan.name, &cleanupEv)
 	if err != nil {
 		return err
 	}
@@ -1718,7 +1763,21 @@ func (s *Service) executeStorageDelete(ctx context.Context, p model.Prepared, cp
 	if err := s.waitForStorageDeletion(ctx, plan.kind, plan.namespace, plan.name, plan.uid); err != nil {
 		return err
 	}
-	return s.recordStorageDeletionReceipt(ctx, plan)
+	return s.completeStorageDelete(ctx, plan, cp)
+}
+
+// completeStorageDelete records the completed-deletion receipt and then, for a
+// claim that was bound to a Retain volume, reclaims that volume. The receipt is
+// durable before the reclaim so a reclaim failure never hides the proven
+// deletion. There is no rollback: the claim is never recreated.
+func (s *Service) completeStorageDelete(ctx context.Context, plan *storageDeletePlan, cp func(string) error) error {
+	if err := s.recordStorageDeletionReceipt(ctx, plan); err != nil {
+		return err
+	}
+	if plan.reclaim == nil {
+		return nil
+	}
+	return s.reclaimRetainedVolume(ctx, plan, cp)
 }
 
 func (s *Service) recordStorageDeletionReceipt(ctx context.Context, plan *storageDeletePlan) error {

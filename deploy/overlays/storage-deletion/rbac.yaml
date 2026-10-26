@@ -8,7 +8,10 @@ metadata:
   name: kubeflow-admin-storage-deletion
 rules:
   - apiGroups: ['']
-    resources: [persistentvolumes, persistentvolumeclaims]
+    resources: [persistentvolumes]
+    verbs: [delete]
+  - apiGroups: ['']
+    resources: [persistentvolumeclaims]
     verbs: [delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

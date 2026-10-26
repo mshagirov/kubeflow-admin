@@ -27,6 +27,8 @@ storage:
   # Replace with your approved classes and review access modes, isolation,
   # reclaim policy and driver support before enabling writes.
   allowedStorageClasses: [REPLACE_WITH_APPROVED_CLASS]
+  # Only after admission denies tenant claims for dedicated registration classes.
+  isolatedStorageClasses: []
   nfsTemplates: []
   csiTemplates: []
   # Separate PV registration / template-bound PVC workflow. Empty until the
@@ -58,6 +60,7 @@ features:
   # Each needs writesEnabled and its own reviewed RBAC grant.
   storageEditing: false
   storageDeletion: false
+  pvReclaim: false
   # Optional PVC-associated PodDefaults only; requires its separate RBAC grant.
   # Read access still detects references when mutation is disabled.
   podDefaults: false

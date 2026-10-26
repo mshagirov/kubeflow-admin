@@ -129,6 +129,9 @@ func (s *Service) buildStorageRegistration(ctx context.Context, a model.Action) 
 // silently ignored by an older action kind. An action that does not implement a
 // field must reject it, never accept it and do less than the browser requested.
 func unsupportedRegistrationFields(a model.Action) error {
+	if a.ConfirmPVReclaim && a.Kind != "pvc.delete" {
+		return errors.New("confirmPVReclaim is only valid for pvc.delete")
+	}
 	if a.NFSPath != "" && a.Kind != "pv.create.static" {
 		return errors.New("nfsPath is only valid for pv.create.static")
 	}
@@ -225,6 +228,12 @@ func (s *Service) registrationTemplate(templateName, kind string) (*config.Regis
 }
 
 func (s *Service) buildPVCreateStatic(ctx context.Context, a model.Action, plan *storageRegistrationPlan) error {
+	if !has(s.Config.Storage.IsolatedStorageClasses, a.StorageClass) {
+		return errors.New("unreserved PV creation requires an operator-confirmed isolated StorageClass")
+	}
+	if err := s.rejectUnboundClassClaims(ctx, a.StorageClass); err != nil {
+		return err
+	}
 	t, err := s.registrationTemplate(a.Template, "")
 	if err != nil {
 		return err
@@ -328,6 +337,7 @@ func (s *Service) buildPVCreateStatic(ctx context.Context, a model.Action, plan 
 		Summary: "pv.create.static " + a.Name,
 		Changes: changes,
 		Warnings: []string{
+			"This volume is unreserved: any matching claim in any namespace can bind it and read or modify the backend data. The configured isolated StorageClass requires independently verified admission restricting tenant PVC creation; an empty claimRef, a template or the class provisioner does not provide tenant isolation.",
 			"Registers existing storage only; it does not create directories, set permissions, allocate backend space or move files. Declared capacity is not an enforced directory quota.",
 			"The new PersistentVolume is created with no claimRef and no PVC. Its observed Available phase and exact identity/spec are verified, but backend readiness, export permissions and mount correctness require independent operator verification.",
 			"Backend uniqueness is a scoped observation, not an atomic cluster-wide guarantee. Coordinate every privileged writer and admission policy; two writers can still race after this list check.",

@@ -62,9 +62,13 @@ type Policy struct {
 	AllowedNamespaces   []string `yaml:"allowedNamespaces"`
 }
 type Storage struct {
-	AllowedStorageClasses []string      `yaml:"allowedStorageClasses"`
-	NFSTemplates          []NFSTemplate `yaml:"nfsTemplates"`
-	CSITemplates          []CSITemplate `yaml:"csiTemplates"`
+	// IsolatedStorageClasses names dedicated registration classes whose PVC
+	// creation is restricted to the console by operator-installed admission.
+	// Empty by default: an Available PV must never expose user data to tenants.
+	IsolatedStorageClasses []string      `yaml:"isolatedStorageClasses"`
+	AllowedStorageClasses  []string      `yaml:"allowedStorageClasses"`
+	NFSTemplates           []NFSTemplate `yaml:"nfsTemplates"`
+	CSITemplates           []CSITemplate `yaml:"csiTemplates"`
 	// RegistrationTemplates is the versioned, typed template-driven static
 	// provisioning contract. It is deliberately separate from the legacy
 	// NFSTemplates/CSITemplates lists: deployed legacy templates keep their
@@ -169,6 +173,8 @@ type Features struct {
 	// PersistentVolume or PersistentVolumeClaim. It is a separate destructive
 	// opt-in and is never implied by WritesEnabled or StorageEditing.
 	StorageDeletion bool `yaml:"storageDeletion"`
+	// PVReclaim separately enables explicitly acknowledged post-delete reclaim.
+	PVReclaim bool `yaml:"pvReclaim"`
 	// PodDefaults is the separate, false-by-default opt-in for the optional
 	// dedicated PodDefault substep of a PVC creation and for removing reviewed
 	// PodDefault dependencies during an unused-only PVC deletion. It is never
@@ -322,6 +328,20 @@ func (c Config) Validate() error {
 	}
 	if c.Kubernetes.RequestTimeoutSeconds < 1 || c.Kubernetes.RequestTimeoutSeconds > 60 {
 		return fmt.Errorf("request timeout must be 1..60 seconds")
+	}
+	if c.Features.PVReclaim && (!c.Features.WritesEnabled || !c.Features.StorageDeletion) {
+		return fmt.Errorf("pvReclaim requires writesEnabled and storageDeletion")
+	}
+	for _, class := range c.Storage.IsolatedStorageClasses {
+		found := false
+		for _, allowed := range c.Storage.AllowedStorageClasses {
+			if class == allowed {
+				found = true
+			}
+		}
+		if class == "" || !found {
+			return fmt.Errorf("isolatedStorageClasses must name approved StorageClasses")
+		}
 	}
 	if (c.Features.StorageEditing || c.Features.StorageDeletion || c.Features.PodDefaults) && !c.Features.WritesEnabled {
 		return fmt.Errorf("storageEditing, storageDeletion and podDefaults require features.writesEnabled")

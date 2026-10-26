@@ -105,7 +105,8 @@ func registrationConfig() config.Config {
 		Features: config.Features{WritesEnabled: true, StaticStorage: true, PodDefaults: true, StorageDeletion: true},
 		Policy:   config.Policy{},
 		Storage: config.Storage{
-			AllowedStorageClasses: []string{"nfs-static", "beegfs-static", "dynamic-class"},
+			IsolatedStorageClasses: []string{"nfs-static", "beegfs-static"},
+			AllowedStorageClasses:  []string{"nfs-static", "beegfs-static", "dynamic-class"},
 			RegistrationTemplates: []config.RegistrationTemplate{
 				{
 					Name: "nfs-reg", Kind: config.RegistrationKindNFS, StorageClass: "nfs-static",
@@ -166,6 +167,8 @@ func installRegistrationReactors(t *testing.T, f *registrationFixture) {
 	// run before the tracker can persist it.
 	f.client.PrependReactor("*", "persistentvolumes", dryRunReactor(f.client))
 	f.client.PrependReactor("*", "persistentvolumeclaims", dryRunReactor(f.client))
+	// A deleted Retain-bound claim releases its volume and the console reclaims it.
+	installPVController(f.client)
 	f.client.PrependReactor("create", "persistentvolumes", func(a ktesting.Action) (bool, runtime.Object, error) {
 		ca, ok := a.(ktesting.CreateActionImpl)
 		if !ok {

@@ -1,0 +1,23 @@
+# Explicit post-delete reclaim permission, separate from storage deletion.
+# RBAC cannot restrict patch fields: enforce admission and protect this identity.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeflow-admin-pv-reclaim
+rules:
+  - apiGroups: ['']
+    resources: [persistentvolumes]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeflow-admin-pv-reclaim
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeflow-admin-pv-reclaim
+subjects:
+  - kind: ServiceAccount
+    name: kubeflow-admin
+    namespace: kubeflow-admin

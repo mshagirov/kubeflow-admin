@@ -17,6 +17,27 @@ separately gated restricted Edit and unused-only Delete actions.
 
 ## Template-driven provisioning (new static workflows)
 
+**Tenant-isolation gate.** Standalone unreserved PV creation is refused unless
+its class is explicitly listed in `storage.isolatedStorageClasses` (empty by
+default). This list is an operator attestation, not an enforcement mechanism.
+Before listing a class, use dedicated registration-only classes, install and
+test admission that denies tenant PVC creation for them, and remove/migrate all
+pre-existing unbound claims. A dedicated class can use the same CSI provisioner;
+sharing a driver does not mean it should share the ordinary tenant class name.
+See `deploy/examples/isolated-storage-policy.yaml` for a fail-closed policy and
+binding to adapt. Verify both explicit and defaulted tenant requests are denied
+and console requests succeed. Test the deprecated
+`volume.beta.kubernetes.io/storage-class` annotation (with missing, empty and
+conflicting spec class) too: the supplied policy forbids it outright because
+the PV controller gives it precedence over the spec. Never mark an isolated
+class as the cluster default. Dynamic PVC creation into isolated classes is
+refused by the app; only exact-PV binding is allowed.
+Do not enable these workflows where equivalent
+controls cannot be enforced. The app also refuses pre-existing unbound claims
+in the class, but a list alone cannot fence future tenant requests. Without
+admission isolation, an ordinary Pending claim in **any namespace** can bind an
+Available PV and expose or overwrite another user's data.
+
 The registration-template list is **separate from the legacy `nfsTemplates` and
 `csiTemplates` lists**. Legacy templates keep their existing PV+PVC behavior and
 strict NFS descendant rule. Do not reinterpret a deployed CSI handle or silently
@@ -393,8 +414,11 @@ features:
 
 Install only the permissions reviewed for the site:
 `deploy/overlays/storage-editing/rbac.yaml` and/or
-`deploy/overlays/storage-deletion/rbac.yaml`. These grant patch and delete
-respectively on PVs/PVCs, not `cluster-admin`. For a composed site overlay,
+`deploy/overlays/storage-deletion/rbac.yaml`. Editing grants patch on PVs/PVCs;
+deletion grants PV/PVC delete only, not `cluster-admin`. The separately reviewed
+`deploy/overlays/pv-reclaim/rbac.yaml` grants PV patch for optional post-delete
+reclaim. RBAC cannot restrict patch fields; protect the service account and
+enforce admission. Ordinary deletion does not require or grant patch. For a composed site overlay,
 copy the RBAC manifests into that overlay and list them as resources; do not
 stack overlays that each include the base. All shipped feature flags stay false.
 RBAC cannot enforce field-level patch restrictions or unused-only deletion;
@@ -428,11 +452,54 @@ at most 32 are included, shared/external warnings require explicit
 acknowledgement, other PVCs are untouched, and a partial failure never rolls
 back or recreates a PVC/PodDefault.
 
+### Retain volume reclaim after PVC deletion
+
+When the deleted PVC is bound to a PV with reclaim policy `Retain`, Kubernetes
+leaves that PV `Released` with a stale `spec.claimRef`, which blocks every new
+binding. **This remains the default.** Optional post-delete reclaim requires
+`features.pvReclaim: true`, writes and storage deletion, the separate `pv-reclaim`
+grant, an explicit per-request `confirmPVReclaim` acknowledgement in the delete
+drawer, and an operator-confirmed isolated StorageClass as described above.
+With all these opt-ins, the plan includes reclaim of that exact PV: after the PVC
+is confirmed gone, the console removes only
+`spec.claimRef` so the PV returns to `Available` and can be reused or deleted
+from the UI. The preview discloses the reclaim and warns that Retain keeps the
+backend data intact while Available makes it bindable; this is not a data wipe.
+
+- **Never for Delete-policy PVs.** Their normal controller cleanup is unchanged;
+  no PV patch is planned or issued. A Pending claim has no PV and no reclaim.
+- **Planning** records the reviewed PV name and UID in the evidence, fences
+  `pv:<name>` like any PV write and dry-runs the conditional claimRef patch, so
+  missing PV `patch` RBAC is refused before the PVC is deleted.
+- **After deletion** the exact reviewed PV is re-read by name and UID. It must be
+  `Released` (a still-`Bound` volume is awaited while the controller catches up),
+  non-terminating, still `Retain`, with an unchanged spec apart from `claimRef`,
+  and its `claimRef` must name exactly the deleted PVC namespace/name/UID. A
+  durable `reclaim-volume` checkpoint precedes the write, and the claim list is
+  re-read: any PVC in any namespace naming the PV, the deleted claim reappearing,
+  a replacement PVC with the same namespace and name (any UID, with or without a
+  `volumeName`), any unbound claim in the class (even without `volumeName`), or
+  an incomplete list refuses the reclaim. This check is a
+  point-in-time observation; a claim created between the list and the patch can
+  still race the clear, in which case post-patch verification stops for review.
+- **One write.** A JSON patch conditioned on the PV UID, current resourceVersion,
+  the deleted claim identity and the Retain policy removes `/spec/claimRef` and
+  nothing else (never reclaim policy, source, status, finalizers or labels).
+  Success requires observing the same UID `Available` with no `claimRef`; a
+  `PersistentVolume` `available` receipt is recorded only then.
+- **Partial outcomes.** The PVC deletion receipt is recorded first. If the
+  reclaim is refused, fails, is rebound by another claim or cannot be verified,
+  the operation ends `needs-review`: the PVC stays deleted and is never
+  recreated, nothing is rolled back or replayed, and finalizers are never
+  touched. The volume's state may be unverified because a patch can apply before
+  a timeout or server error, so the operator must inspect it.
+
 Both workflows fetch fresh identity, dry-run and revalidate. Edit issues one
 conditional patch after its durable checkpoint. PVC cleanup conditionally deletes
 each reviewed PodDefault before conditionally deleting the PVC, with a checkpoint
 before each write and partial-outcome retention. A stale UID/resourceVersion
-requires a new review. Deletion succeeds only after disappearance is observed;
+requires a new review. Deletion succeeds only after disappearance is observed
+(and, when explicitly requested, after the reclaim above is verified);
 finalizers or an uncertain API result may require operator review, not a retry.
 Incomplete operations are not automatically replayed and retain their locks.
 

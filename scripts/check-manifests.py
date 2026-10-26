@@ -66,6 +66,7 @@ EXPECTED_ROLES = {
         ("", "persistentvolumes"): {"delete"},
         ("", "persistentvolumeclaims"): {"delete"},
     },
+    "kubeflow-admin-pv-reclaim": {("", "persistentvolumes"): {"patch"}},
     # Optional, separately reviewed PodDefault create/overwrite/cleanup used
     # only as a substep of reviewed PVC operations. Base read stays get/list.
     "kubeflow-admin-poddefaults": {
@@ -90,6 +91,7 @@ EXPECTED_VARIANTS = {
     "pod-restarts",
     "poddefaults",
     "pvc-expansion",
+    "pv-reclaim",
     "profile-deletion",
     "static-storage",
     "storage-editing",
@@ -131,6 +133,7 @@ def check(path):
             if d["metadata"]["name"] == "kubeflow-admin-profile-deletion":
                 assert path.name == DELETE_OPT_IN_PATH, "profile deletion grant must stay separately opt-in"
             for role, overlay in (("kubeflow-admin-storage-editing", "storage-editing"),
+                                  ("kubeflow-admin-pv-reclaim", "pv-reclaim"),
                                   ("kubeflow-admin-storage-deletion", "storage-deletion")):
                 if d["metadata"]["name"] == role:
                     assert path.name == overlay, "storage management grants must stay separately opt-in"
@@ -162,4 +165,12 @@ if __name__ == "__main__":
     assert variants == EXPECTED_VARIANTS, f"overlay variants changed: {sorted(variants)}"
     for directory in directories:
         check(directory)
+    with (ROOT / "deploy/examples/db-ownership-check.yaml").open() as source:
+        checks = [doc for doc in yaml.safe_load_all(source) if doc["kind"] == "Pod"]
+    assert len(checks) == 2, "both disposable database ownership checks must be present"
+    for pod in checks:
+        assert pod["spec"].get("automountServiceAccountToken") is False, "offline database checks must not mount API credentials"
+        for container in pod["spec"]["containers"]:
+            for group in ("requests", "limits"):
+                assert all(container.get("resources", {}).get(group, {}).get(key) for key in ("cpu", "memory")), "database checks must bound CPU and memory"
     print(f"OK {len(variants)} rendered variants ({', '.join(sorted(variants))})")

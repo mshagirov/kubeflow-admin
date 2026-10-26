@@ -1857,6 +1857,7 @@ async function bootHarness(options = {}) {
   storageDeleteTest.walk(storageDeleteTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete")[0].click();
   await storageDeleteTest.settle();
   assert.equal(storageDeleteTest.get("#storage-delete-drawer").hidden, false, "Delete opens the storage-delete right drawer");
+  assert.equal(storageDeleteTest.get("#storage-delete-title").textContent, "Delete data", "Delete names the selected storage resource in the drawer title");
   assert.equal(storageDeleteTest.get("#storage-delete-target-uid").value, "uid-pvc-team-data");
   assert.equal(storageDeleteTest.get("#storage-delete-target-rv").value, "41");
   const deleteWarning = storageDeleteTest.textOf(storageDeleteTest.get("#storage-delete-warning"));
@@ -1891,6 +1892,19 @@ async function bootHarness(options = {}) {
   assert.equal(storageDeleteBody.force, undefined, "deletion carries no force field");
   assert.equal(storageDeleteBody.dataLossAck, undefined, "the acknowledgement is never submitted");
   assert.equal(storageDeleteBody.storageYAML, undefined, "deletion carries no YAML");
+  assert.equal(storageDeleteBody.confirmPVReclaim, undefined, "deletion never implicitly reclaims retained data");
+  const reclaimDeleteTest = await bootHarness({});
+  await reclaimDeleteTest.click("storage");
+  reclaimDeleteTest.walk(reclaimDeleteTest.get('[data-table="storage"]'), node => node.dataset.resourceKey === "PersistentVolumeClaim|team|data" && node.tagName === "BUTTON")[0].click();
+  reclaimDeleteTest.walk(reclaimDeleteTest.get("#resource-details-body"), node => node.tagName === "BUTTON" && node.textContent === "Delete")[0].click();
+  await reclaimDeleteTest.settle();
+  reclaimDeleteTest.get("#storage-delete-reason").value = "reviewed isolated reclaim";
+  reclaimDeleteTest.get("#storage-delete-confirm").value = "data";
+  reclaimDeleteTest.get("#storage-delete-ack").checked = true;
+  reclaimDeleteTest.get("#storage-delete-pod-default-ack").checked = true;
+  reclaimDeleteTest.get("#storage-delete-reclaim-ack").checked = true;
+  await reclaimDeleteTest.submitForm(6);
+  assert.equal(reclaimDeleteTest.bodies[reclaimDeleteTest.bodies.length - 1].confirmPVReclaim, true, "reclaim requires its own explicit acknowledgement");
   // The focus returns to the exact visible name control, never a closed
   // drawer's Delete/Edit button.
   storageDeleteTest.get("#cancel-plan").listeners.click[0]();

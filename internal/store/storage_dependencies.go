@@ -75,7 +75,7 @@ func validatePodDefaultContract(p model.Prepared) error {
 		}
 	}
 	if a.Kind != pvcDeleteKind {
-		if a.ConfirmPodDefaultCleanup {
+		if a.ConfirmPodDefaultCleanup || a.ConfirmPVReclaim {
 			return ErrInvalidTarget
 		}
 		return nil
@@ -400,6 +400,20 @@ func plannedDependencyTargets(p model.Prepared) ([]string, error) {
 		}
 		add(target)
 	}
+	if a.Kind == pvcDeleteKind {
+		// A claim bound to a Retain volume carries that volume's reclaim after
+		// deletion, so the volume is fenced like any other PV write.
+		volume, err := reviewedReclaimVolume(p.Data)
+		if err != nil {
+			return nil, err
+		}
+		if (volume != "") != a.ConfirmPVReclaim {
+			return nil, ErrInvalidTarget
+		}
+		if volume != "" {
+			add("pv:" + volume)
+		}
+	}
 	if a.Kind == pvcDeleteKind && a.ConfirmPodDefaultCleanup {
 		names, err := reviewedPodDefaultNames(p.Data, a.Namespace)
 		if err != nil {
@@ -414,6 +428,30 @@ func plannedDependencyTargets(p model.Prepared) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// reviewedReclaimVolume returns the Retain PersistentVolume a PVC deletion
+// reclaims after the claim is gone, or "" for evidence without one. A present
+// but malformed value is refused rather than silently dropping the lock.
+func reviewedReclaimVolume(data json.RawMessage) (string, error) {
+	if len(data) == 0 {
+		return "", nil
+	}
+	var evidence struct {
+		ReclaimVolume    *string `json:"reclaimVolume"`
+		ReclaimVolumeUID *string `json:"reclaimVolumeUID"`
+	}
+	if err := json.Unmarshal(data, &evidence); err != nil {
+		return "", errors.New("prepared evidence is not valid JSON")
+	}
+	if evidence.ReclaimVolume == nil && evidence.ReclaimVolumeUID == nil {
+		return "", nil
+	}
+	if evidence.ReclaimVolume == nil || evidence.ReclaimVolumeUID == nil ||
+		!validTargetName(*evidence.ReclaimVolume) || *evidence.ReclaimVolumeUID == "" {
+		return "", errors.New("reviewed reclaim volume is malformed")
+	}
+	return *evidence.ReclaimVolume, nil
 }
 
 // validatePVCreateStatic enforces the standalone static PV contract: the PV

@@ -21,9 +21,14 @@ require `features.storageDeletion`, exact `confirmName` and a reason. All requir
 writes, explicit target UID/resourceVersion and policy validation. YAML changes
 are allowlisted (console-owned labels, PV reclaim policy, upward-only PVC request
 with existing expansion gates); hidden fields are preserved. StorageClasses stay
-read-only. PV mutation is limited to approved unclaimed Available resources;
-PVC deletion refuses observed Pod/Notebook references. No force/finalizer
-cleanup or replay is permitted. Separate observations do not atomically fence
+read-only. PV mutation is limited to approved unclaimed Available resources,
+except the bounded post-delete reclaim below; PVC deletion refuses observed
+Pod/Notebook references. Retain stays Released by default. Only with the separate
+`pvReclaim` feature, explicit `confirmPVReclaim`, isolated-class attestation and
+separate patch grant does deletion remove the stale claimRef (back to Available)
+after the PVC is gone, with any reclaim
+failure reported as needs-review, never rolled back. No force/finalizer cleanup
+or replay is permitted. Separate observations do not atomically fence
 external workloads/binders; admission and operator coordination remain necessary.
 
 `pvc.delete` acceptance also takes an exclusive `namespace:<name>` fence against

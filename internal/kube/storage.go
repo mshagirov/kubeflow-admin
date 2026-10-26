@@ -170,6 +170,9 @@ func (s *Service) prepareStorage(ctx context.Context, a model.Action, w *work) e
 		return err
 	}
 	if a.Kind == "pvc.create.dynamic" {
+		if has(s.Config.Storage.IsolatedStorageClasses, a.StorageClass) {
+			return errors.New("dynamic PVC creation is forbidden for isolated registration StorageClasses; select an exact reviewed PV instead")
+		}
 		c, err := s.class(ctx, a.StorageClass, &w.ev)
 		if err != nil {
 			return err

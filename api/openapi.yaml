@@ -458,8 +458,17 @@ components:
             document. pv.delete and pvc.delete require storageDeletion plus
             writes, current identity, reason and exact confirmName. Referenced
             PVCs and bound/reserved PVs are refused; no forced cleanup exists.
+            Only with confirmPVReclaim, the separate pvReclaim feature and an
+            operator-confirmed isolated StorageClass, a pvc.delete whose bound
+            PV has reclaim policy Retain also removes
+            only that PV's stale spec.claimRef after the PVC is confirmed gone,
+            returning it to Available (a Delete-policy PV is never patched;
+            this is not a data wipe). A failed or uncertain reclaim leaves the
+            PVC deleted and ends needs-review without rollback or replay.
             pv.create.static creates one standalone PV from an approved
-            registration template and never creates a PVC or claimRef.
+            registration template and never creates a PVC or claimRef. It
+            requires storage.isolatedStorageClasses with independently enforced
+            admission isolation. Otherwise unreserved creation is refused.
             pvc.create.bound creates one PVC in the selected namespace and binds
             it to the selected Available, unclaimed PV. Both resolve capacity,
             access modes, reclaim policy, volume mode, mount options and driver
@@ -657,6 +666,9 @@ components:
             is acknowledged. PodDefault deletion uses Orphan propagation so
             unreviewed dependents are not cascade-deleted. Other PVCs are never deleted, and a partial cleanup
             never triggers PVC rollback or PodDefault recreation.
+        confirmPVReclaim:
+          type: boolean
+          description: Explicit post-delete Retain PV reclaim; requires pvReclaim, operator-confirmed isolatedStorageClasses and separate PV patch RBAC. Default false leaves the PV Released.
         container: {type: string}
         image: {type: string}
         cpuRequest: {type: string}

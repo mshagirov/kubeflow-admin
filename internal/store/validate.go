@@ -265,7 +265,7 @@ func strictDependencyLocks(a model.Action) bool {
 	case "pvc.create.dynamic":
 		return a.PodDefault != nil
 	case pvcDeleteKind:
-		return a.ConfirmPodDefaultCleanup
+		return a.ConfirmPodDefaultCleanup || a.ConfirmPVReclaim
 	}
 	return false
 }

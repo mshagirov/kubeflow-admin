@@ -132,6 +132,14 @@ Profile deletion requires UID and resourceVersion preconditions
 namespace is not active
 namespace ownership does not match its Profile
 writes are disabled
+PV reclaim requires its separate feature and a bound Retain volume
+PV reclaim requires an operator-confirmed isolated StorageClass
+PV reclaim refuses deprecated beta StorageClass annotations
+unreserved PV creation requires an operator-confirmed isolated StorageClass
+complete PVC reference list required before exposing an unreserved PV
+an unbound PVC already uses this isolated StorageClass
+dynamic PVC creation is forbidden for isolated registration StorageClasses; select an exact reviewed PV instead
+confirmPVReclaim is only valid for pvc.delete
 reason is too long
 reason exceeds 500 characters
 Profile namespace must match its name

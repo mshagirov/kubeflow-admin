@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -131,5 +132,50 @@ func TestNamespaceFenceIntegrityRequiresExclusiveDeletion(t *testing.T) {
 	}
 	if err := s.CheckIntegrity(ctx); err == nil {
 		t.Fatal("missing PVC delete namespace fence passed integrity")
+	}
+}
+
+// A PVC delete that reclaims a Retain volume after deletion fences that PV like
+// any other PV write, so a concurrent PV operation cannot race the claimRef
+// removal. Evidence without a reclaim volume keeps the historical lock shape.
+func TestPVCDeleteReclaimVolumeIsFenced(t *testing.T) {
+	s := database(t)
+	ctx := context.Background()
+	a := model.Action{Kind: "pvc.delete", Namespace: "alice", Name: "claim", TargetUID: "claim-uid", TargetResourceVersion: "1", ConfirmName: "claim", Reason: "verified unused"}
+	plan := storageDeletePlan("reclaim-plan", a)
+	if targets := Targets(plan); len(targets) != 2 {
+		t.Fatalf("legacy evidence changed the lock shape: %v", targets)
+	}
+	plan.Prepared.Data = json.RawMessage(`{"version":1,"reclaimVolume":"retained-pv","reclaimVolumeUID":"pv-uid","podDefaults":[]}`)
+	plan.Prepared.Action.ConfirmPVReclaim = true
+	found := false
+	for _, target := range Targets(plan) {
+		found = found || target == "pv:retained-pv"
+	}
+	if !found {
+		t.Fatalf("reclaim volume was not locked: %v", Targets(plan))
+	}
+	if _, created, err := s.CreateOperation(ctx, storageDeleteOp(plan, "reclaim-op"), plan, "reclaim-key"); err != nil || !created {
+		t.Fatal(err)
+	}
+	edit := storageDeletePlan("pv-edit-plan", model.Action{Kind: "pv.delete", Name: "retained-pv", TargetUID: "pv-uid", TargetResourceVersion: "1", ConfirmName: "retained-pv", Reason: "unused"})
+	if _, _, err := s.CreateOperation(ctx, storageDeleteOp(edit, "pv-op"), edit, "pv-key"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a PV operation raced the reclaim: %v", err)
+	}
+	for name, data := range map[string]string{
+		"invalid name":   `{"reclaimVolume":"Bad/Name","reclaimVolumeUID":"pv-uid"}`,
+		"missing uid":    `{"reclaimVolume":"retained-pv"}`,
+		"uid only":       `{"reclaimVolumeUID":"pv-uid"}`,
+		"non-string pv":  `{"reclaimVolume":7,"reclaimVolumeUID":"pv-uid"}`,
+		"empty uid":      `{"reclaimVolume":"retained-pv","reclaimVolumeUID":""}`,
+		"empty pv value": `{"reclaimVolume":"","reclaimVolumeUID":"pv-uid"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := storageDeletePlan("bad-"+name, a)
+			bad.Prepared.Data = json.RawMessage(data)
+			if _, err := targets(bad); err == nil {
+				t.Fatal("malformed reclaim evidence produced a lock set")
+			}
+		})
 	}
 }

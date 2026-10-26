@@ -2160,6 +2160,8 @@
   function enforceStorageAction(action) {
     if (!action) return action;
     if (action.kind === "pvc.delete") {
+      if ($("#storage-delete-reclaim-ack")?.checked) action.confirmPVReclaim = true;
+      else delete action.confirmPVReclaim;
       if ($("#storage-delete-pod-default-ack")?.checked) action.confirmPodDefaultCleanup = true;
       else delete action.confirmPodDefaultCleanup;
       return action;
@@ -2547,6 +2549,13 @@
       const warnings = $("#storage-edit-warnings"); if (warnings) { warnings.textContent = ""; warnings.hidden = true; }
       const policy = $("#storage-edit-policy"); if (policy) policy.textContent = storagePolicyHint(found, mode);
     } else {
+      const title = $("#storage-delete-title"); if (title) title.textContent = `Delete ${found.name}`;
+      if (!$("#storage-delete-reclaim-option")) {
+        const option = $("#storage-reclaim-option")?.content?.cloneNode(true);
+        if (option) form.prepend(option);
+      }
+      const reclaimOption = $("#storage-delete-reclaim-option"); if (reclaimOption) reclaimOption.hidden = found.kind !== "PersistentVolumeClaim";
+      const reclaim = $("#storage-delete-reclaim-ack"); if (reclaim) reclaim.checked = false;
       const confirm = $("#storage-delete-confirm"); if (confirm) confirm.value = "";
       const ack = $("#storage-delete-ack"); if (ack) ack.checked = false;
       const podDefaultAck = $("#storage-delete-pod-default-ack"); if (podDefaultAck) podDefaultAck.checked = false;

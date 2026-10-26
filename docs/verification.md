@@ -2,6 +2,35 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
+## 0.4.5 — explicit Retain reclaim and security isolation (26 October 2026)
+
+Source validation completed; publication is recorded separately after artifact
+scanning and registry verification. No live cluster mutation or deployment.
+
+- Storage-delete headings name the exact resource using `textContent`.
+  Earlier sidebar padding and empty-legacy-template action gating are retained.
+- Optional Retain reclaim is off by default and requires its own feature,
+  per-plan acknowledgement, isolated-class attestation and separate PV patch
+  grant. Default deletion leaves the PV Released. Only the exact deleted
+  claim's stale claimRef is removed; Available must be observed before success.
+- Unreserved registration requires operator-enforced isolated classes. Dynamic
+  PVCs in those classes are refused; existing unbound and replacement claims
+  block exposure. Deprecated class annotations cannot bypass the claim checks
+  or the supplied admission policy. Reclaim also refuses PV-side aliases.
+- Partial outcomes preserve receipts and locks without rollback/replay. The
+  deletion overlay remains delete-only; the new `pv-reclaim` overlay is separate.
+- Disposable database-check examples no longer mount service-account tokens
+  and have bounded CPU/memory. A flaky pre-existing eviction test deadline was
+  increased so race instrumentation reaches the intended post-eviction checks.
+
+See [security review](security-review-2026-10-26.md) for findings, fixes,
+independent Opus 5.5/high review, local checks and deployment prerequisites.
+Go 1.27.3 tests/race/vet/vulnerability checks, browser logic/navigation, API
+parity, Python tests, OpenAPI and 13 manifest variants passed. Admission
+examples passed Kubernetes 1.32 schema checks and an isolated CEL harness.
+Source Trivy HIGH/CRITICAL dependency, secret and misconfiguration scans passed.
+These checks are not live tenant-isolation, controller or mount acceptance.
+
 ## 0.4.4 — template-driven storage provisioning (22 October 2026)
 
 **Published and registry-verified:** `0.4.4` and `latest` resolve to the same

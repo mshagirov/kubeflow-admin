@@ -176,6 +176,7 @@ type Action struct {
 	// namespace-local PodDefaults reviewed by a pvc.delete plan. It is only
 	// valid when that plan carries a complete bounded cleanup set.
 	ConfirmPodDefaultCleanup bool `json:"confirmPodDefaultCleanup,omitempty"`
+	ConfirmPVReclaim         bool `json:"confirmPVReclaim,omitempty"`
 }
 
 // PodDefaultRequest is the typed browser input for the optional dedicated
