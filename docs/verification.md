@@ -64,9 +64,12 @@ conservative needs-review outcomes, with no automatic retry or lock release.
 - Index: `sha256:598dcaa0b9db2e0ac1bf59d747cc728fc9026c8bcc3c66b9cf9deff8afbb5c8b`.
   Attestation references: `sha256:c9c912e40f0e31df3a018be4de1c0f2305b3e11295af4775faabda2e35819d82`
   and `sha256:56beff89edee1d34da67959a04acd4bcf311a29d364fb119b48bb35225f8c73b`.
-- The registry tag listing contains `1.0.0` and `latest` at that index. The
-  remote `deploy/site` overlay is pinned to the same digest and renders without
-  applying it; rollout remains an operator action.
+- The registry tag listing contains `1.0.0` and `latest` at that index. At the
+  same check, the previous `0.4.5` tag and its recorded digest were absent from
+  the registry. The ignored remote `deploy/site` overlay now pins this verified
+  `1.0.0` digest and renders without applying it; rollout remains an operator
+  action. The `0.4.5` registry receipt below is historical and not currently
+  reproducible from the registry.
 - All 37 real Chrome baseline acceptance checks passed against the committed
   assets. Live reclaim still requires the operator-enforced isolated class,
   admission policy, `pvReclaim` opt-in and `pv-reclaim` patch RBAC.
