@@ -35,7 +35,7 @@ These checks are not live tenant-isolation, controller or mount acceptance.
 
 - Source commit: `4772a76b8f8c47c04a33dbf39c2936aa9406c5da`, pushed to `main`.
 - Source CI: [40280987954](https://github.com/mshagirov/kubeflow-admin/actions/runs/40280987954).
-  This receipt records local and registry verification, not an unobserved CI result.
+  Both security and test jobs passed, including multi-architecture compilation.
 - Built once from the committed Git archive with Go 1.27.3, SPDX SBOM and SLSA
   provenance; promoted the exact scanned OCI artifacts without rebuilding.
 - The archived source passed pinned Trivy 0.76.0 HIGH/CRITICAL dependency,
