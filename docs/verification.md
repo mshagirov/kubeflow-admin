@@ -4,8 +4,8 @@ Records what has been **proven locally** and what still requires the operator's 
 
 ## 0.4.5 — explicit Retain reclaim and security isolation (26 October 2026)
 
-Source validation completed; publication is recorded separately after artifact
-scanning and registry verification. No live cluster mutation or deployment.
+**Published and registry-verified:** `0.4.5` and `latest` resolve to the same
+multi-platform index below. No live cluster mutation or deployment.
 
 - Storage-delete headings name the exact resource using `textContent`.
   Earlier sidebar padding and empty-legacy-template action gating are retained.
@@ -30,6 +30,36 @@ parity, Python tests, OpenAPI and 13 manifest variants passed. Admission
 examples passed Kubernetes 1.32 schema checks and an isolated CEL harness.
 Source Trivy HIGH/CRITICAL dependency, secret and misconfiguration scans passed.
 These checks are not live tenant-isolation, controller or mount acceptance.
+
+### 0.4.5 publication receipt
+
+- Source commit: `4772a76b8f8c47c04a33dbf39c2936aa9406c5da`, pushed to `main`.
+- Source CI: [40280987954](https://github.com/mshagirov/kubeflow-admin/actions/runs/40280987954).
+  This receipt records local and registry verification, not an unobserved CI result.
+- Built once from the committed Git archive with Go 1.27.3, SPDX SBOM and SLSA
+  provenance; promoted the exact scanned OCI artifacts without rebuilding.
+- The archived source passed pinned Trivy 0.76.0 HIGH/CRITICAL dependency,
+  secret and misconfiguration gates. Each runtime architecture was separately
+  selected and verified in the scanner output; both passed vulnerability and
+  secret gates. Scanning the full OCI layout with a platform flag initially
+  selected AMD64 twice, so the final gates used single-platform layout views
+  of the exact two runtime manifest digests instead.
+- Both architectures have UID/GID `65532:65532`, correct source/version labels,
+  byte-identical LICENSE files, and verified SPDX/SLSA attestations with no
+  workstation paths. Network-disabled, read-only-root, dropped-capability,
+  no-new-privileges startup checks failed closed without configuration.
+- AMD64: `sha256:9f73886e46ef62d9df3fd3631490b71c04a708f46504ca80f49ee6b7394ad6b2`.
+- ARM64: `sha256:79cb83d8a9147406675a790b08f846b0b7dd5fb72233ec9330e209ced1925cf3`.
+- The registry index, both runtime digests and attestation references match the
+  offline artifact. `0.4.5` and `latest` match; `0.4.4` remains unchanged.
+
+```yaml
+image: docker.io/muratshagirov/kubeflow-admin@sha256:a6e48cd624ae42081f5dc243a540d1abddfd8acb062bcddb10b033404d2fc965
+```
+
+This receipt is documentation-only; the image source label remains the source
+commit above. Reclaim and isolated storage still require the operator acceptance
+and admission prerequisites in [storage](storage.md).
 
 ## 0.4.4 — template-driven storage provisioning (22 October 2026)
 
