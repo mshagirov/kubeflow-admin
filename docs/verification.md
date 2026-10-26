@@ -2,7 +2,7 @@
 
 Records what has been **proven locally** and what still requires the operator's live acceptance. Fake Kubernetes clients and local OIDC fixtures do not simulate Kubeflow reconciliation, CSI provisioning, scheduling, admission or Istio.
 
-## 1.0.0 — standalone Released-PV reclaim (26 October 2026)
+## 1.0.0 — standalone Released-PV reclaim and bound-PVC field order (26 October 2026)
 
 **Published and registry-verified:** `1.0.0` and `latest` resolve to the same
 multi-platform index below. Source commit and tag are pushed. No live cluster
@@ -42,40 +42,47 @@ conservative needs-review outcomes, with no automatic retry or lock release.
 
 ### 1.0.0 publication receipt
 
-- Source commit: `026db2ee16382691d95e9a65ed77616b2ac91e90`, pushed to `main`.
-  Annotated tag object `8546b9a7357970ca01836a65da60b5d41e3bd674` resolves to
-  that commit.
-- Source CI: [40287329218](https://github.com/mshagirov/kubeflow-admin/actions/runs/40287329218)
+- Add the bound-PVC field order: **Registration template** → **Storage
+  class** → **Selected PV**. Other storage actions retain their prior order.
+- Source commit: `062f1deda728f659f7c2695036d6d6b6862a9afd`, pushed to `main`.
+  Annotated tag object `52108a91d535b6475490d6824eadddde9557f87d` resolves to
+  that commit. The GitHub `1.0.0` release is marked **Latest**.
+- Source CI: [40291628729](https://github.com/mshagirov/kubeflow-admin/actions/runs/40291628729)
   for `main` and
-  [40287329241](https://github.com/mshagirov/kubeflow-admin/actions/runs/40287329241)
+  [40292571143](https://github.com/mshagirov/kubeflow-admin/actions/runs/40292571143)
   for `1.0.0`. Security and test jobs passed on both.
 - Built once from the exact `git archive 1.0.0` source with Go 1.27.3, SPDX SBOM
-  and SLSA provenance. The scanned OCI artifacts were pushed without rebuilding;
-  `latest` was promoted to the same index by digest, not rebuilt.
-- The archived source passed pinned Trivy 0.76.0 HIGH/CRITICAL dependency,
-  secret and misconfiguration gates. Each runtime architecture was separately
-  selected and scanned; both passed vulnerability and secret gates.
-- Both architectures have UID/GID `65532:65532`, correct source/version labels,
-  byte-identical LICENSE files, and verified SPDX/SLSA attestations with no
-  workstation paths. Network-disabled, read-only-root, dropped-capability,
-  no-new-privileges startup checks failed closed without configuration.
-- AMD64: `sha256:285acfec9711b40ad660f850b23399e84492532b0855276b2935ee6243e15135`.
-- ARM64: `sha256:4c8108917bc80dd67bd58c4620f41d6042f60b6e6a3b676da52364e06490159c`.
-- Index: `sha256:598dcaa0b9db2e0ac1bf59d747cc728fc9026c8bcc3c66b9cf9deff8afbb5c8b`.
-  Attestation references: `sha256:c9c912e40f0e31df3a018be4de1c0f2305b3e11295af4775faabda2e35819d82`
-  and `sha256:56beff89edee1d34da67959a04acd4bcf311a29d364fb119b48bb35225f8c73b`.
-- The registry tag listing contains `1.0.0` and `latest` at that index. At the
-  same check, the previous `0.4.5` tag and its recorded digest were absent from
-  the registry. The ignored remote `deploy/site` overlay now pins this verified
-  `1.0.0` digest and renders without applying it; rollout remains an operator
-  action. The `0.4.5` registry receipt below is historical and not currently
-  reproducible from the registry.
-- All 37 real Chrome baseline acceptance checks passed against the committed
-  assets. Live reclaim still requires the operator-enforced isolated class,
-  admission policy, `pvReclaim` opt-in and `pv-reclaim` patch RBAC.
+  and SLSA provenance. `1.0.0` and `latest` were pushed to the same index by
+  the same build, not rebuilt.
+- Source CI passed pinned Trivy 0.76.0 HIGH/CRITICAL dependency, secret and
+  misconfiguration gates. Each published runtime manifest was then separately
+  selected and scanned with the same pinned Trivy image; both passed the
+  vulnerability and secret gates with no HIGH/CRITICAL findings.
+- Both architectures have UID/GID `65532:65532`, source/version labels
+  `062f1de` / `1.0.0`, and the byte-identical MIT LICENSE
+  (`sha256:77ffde667034153e72bcaaa23279029510bf5142d3a7a7f210ff3e4025d993b6`).
+  A network-disabled, read-only-root, dropped-capability, no-new-privileges
+  startup check failed closed without configuration.
+- AMD64: `sha256:ada24433994eb3b12635544d9ddd41f0c903fe8e1cd212cfd6877b560327f3fc`.
+- ARM64: `sha256:f83de62f7b1f7445eb1442bb090ee3520892c43fbc5cc5fd6892b3002cdc3107`.
+- Index: `sha256:16a0423aebba849f5c78c716e6203845403b116b2a19767c63f99c5ba1bbd388`.
+  Attestation references: `sha256:77fdcfdce8735a9af88af343336ca69eb8e01519853b4f41b16bb0e285e0aea6`
+  and `sha256:6c767aa5cd5c952c097fcfe7e71ff1671475a125f6e7bf9a1d160a41f45d48ec`.
+- The registry tag listing contains `1.0.0` and `latest` at that index. This
+  supersedes the earlier `1.0.0` publication from source `026db2e` with image
+  index `598dcaa0b9db2e0ac1bf59d747cc728fc9026c8bcc3c66b9cf9deff8afbb5c8b`
+  and tag object `8546b9a7357970ca01836a65da60b5d41e3bd674`; the earlier index
+  did not contain the bound-PVC field order. No live cluster used it. The
+  ignored `deploy/site` overlay is not part of this source commit and must be
+  repinned to the new index before an operator rollout. The `0.4.5` registry
+  receipt below is historical.
+- All 37 real Chrome synthetic-fixture acceptance checks passed against the
+  committed assets, including the bound-PVC field-order assertion. Live reclaim
+  still requires the operator-enforced isolated class, admission policy,
+  `pvReclaim` opt-in and `pv-reclaim` patch RBAC.
 
 ```yaml
-image: docker.io/muratshagirov/kubeflow-admin@sha256:598dcaa0b9db2e0ac1bf59d747cc728fc9026c8bcc3c66b9cf9deff8afbb5c8b
+image: docker.io/muratshagirov/kubeflow-admin@sha256:16a0423aebba849f5c78c716e6203845403b116b2a19767c63f99c5ba1bbd388
 ```
 
 ## 0.4.5 — explicit Retain reclaim and security isolation (26 October 2026)
