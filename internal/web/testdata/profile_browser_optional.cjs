@@ -1946,6 +1946,14 @@ async function checkStorageRegistrationPayloads(context) {
   // never a backend path.
   drawer = await openNew();
   await drawer.locator("#storage-kind").selectOption("pvc.create.bound");
+  const boundFieldOrder = await page.evaluate(() => {
+    const grid = document.querySelector("#storage-registration-template-field").parentElement;
+    const fields = [...grid.children];
+    return ["storage-registration-template-field", "storage-class-field", "storage-bound-pv-field"]
+      .map(id => fields.indexOf(document.getElementById(id)));
+  });
+  assert.ok(boundFieldOrder[0] < boundFieldOrder[1] && boundFieldOrder[1] < boundFieldOrder[2],
+    "the bound claim asks for its template and fixed class before the selected PV");
   await drawer.locator("#storage-registration-template").selectOption("nfs-template");
   await drawer.locator('#storage-form [name="namespace"]').selectOption("team-alpha");
   await drawer.locator('#storage-claim-name').fill("browser-bound-claim");

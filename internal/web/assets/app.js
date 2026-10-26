@@ -1982,8 +1982,27 @@
     fillSelect($("#container-selector"), names, "Select the exact named container");
     if (names.length === 1) $("#container-selector").value = names[0];
   }
+  // A bound claim chooses the registration template before the volume: the
+  // template fixes the class and narrows the compatible PV list. Keep the
+  // original order for every other storage action.
+  function syncStorageFieldOrder(kind) {
+    const registration = $("#storage-registration-template-field");
+    const selected = $("#storage-bound-pv-field");
+    const classField = $("#storage-class-field");
+    if (!registration || !selected || !classField) return;
+    const grid = registration.parentElement;
+    if (!grid || typeof grid.insertBefore !== "function") return;
+    if (kind === "pvc.create.bound") {
+      if (registration.nextElementSibling !== classField) grid.insertBefore(registration, classField);
+      if (classField.nextElementSibling !== selected) grid.insertBefore(selected, classField.nextElementSibling);
+    } else {
+      if (selected.nextElementSibling !== classField) grid.insertBefore(selected, classField);
+      if (classField.nextElementSibling !== registration) grid.insertBefore(registration, classField.nextElementSibling);
+    }
+  }
   function storageFields() {
     const kind = $("#storage-kind").value;
+    syncStorageFieldOrder(kind);
     $$('[data-storage]').forEach(label => { const visible = label.dataset.storage.split(" ").includes(kind); label.hidden = !visible; $$("input,select", label).forEach(input => { input.disabled = !visible; }); });
     const legacy = $("#storage-template").selectedOptions?.[0];
     const registrationSelect = $("#storage-registration-template");
