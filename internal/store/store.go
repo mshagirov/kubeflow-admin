@@ -1530,29 +1530,6 @@ func (s *Store) OperationForKey(ctx context.Context, actor, key, planID string) 
 	return decodeOperation(b)
 }
 
-// profile_reconcile.go holds the offline reconciliation of an uncertain
-// Profile deletion.
-//
-// A Profile deletion that reached an ambiguous outcome keeps its Profile and
-// namespace locks until an administrator resolves it. This file implements
-// the only supported resolution: an offline, read-only reconciliation that
-// derives a terminal outcome from evidence the application already recorded,
-// and from the operator's own observations of the cluster.
-//
-// The rules are deliberately narrow:
-//
-//   - Only a needs-review profile.delete operation that still holds both of
-//     its locks can be reconciled. Nothing else is reachable from here.
-//   - The cluster is only ever read. The reconciliation itself performs no
-//     cluster write of any kind; the caller supplies the observations.
-//   - Two derived outcomes exist and no more. Either the deletion is proven
-//     complete, or it is proven that no deletion request was ever issued.
-//   - An operation whose delete request may have been issued is never
-//     cancelled, no matter what the cluster currently shows. Such an
-//     operation needs the operator's own review and the normal cleanup path.
-//   - A normal Finish can never resolve an uncertain operation. The
-//     reconciliation has its own private transition rule.
-
 // ErrReconcileUnsupported reports that an offline reconciliation cannot be
 // derived from the available evidence. It never unlocks anything and never
 // changes durable state.

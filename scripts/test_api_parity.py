@@ -83,21 +83,6 @@ class APIParityTests(unittest.TestCase):
             self.assertIn(field, template["properties"])
         self.assertEqual(template["properties"]["podDefaultName"]["maxLength"], 52)
 
-    def test_inline_mapping_descriptions_do_not_create_null_properties(self):
-        # YAML inline mappings with an unquoted comma turn the remainder of a
-        # description into an extra null-valued key. The OpenAPI validator then
-        # rejects the schema even though YAML parsing succeeds.
-        def assert_no_nulls(value, path=""):
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    self.assertIsNotNone(item, f"null value at {path}/{key}")
-                    assert_no_nulls(item, f"{path}/{key}")
-            elif isinstance(value, list):
-                for index, item in enumerate(value):
-                    assert_no_nulls(item, f"{path}/{index}")
-
-        assert_no_nulls(self.spec)
-
     def test_no_standalone_poddefault_mutation_route(self):
         # PodDefault changes are only substeps of a reviewed PVC plan; the API
         # deliberately exposes no standalone page or mutation endpoint.

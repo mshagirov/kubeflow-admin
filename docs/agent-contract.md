@@ -1,54 +1,42 @@
 # Implementation boundaries
 
-Module `kubeflow-admin`, Go 1.26+, stdlib net/http router. Shared types in internal/model and internal/config; do not change them without coordinating. Each agent owns its files. Do not edit go.mod/go.sum (lead owns dependency resolution).
+The module is `kubeflow-admin`, using Go and the standard `net/http` router. See [go.mod](../go.mod) for the language minimum and [verification](verification.md) for the supported build/check procedure. Function signatures and schema definitions in source are authoritative.
 
-* Kubernetes agent owns internal/kube. Export `New(config.Config) (*Service,error)`, `Check(context.Context) error`, `Inventory(context.Context) (model.Inventory,error)`, `Prepare(context.Context,model.Action) (model.Prepared,error)`, `Execute(context.Context,model.Prepared,func(string)error) error`. Tests may inject clients by exported Service fields or a helper. Prepare validates and dry-runs; Execute revalidates, checks preview evidence, checkpoints BEFORE every write and waits for real observed convergence. No complete notebook manifests in Prepared.Data. Separately gated, conditional `profile.delete`, `pv.delete` and `pvc.delete` may delete their reviewed objects. Storage deletion is unused-only; no Namespace DELETE, force-finalizer cleanup or strategic-merge CRD patches.
-* Auth agent owns internal/auth. Export `New(context.Context,config.Config,*store.Store) (*Auth,error)`, `(*Auth).Middleware(http.Handler) http.Handler`, `Login/Callback/Logout(http.ResponseWriter,*http.Request)`, `Identity(context.Context) (model.Identity,bool)`. Middleware authenticates all protected routes and enforces same-origin plus CSRF on unsafe methods (`X-CSRF-Token` or form `csrf`). Sessions <=15 minutes, no raw token storage, ignore forwarded identity headers. `Identity.SessionID` is the server-only hashed session key (`json:"-"`); never expose it to browsers or persist it in plans/operations/audit. `auth.ValidateSession(ctx,cfg,store,actor)` checks the persisted session, issuer/subject, timestamps and current local authorization; workers must use it before execution and each write checkpoint, not cached claims. Authentication traffic periodically invokes `Store.CleanupAuth`, which deletes only expired authentication records. Store interface below.
-* Web agent owns internal/web. Export `New(config.Config,*auth.Auth,*kube.Service,*operations.Manager,*store.Store) http.Handler`. Embedded server-rendered UI and local static JS/CSS, no CDN. All auth/UI/API route registration here; public health/login/callback/static; protected everything else. API actions use plans then operations. Tests required.
-* Deployment agent owns deploy/, scripts/, README.md, docs/deployment.md, docs/operations.md, Dockerfile, .dockerignore, Makefile, .github/, api/. Match actual config structs. No cluster commands may be executed. Produce read-only discovery script, reduced read-only RBAC base and optional mutation/static/expand RBAC overlays, including the independently opt-in `deploy/overlays/profile-deletion/`, deployment instructions, HTTPS Istio route example on dedicated host, SQLite suitable-filesystem warning. Lead owns final plan and build outputs.
-* Lead owns config/model, internal/store, internal/operations, cmd/, final plan and integration.
+## Package responsibilities
 
-Store API (thread-safe SQLite): `Open(path string)(*Store,error)`, `Close()error`, `Ping(context.Context)error`, `Put(ctx,bucket,key string,value any)error`, `Get(ctx,bucket,key string,out any)error`, `Delete(ctx,bucket,key string)error`, `List(ctx,bucket string,limit int)([]json.RawMessage,error)`, `Take(ctx,bucket,key string,out any)error` atomically reads+deletes (login attempt), `CreateOperation(ctx,op model.Operation,plan model.Plan,idempotencyKey string)(model.Operation,bool,error)` atomically claims plan/key/target. Missing records return store.ErrNotFound. JSON data only; no access tokens. Store.List newest first.
+| Path | Responsibility |
+| --- | --- |
+| `internal/config`, `internal/model` | Strict configuration, shared typed actions, plans and operation records |
+| `internal/kube` | Inventory, policy validation, dry runs, fresh evidence checks, conditional mutations and observed convergence |
+| `internal/auth` | OIDC, short-lived sessions, local authorization, same-origin and CSRF checks |
+| `internal/store` | SQLite ownership, transactional acceptance/checkpoints/outcomes, locks, immutable evidence and retention |
+| `internal/operations` | Server-owned previews, idempotent submission, sequential worker, checkpoint authorization and recovery |
+| `internal/web` | Routes, embedded UI/assets, safe projections and API responses |
+| `cmd/kubeflow-admin` | Startup, shutdown, database ownership check and offline Profile reconciliation |
+| `deploy`, `scripts`, `api` | Minimal RBAC, optional grants, offline checks and OpenAPI contract |
 
-Manager API: `New(ctx context.Context,cfg config.Config,s *store.Store,k Backend)(*Manager,error)` (`Backend` is structurally implemented by `*kube.Service` with Prepare/Execute), `Plan(ctx context.Context,actor model.Identity,a model.Action)(model.Plan,error)`, `Submit(ctx context.Context,actor model.Identity,planID,key string)(model.Operation,error)`, `Get(ctx,id string)(model.Operation,error)`, `List(ctx)([]model.Operation,error)`, `Audit(ctx)([]model.Audit,error)`, `Close()`. Recovered incomplete operations become needs-review (never replayed), retaining their target locks pending explicit reconciliation. One sequential worker; one manager lease and one lifetime process file lock per database. Plan TTL 5 minutes, server-owned plan and actor binding. Shutdown durably accounts for accepted queued work without executing it. Accepted, checkpoint, and outcome records each commit transactionally with immutable audit records including the accepted reason and safe field changes. UI/API can use store list only for additional views.
+## Authentication and execution
 
-Profile workflow amendment: `profile.update` changes quotas only; it requires the exact unchanged owner and an identity-bound canonical `baseConfigDigest` from the observed Profile. `profile.delete` additionally requires `features.profileDeletion`, an exact raw `confirmName` and a reason. It deletes only the reviewed Profile with UID/resourceVersion preconditions, then waits for both the Profile and its owned namespace to disappear. Store acceptance atomically fences `namespace:<name>` in both directions against other mutations there; ordinary mutations do not acquire an exclusive namespace lock. `needs-review` retains the Profile and namespace locks. There is no namespace-delete action or force-finalizer cleanup.
+- Authenticate protected routes; ignore forwarded identity headers. Unsafe methods require same-origin and CSRF validation. Sessions last at most 15 minutes; do not store raw access tokens.
+- `Identity.SessionID` is a server-only hashed key, excluded from JSON and durable plans/operations/audit. Workers revalidate the persisted session and current local authorization before execution and every write checkpoint.
+- Previews are server-owned, actor-bound and expire after five minutes. Dry runs do not prove generated-Pod admission or controller/storage convergence.
+- Revalidate exact object identities and relevant evidence before each conditional write. Persist checkpoints before writes and mutation receipts before subsequent writes; wait for workflow-specific convergence.
+- Propagate errors with safe messages. Never log credentials, full manifests, backend paths/handles or sensitive diffs. Do not provide a development authentication bypass, arbitrary Kubernetes proxy or unrestricted manifests/deletion.
 
-Storage management amendment: `StorageDocument` provides only a restricted editable
-PV/PVC YAML projection and fresh UID/resourceVersion, never backend source details.
-`pv.edit`/`pvc.edit` require `features.storageEditing`; `pv.delete`/`pvc.delete`
-require `features.storageDeletion`, exact `confirmName` and a reason. All require
-writes, explicit target UID/resourceVersion and policy validation. YAML changes
-are allowlisted (console-owned labels, PV reclaim policy, upward-only PVC request
-with existing expansion gates); hidden fields are preserved. StorageClasses stay
-read-only. PV mutation is limited to approved unclaimed Available resources,
-except the bounded post-delete reclaim below; PVC deletion refuses observed
-Pod/Notebook references. Retain stays Released by default. Only with the separate
-`pvReclaim` feature, explicit `confirmPVReclaim`, isolated-class attestation and
-separate patch grant does deletion remove the stale claimRef (back to Available)
-after the PVC is gone, with any reclaim
-failure reported as needs-review, never rolled back. No force/finalizer cleanup
-or replay is permitted. Separate observations do not atomically fence
-external workloads/binders; admission and operator coordination remain necessary.
+## Persistence and recovery
 
-`pv.reclaim` explicitly reclaims an already-Released Retain PV without deleting
-any resource. It uses the same default-off `pvReclaim`/class-isolation controls
-and separate patch grant. A reason, exact typed PV name and reviewed UID/RV are
-required; the old claim must already be absent. Replacement, referencing and
-unbound matching claims block reclaim. The final PV resourceVersion must still
-match the reviewed one. Only stale claimRef is removed, never status or backend
-fields; Available must be observed and receipted. Any uncertain patch outcome
-retains the PV lock with typed needs-review/recovery guidance and no replay.
+One lifetime process file lock, one manager lease and one sequential worker own a database. [Database requirements](database.md) define supported filesystems, journal modes and private permissions.
 
-`pvc.delete` acceptance also takes an exclusive `namespace:<name>` fence against
-other app mutations, retained on needs-review alongside the PVC target lock.
-Bound-PV and namespace/Profile dependencies contribute digested evidence; raw
-backend source fields are neither persisted nor exposed. Explicit YAML
-`metadata.labels: {}` removes console labels, omitted/null preserves them, and
-unrelated labels remain untouched.
+Acceptance atomically records the plan/key claim, operation, audit evidence and derived target/dependency locks. `Targets` and storage dependency validation in `internal/store` are authoritative: operations can lock related PVs, PVCs, PodDefaults and Notebook dependencies, not only the primary resource. Profile deletion and PVC deletion take an exclusive namespace fence against other app mutations. These locks do not constrain external Kubernetes writers.
 
-Additional store APIs: `CleanupAuth(context.Context,time.Time) error`, `CleanupPlans(context.Context,time.Time) error`, `CheckIntegrity(context.Context) error`, `Checkpoint(context.Context,model.Operation,model.Audit) error`, `Finish(context.Context,model.Operation,model.Audit) error`, `IncompleteOperations(context.Context)([]model.Operation,error)`, `OperationForKey(ctx,actor,key,planID)(model.Operation,error)`, `AcquireWorker() bool`, `ReleaseWorker()`. `PrimaryTarget(model.Action) string` and `Targets(model.Plan) []string` derive lock identities from the server-owned action; only static create/reserve actions acquire a secondary PV lock. Manager previews periodically clean expired or malformed plans, never operations, audit or idempotency claims. Startup integrity failures are typed `ErrIntegrity`/`IntegrityError`, fail closed and never synthesize audit or release locks. `Open` uses WAL/FULL; `OpenWithJournal(path,"delete",allowUnverified)` uses DELETE/EXTRA and requires the explicit opt-in for BeeGFS or unrecognized filesystems (see database.md). overlayfs is accepted for development but reported unverified, not proven persistent. NFS/SMB/FUSE/tmpfs/Lustre/CephFS/GPFS/OCFS2 are always rejected. Open holds a private `.lock` file with nonblocking exclusive flock until idempotent Close; the process sets `umask 0077`. A needs-review outcome preserves all PVC/PV/object locks. Do not manually edit lock rows. Separate bounded History retention may prune presentation audit events and terminal operation rows; immutable acceptance evidence, claims and idempotency tombstones are retained (see history.md).
+Startup converts incomplete work to `needs-review` without replay and retains locks. Integrity failures refuse startup rather than fabricating evidence or unlocking. Shutdown accounts durably for accepted queued work. Missing mutation receipts do not prove no write occurred. [History retention](history.md) distinguishes prunable presentation records from retained acceptance evidence and idempotency tombstones.
 
-All packages must propagate errors. No development auth bypass, no wildcard RBAC, no user manifests/raw Kubernetes proxy, no sensitive logs/diffs. HTTP failures must be safe. Live deployment/testing remains user's responsibility; local fake-client tests are not evidence of controller/storage convergence.
+Only [offline Profile-deletion reconciliation](operations.md#offline-reconciliation-of-a-profile-deletion) can resolve its supported uncertain outcome. It defaults to dry-run, requires a stopped app and immutable cluster/object evidence, and performs Kubernetes reads only. There is no generic unlock, replay or HTTP recovery endpoint.
 
-Offline Profile deletion recovery uses `PlanProfileDeleteReconciliation`, `DeriveProfileDeleteOutcome` and `ReconcileProfileDelete`; see their typed plan/observation/request records in `internal/store`. The CLI mode is `-reconcile-profile-delete OPERATION_ID -confirm-profile NAME -reason TEXT`, dry-run by default, with `-apply` required to record the derived outcome. It requires the app to be stopped, verifies immutable cluster/object identities using GETs only, and can resolve only a needs-review Profile deletion. See [the operator procedure](operations.md#offline-reconciliation-of-a-profile-deletion); there is no generic unlock or HTTP recovery endpoint.
+## Mutation contracts
+
+- **Profiles:** updates change quotas only, with unchanged owner and identity-bound `baseConfigDigest`. Deletion requires its separate flag, reason and exact raw confirmation; conditionally delete the reviewed Profile and observe it and its owned namespace disappear. Never directly delete Namespaces or remove finalizers.
+- **Storage:** restricted YAML permits console labels, PV reclaim policy and gated upward-only PVC growth. Unused-only deletion requires exact identity and confirmation. Reclaim only clears an eligible stale claimRef under separate isolation/permission gates; it never wipes backend data. PodDefaults exist only as reviewed PVC substeps. Preserve partial outcomes without rollback or replay. See [storage contracts](storage.md).
+- **Notebooks/Pods/Nodes:** honor the verified Notebook controller contract, protected mounts, approved images/GPU presets and quota checks. Pod restart uses guarded eviction, never forced deletion. Node cordon changes scheduling only. See [compatibility](compatibility.md), [Pods](pods.md) and [Nodes](nodes.md).
+
+Keep [OpenAPI](../api/openapi.yaml), configuration, UI and deployment grants aligned. Use focused local tests and the release checks; fake clients and browser fixtures cannot prove live controller, admission, storage or network behavior.

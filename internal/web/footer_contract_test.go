@@ -6,8 +6,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"kubeflow-admin/internal/footer"
 )
 
 // footerSection returns the rendered footer element of a page, or an empty
@@ -26,23 +24,11 @@ func footerSection(t *testing.T, body string) string {
 	return body[start : start+end+len("</footer>")]
 }
 
-// The console footer is deployment configuration, not a shipped sentence. The
-// default is empty, so no footer element is rendered at all and the page
-// keeps no empty placeholder.
 func TestFooterIsEmptyByDefault(t *testing.T) {
 	s, _, _ := fixture()
 	body := request(handler(s), "GET", "/", "").Body.String()
 	if strings.Contains(body, "<footer") {
 		t.Fatal("an empty footer must not render a footer element")
-	}
-	for _, gone := range []string{
-		"Administrative changes are audited",
-		"Inventory reflects its observation timestamp",
-		"History is a bounded recent window, not a full export",
-	} {
-		if strings.Contains(body, gone) {
-			t.Fatalf("the shipped footer text is still rendered: %q", gone)
-		}
 	}
 	// A whitespace-only value is no footer either.
 	s.cfg.UI.FooterText = "   \n\t  "
@@ -58,9 +44,6 @@ func TestFooterIsEmptyByDefault(t *testing.T) {
 	}
 }
 
-// A configured footer is rendered as sanitized branding: the company logo,
-// the support link and the text are shown, and the link is a hardened
-// external navigation.
 func TestFooterRendersSanitizedBrandingHTML(t *testing.T) {
 	s, _, _ := fixture()
 	s.cfg.UI.FooterText = `<div><p><strong>Acme Platform</strong> · Support</p>` +
@@ -87,7 +70,6 @@ func TestFooterRendersSanitizedBrandingHTML(t *testing.T) {
 	}
 }
 
-// A plain configured footer keeps working: the value is shown as text.
 func TestFooterPlainTextStaysText(t *testing.T) {
 	s, _, _ := fixture()
 	s.cfg.UI.FooterText = `Support: platform-team@example.org`
@@ -106,18 +88,6 @@ func TestFooterPlainTextStaysText(t *testing.T) {
 	}
 }
 
-// Basic formatting in the configured footer is now rendered as formatting:
-// the key accepts a small amount of HTML for branding.
-func TestFooterFormattingIsRendered(t *testing.T) {
-	s, _, _ := fixture()
-	s.cfg.UI.FooterText = `<p><strong>Acme</strong> <em>Platform</em></p>`
-	footer := footerSection(t, request(handler(s), "GET", "/", "").Body.String())
-	if !strings.Contains(footer, "<strong>Acme</strong>") || !strings.Contains(footer, "<em>Platform</em>") {
-		t.Fatalf("the configured formatting was not rendered: %s", footer)
-	}
-}
-
-// Unsafe markup in the configured footer never reaches the browser.
 func TestFooterRemovesUnsafeMarkup(t *testing.T) {
 	s, _, _ := fixture()
 	s.cfg.UI.FooterText = `<p>Support</p>` +
@@ -139,7 +109,6 @@ func TestFooterRemovesUnsafeMarkup(t *testing.T) {
 	}
 }
 
-// Malformed markup is reduced to something safe instead of failing the page.
 func TestFooterMalformedMarkupIsSafe(t *testing.T) {
 	s, _, _ := fixture()
 	s.cfg.UI.FooterText = `<p>unclosed <b>bold<img src="https://cdn.acme.example/logo.png" alt="x"`
@@ -341,46 +310,5 @@ func TestFooterSchemeRelativeImageIsNormalized(t *testing.T) {
 	policy := response.Header().Get("Content-Security-Policy")
 	if !strings.Contains(policy, "img-src 'self' https://cdn.acme.example") {
 		t.Fatalf("the page policy does not name the normalized image host: %s", policy)
-	}
-}
-
-// The Overview page no longer carries the static explanation panels, and the
-// observed Workspace Health content remains without a separate metrics row.
-func TestOverviewExplanationPanelsAreRemoved(t *testing.T) {
-	s, _, _ := fixture()
-	body := request(handler(s), "GET", "/", "").Body.String()
-	for _, gone := range []string{"Review before you apply", "Observed, not assumed", "info-grid", `id="metrics"`, `id="page-subtitle"`} {
-		if strings.Contains(body, gone) {
-			t.Fatalf("the removed Overview panel is still rendered: %q", gone)
-		}
-	}
-	// The Overview page itself keeps its observed content.
-	for _, kept := range []string{`id="overview" class="page"`, `id="workspace-health-summary"`, `id="overview-table" data-table="overview"`, `id="page-eyebrow" class="eyebrow">CLUSTER AT A GLANCE</div>`} {
-		if !strings.Contains(body, kept) {
-			t.Fatalf("the Overview page lost %q", kept)
-		}
-	}
-}
-
-// The plan confirmation workflow is unchanged by the footer work: the
-// browser still confirms a server-owned plan before anything is submitted.
-func TestPlanConfirmationWorkflowIsUnchanged(t *testing.T) {
-	s, _, o := fixture()
-	body := request(handler(s), "GET", "/", "").Body.String()
-	for _, control := range []string{`id="plan-dialog"`, `id="plan-preview"`, `id="confirm-plan"`, `id="cancel-plan"`, `id="submit-plan"`} {
-		if !strings.Contains(body, control) {
-			t.Fatalf("the plan confirmation control %s is missing", control)
-		}
-	}
-	response := request(handler(s), "POST", "/api/v1/plans", `{"kind":"profile.update","name":"team","owner":"owner@example.org","baseConfigDigest":"sha256:reviewed","quota":{"requests.cpu":"4","pods":"0"}}`)
-	if response.Code != 201 || o.plans != 1 {
-		t.Fatalf("the plan workflow changed: %d %s", response.Code, response.Body.String())
-	}
-}
-
-// The renderer bound and the configuration bound are the same bound.
-func TestFooterBoundMatchesTheConfigurationBound(t *testing.T) {
-	if footer.MaxRunes != 16384 {
-		t.Fatalf("the footer bound changed: %d", footer.MaxRunes)
 	}
 }

@@ -21,9 +21,9 @@ import (
 
 const podRestartReasonLimit = 500
 
-// preparePodRestart validates the narrow first-release contract: a running Pod
-// controlled by one StatefulSet, itself controlled by a running Notebook in the
-// same Profile namespace. It never evicts or mutates anything; the live Pod's
+// preparePodRestart validates a running Pod controlled by one StatefulSet,
+// itself controlled by a running Notebook in the same Profile namespace.
+// It never evicts or mutates anything; the live Pod's
 // current UID/resourceVersion become the eviction preconditions only in Execute.
 func (s *Service) preparePodRestart(ctx context.Context, a model.Action, w *work) error {
 	if !s.Config.Features.PodRestarts {

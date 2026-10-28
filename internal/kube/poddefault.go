@@ -1,20 +1,18 @@
 package kube
 
-// poddefault.go implements the one narrowly scoped custom-resource workflow of
-// this adapter: a dedicated PodDefault substep of PVC creation and the reviewed
-// cleanup of related PodDefaults during unused-only PVC deletion. There is no
-// standalone PodDefault route, action or browser editor.
+// PodDefaults are substeps of PVC creation and unused-only PVC deletion.
+// There is no standalone PodDefault route, action or browser editor.
 //
 // The object shape is fixed by the server:
 //   - one PersistentVolumeClaim volume and one matching volumeMount;
 //   - one selector label derived from the final PodDefault name;
-//   - a generated description and, on create, two provenance annotations;
+//   - a generated description and provenance annotations;
 //   - no env, Secret, container, service, additional PVC or unrelated setting.
 //
 // An existing object is only patched with an explicit overwrite acknowledgement
 // and an exact UID/resourceVersion precondition. The whole spec is replaced, so
 // removal of the previous selector/other PVC/injected settings is explicit in
-// the reviewed plan; metadata, ownerReferences and finalizers are preserved.
+// the reviewed plan; foreign metadata, ownerReferences and finalizers are preserved.
 
 import (
 	"context"

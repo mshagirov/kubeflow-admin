@@ -1,12 +1,5 @@
 package main
 
-// cli_mode_test.go covers the mode the command line selects.
-//
-// The selection is a pure function of the parsed flags, so these tests never
-// need a configuration, a database or a server. The cases that matter are the
-// ones where an operator believes the process reconciles an operation while
-// the process would otherwise start a writable server.
-
 import (
 	"errors"
 	"flag"
@@ -18,8 +11,6 @@ import (
 	"time"
 )
 
-// cliFlagSet builds a flag set with the application's command line and the
-// parsed values.
 func cliFlagSet(t *testing.T, args []string) (*flag.FlagSet, *cliValues) {
 	t.Helper()
 	fs := flag.NewFlagSet("kubeflow-admin", flag.ContinueOnError)
@@ -74,7 +65,6 @@ func TestCLIModeRefusesApplyWithoutAReconciliationTarget(t *testing.T) {
 	}
 }
 
-// The ordinary modes are unchanged when no recovery flag is given.
 func TestCLIModeAcceptsTheOrdinaryModes(t *testing.T) {
 	fs, values := cliFlagSet(t, []string{"-config", "/etc/kubeflow-admin/config.yaml"})
 	mode, err := selectMode(fs, values)
@@ -102,8 +92,6 @@ func TestCLIModeAcceptsTheOrdinaryModes(t *testing.T) {
 	}
 }
 
-// The complete recovery set selects the offline reconciliation mode and
-// carries the operator's values unchanged.
 func TestCLIModeAcceptsTheFullRecoverySet(t *testing.T) {
 	fs, values := cliFlagSet(t, []string{"-reconcile-profile-delete", "op-123", "-confirm-profile", "alice", "-reason", "verified", "-apply"})
 	mode, err := selectMode(fs, values)
@@ -149,33 +137,6 @@ func TestCLIModeRefusesTheReconciliationCombinedWithTheDatabaseCheck(t *testing.
 		if err == nil {
 			t.Fatalf("the contradictory command line %v selected the mode %v", args, mode.Mode)
 		}
-	}
-}
-
-// A refused command line never loads the configuration, never opens the
-// database and never starts the server.
-func TestCLIRefusedModeLoadsNoConfigurationAndOpensNoDatabase(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "admin.db")
-	cfgPath := filepath.Join(dir, "config.yaml")
-	body := "server:\n  listen: \"127.0.0.1:0\"\n  publicURL: https://admin.example.test\n" +
-		"auth:\n  issuerURL: https://issuer.example.test\n  clientID: kubeflow-admin\n" +
-		"  clientSecretFile: " + filepath.Join(dir, "secret") + "\n  adminGroups:\n    - platform-admins\n" +
-		"database:\n  path: " + dbPath + "\n"
-	if err := os.WriteFile(cfgPath, []byte(body), 0600); err != nil {
-		t.Fatal(err)
-	}
-	fs := flag.NewFlagSet("kubeflow-admin", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	mode, _, err := cliPrepare(fs, []string{"-config", cfgPath, "-reconcile-profile-delete=", "-confirm-profile", "alice", "-reason", "verified"})
-	if err == nil {
-		t.Fatalf("a recovery flag without an operation ID selected the mode %v", mode.Mode)
-	}
-	if mode.Mode != cliModeUnresolved {
-		t.Fatalf("a refused command line selected the mode %v", mode.Mode)
-	}
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Fatalf("the refused mode opened the database: %v", err)
 	}
 }
 

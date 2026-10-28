@@ -355,9 +355,7 @@
   function resourceKey(resource) {
     return [resource?.kind || "", resource?.namespace || "", resource?.name || ""].join("|");
   }
-  // Names are the visible handle for the kinds whose full observation belongs
-  // in the right-side details drawer. The separate Details control is removed
-  // for these tables (Profiles opens its consolidated summary instead).
+  // Resource names open the details drawer; Profiles use their consolidated summary.
   const nameDetailsKinds = new Set(["Notebook", "Pod", "Node", "PersistentVolume", "PersistentVolumeClaim", "StorageClass"]);
   const inlineDetailsKinds = new Set(["Profile", ...nameDetailsKinds]);
   function detailsButton(resource) {

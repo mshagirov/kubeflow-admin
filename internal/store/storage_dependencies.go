@@ -63,7 +63,7 @@ func supportsPodDefaultCreation(kind string) bool {
 	return false
 }
 
-// validatePodDefaultContract enforces the new typed fields before admission:
+// validatePodDefaultContract enforces the typed fields before admission:
 // a PodDefault request is accepted only on a PVC creation kind, a cleanup
 // acknowledgement only on the PVC deletion kind, and a cleanup acknowledgement
 // must carry a complete safe reviewed dependency list.
@@ -116,9 +116,7 @@ func validatePodDefaultContract(p model.Prepared) error {
 // field in safe prepared evidence. It rejects duplicate canonical keys,
 // malformed documents and every known cleanup-shaped noncanonical alias,
 // wrapper or case variant. Unknown top-level fields written by the server stay
-// allowed. There is intentionally no alias, wrapper or case-insensitive form:
-// cleanup evidence has never shipped, so a loose parser would only invent
-// ambiguous new surface.
+// allowed. Aliases, wrappers and case variants are rejected as ambiguous.
 func scanPodDefaultEvidence(data json.RawMessage) (value json.RawMessage, canonical, noncanonical bool, err error) {
 	if len(data) == 0 {
 		return nil, false, false, nil
@@ -166,9 +164,8 @@ func scanPodDefaultEvidence(data json.RawMessage) (value json.RawMessage, canoni
 	return value, canonical, noncanonical, nil
 }
 
-// cleanupShapedKey recognizes the bounded set of previously speculative keys.
-// None of them ever shipped, so a present key is always refused rather than
-// silently ignored.
+// cleanupShapedKey recognizes noncanonical cleanup keys that must be rejected
+// rather than silently ignored.
 func cleanupShapedKey(key string) bool {
 	switch strings.ToLower(key) {
 	case "poddefaults", "poddefaultdependencies", "poddefaultnames", "poddefaultcleanuptargets", "poddefaultcleanup":
@@ -468,7 +465,7 @@ func validatePVCreateStatic(a model.Action) error {
 	return nil
 }
 
-// validatePVCCreateBound enforces the new bound-claim contract: an explicit
+// validatePVCCreateBound enforces the bound-claim contract: an explicit
 // namespace, a new claim name, one valid selected PV and the selected PV's
 // reviewed UID/resourceVersion. The legacy dynamic and combined actions are not
 // changed by this validator.

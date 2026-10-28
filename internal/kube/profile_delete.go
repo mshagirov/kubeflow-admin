@@ -1,8 +1,5 @@
 package kube
 
-// profile_delete.go implements the typed Profile deletion action this console
-// exposes.
-//
 // The path is deliberately narrow. It deletes exactly one Profile object with
 // UID and resourceVersion preconditions and Background propagation (the
 // kubectl default). It never deletes a namespace, never deletes or edits a
@@ -11,9 +8,8 @@ package kube
 // what to remove: the cleanup belongs to the Profile controller and the
 // Kubernetes garbage collector.
 //
-// The specialized path is dispatched from Service.Prepare and Service.Execute
-// in prepare.go, next to the other specialized kinds. It is separate from the
-// generic Prepare/Execute because the generic preview compare cannot express
+// The specialized path is dispatched from Service.Prepare and Service.Execute.
+// It is separate from the generic path because the preview compare cannot express
 // "one Profile object plus the namespace it owns" and must never be allowed
 // to widen into a namespace or volume delete.
 

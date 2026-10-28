@@ -335,11 +335,6 @@ func auditUsage(ctx context.Context, tx *sql.Tx) (int, int64, error) {
 	return count, bytes, err
 }
 
-// compactAndRedactOperations processes one bounded batch of old completed
-// operations. It keeps the compact retry tombstone and claim, but removes the
-// accepted reason/diff from the ledger because that full immutable copy is no
-// longer needed once the operation is terminal. Active/needs-review claims are
-// never selected.
 // cleanupOperations processes one bounded batch from the indexed compaction
 // queue. It never scans a compacted prefix and never touches an active or
 // needs-review claim. Invalid rows fail closed for that row while other valid

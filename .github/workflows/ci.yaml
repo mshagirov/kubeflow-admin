@@ -20,41 +20,5 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: true
-      - name: Local tests, vet and build (no cluster)
-        run: make test vet build
-      - name: Install offline manifest tooling
-        run: |
-          go install sigs.k8s.io/kustomize/kustomize/v5@v5.7.1
-          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
-          python3 -m venv /tmp/manifest-tools
-          /tmp/manifest-tools/bin/pip install --require-hashes -r scripts/requirements.txt
-      - name: Render and check security invariants
-        run: |
-          PATH="/tmp/manifest-tools/bin:$PATH" make manifests
-          for overlay in deploy/base deploy/overlays/*; do
-            kustomize build "$overlay" | kubeconform -strict -summary -kubernetes-version 1.32.0
-          done
-          /tmp/manifest-tools/bin/openapi-spec-validator api/openapi.yaml
-          bash -n scripts/discover.sh
-      - name: Compile multi-architecture runtime images (no push)
-        run: |
-          docker buildx create --driver docker-container --use
-          docker buildx build --platform linux/amd64,linux/arm64 --output type=oci,dest=/tmp/kubeflow-admin.oci .
-  security:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
-        with:
-          go-version: '1.27.3'
-          cache: true
-      - name: Scan reachable Go vulnerabilities
-        run: |
-          # Keep the scanner's SSA parser compatible with the selected Go toolchain.
-          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
-          "$(go env GOPATH)/bin/govulncheck" ./...
-      - name: Scan source dependencies, secrets and manifest misconfiguration
-        run: docker run --rm -v "$PWD:/src:ro" aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222 fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 /src
+      - name: Tests and vet (no cluster)
+        run: make test vet

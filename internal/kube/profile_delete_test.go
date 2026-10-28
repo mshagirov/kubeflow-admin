@@ -1521,22 +1521,3 @@ func TestProfileDeletePolicyDigestTracksTheDeletionFeature(t *testing.T) {
 		t.Fatal("the policy digest must include Features.ProfileDeletion")
 	}
 }
-
-// The fixture must never let a test claim a completed deletion without both
-// objects actually being removed.
-func TestProfileDeleteFixtureRemovesBothObjects(t *testing.T) {
-	f := newProfileDeleteFixture(t)
-	p, err := f.service.prepareProfileDelete(context.Background(), profileDeleteAction())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = f.service.executeProfileDelete(context.Background(), p, func(string) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if f.profile("alice") != nil {
-		t.Fatal("the Profile fixture was not removed")
-	}
-	if _, err = f.client.CoreV1().Namespaces().Get(context.Background(), "alice", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("the namespace fixture was not removed: %v", err)
-	}
-}

@@ -73,10 +73,9 @@ type pageFeatures struct {
 	StorageEditing  bool
 	StorageDeletion bool
 	PVReclaim       bool
-	// PodDefaults is the separate opt-in for the optional PodDefault that can
-	// accompany a PVC-from-existing-PV creation and for reviewed PodDefault
-	// cleanup during PVC deletion. It is never implied by WritesEnabled,
-	// StaticStorage or the storage editing/deletion opt-ins.
+	// PodDefaults is the separate opt-in for optional PodDefaults during dynamic
+	// or bound PVC creation and reviewed cleanup during PVC deletion.
+	// It is never implied by WritesEnabled, StaticStorage or storage editing/deletion.
 	PodDefaults bool
 }
 type pageNotebooks struct {

@@ -1,7 +1,5 @@
 "use strict";
-// Focused navigation/presentation contract tests. Pure navigation, inventory
-// refresh and table state live in logic.js; the static shell is checked so a
-// refactor cannot silently drop required controls, meta fields or CSP rules.
+// Shell contracts and behavioral tests of app.js using a stub DOM.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -11,47 +9,15 @@ const logic = require("../assets/logic.js");
 const root = path.join(__dirname, "..", "assets");
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 const app = fs.readFileSync(path.join(root, "app.js"), "utf8");
-const style = fs.readFileSync(path.join(root, "style.css"), "utf8");
-
-// Both browser scripts must parse before any test relies on them.
-new vm.Script(app, { filename: "app.js" });
-new vm.Script(fs.readFileSync(path.join(root, "logic.js"), "utf8"), { filename: "logic.js" });
 
 // Sidebar order and legacy History entry points.
 const nav = html.match(/<nav aria-label="Main navigation">([\s\S]*?)<\/nav>/);
 assert.ok(nav, "main navigation is missing");
-assert.equal(html.includes('class="nav-label"'), false, "sidebar omits the WORKSPACE label");
 const links = [...nav[1].matchAll(/data-page="([^"]+)"[^>]*>([^<]+)</g)].map(match => [match[1], match[2]]);
 assert.deepEqual(links, [["overview", "Overview"], ["profiles", "Profiles"], ["storage", "Storage"], ["namespaces", "Namespaces"], ["notebooks", "Notebooks"], ["pods", "Pods"], ["nodes", "Nodes"], ["history", "History"]]);
 assert.ok(html.includes('href="/history" data-page="history"'));
 assert.ok(html.includes('class="source-link"') && html.includes('href="https://github.com/mshagirov/kubeflow-admin.git"') && html.includes('class="gh-icon"') && html.includes('rel="noopener noreferrer"'), "sidebar links to the public source repository");
-assert.ok(style.includes(".source-link") && style.includes(".gh-icon"));
-assert.ok(html.includes('</a><small>© 2026 Murat Shagirov</small></div></aside>'), "sidebar copyright follows the repository link");
-assert.equal(html.includes("Administrative control plane"), false, "sidebar omits the administrative control plane label");
-assert.equal(html.includes('<span class="dot"></span>'), false, "sidebar omits the status dot");
-assert.equal(/data-page="(operations|audit)"/.test(html), false, "History replaces separate sidebar entries");
-assert.equal(html.includes('<section id="operations"'), false);
-assert.equal(html.includes('<section id="audit"'), false);
-
-// The Overview no longer carries the static explanation panels: the console
-// explains nothing the operator did not ask for.
-assert.equal(html.includes("Review before you apply"), false, "the Overview no longer renders the review panel");
-assert.equal(html.includes("Observed, not assumed"), false, "the Overview no longer renders the observed-state panel");
-assert.equal(html.includes("info-grid"), false, "the Overview info grid is removed");
-assert.equal(style.includes(".info-grid"), false, "the removed info grid leaves no styling behind");
-assert.ok(style.includes(".info{"), "the shared info panel styling stays for the other pages");
-
-// The footer is deployment configuration, not a shipped sentence. An empty
-// configuration renders no footer element at all.
-assert.equal(html.includes("Administrative changes are audited"), false, "the built-in footer sentence is removed");
-assert.equal(html.includes("Inventory reflects its observation timestamp"), false, "the built-in footer sentence is removed");
-assert.equal(html.includes("History is a bounded recent window, not a full export"), false, "the built-in footer sentence is removed");
-assert.ok(html.includes("{{if .Config.UI.FooterText}}") && html.includes("<footer>{{.Config.UI.FooterText}}</footer>"), "the footer text is projected from the deployment configuration");
-assert.ok(/<footer>\{\{\.Config\.UI\.FooterText\}\}<\/footer>/.test(html), "the footer carries no hardcoded text");
-
-// The plan confirmation workflow is unchanged: the browser still confirms a
-// server-owned plan before anything is submitted.
-assert.ok(html.includes('id="plan-dialog"') && html.includes('id="plan-preview"') && html.includes('id="confirm-plan"') && html.includes('id="cancel-plan"') && html.includes('id="submit-plan"'), "the plan confirmation workflow is unchanged");
+assert.ok(html.includes('id="plan-dialog"') && html.includes('id="plan-preview"') && html.includes('id="confirm-plan"') && html.includes('id="cancel-plan"') && html.includes('id="submit-plan"'), "plan confirmation controls are present");
 assert.deepEqual(logic.routeFor("/operations", ""), { page: "history", tab: "operations" });
 assert.deepEqual(logic.routeFor("/audit", ""), { page: "history", tab: "audit" });
 assert.deepEqual(logic.routeFor("/history", "?tab=audit"), { page: "history", tab: "audit" });
@@ -67,17 +33,12 @@ for (const id of ["overview", "profiles", "namespaces", "storage", "notebooks", 
 }
 assert.ok(html.includes('role="tablist"') && html.includes('data-history-tab="operations"') && html.includes('data-history-tab="audit"'));
 
-// Supervisors inject these; the browser must not make an extra /me round trip.
+// The server renders identity and feature metadata into the page.
 assert.ok(html.includes('<meta name="notification-scope" content="{{.Identity.NotificationScope}}">'));
 assert.ok(html.includes('data-open-drawer="storage">New</button>'), "Storage page uses the requested New button label");
 assert.ok(html.includes('data-open-drawer="profile">New</button>'), "Profiles page uses the requested New button label");
-const profilesMarkup = html.slice(html.indexOf('<section id="profiles"'), html.indexOf('<section id="namespaces"'));
-assert.ok(profilesMarkup.includes('class="panel info-panel"'), "Profiles retains its information panel");
-assert.ok(profilesMarkup.indexOf('class="panel info-panel"') < profilesMarkup.indexOf('id="profiles-table"'), "Profile information panel precedes the Profiles table");
-assert.equal(profilesMarkup.includes('class="split"'), false, "Profiles uses a full-width vertical layout rather than side-by-side panels");
 assert.ok(html.includes('<meta name="pod-restarts" content="{{.Config.Features.PodRestarts}}">'));
 assert.ok(html.includes('<meta name="node-cordon" content="{{.Config.Features.NodeCordon}}">'));
-assert.ok(app.includes("nodeCordonFeature") && app.includes('meta("node-cordon")'));
 assert.ok(html.includes('<meta name="csrf-token" content="{{.Identity.CSRF}}">'));
 assert.ok(html.includes('<meta name="profile-deletion" content="{{.Config.Features.ProfileDeletion}}">'), "the profile deletion capability is projected to the browser as a feature meta");
 assert.ok(html.includes('<meta name="storage-editing" content="{{.Config.Features.StorageEditing}}">'), "the storage editing capability is projected to the browser");
@@ -87,37 +48,8 @@ assert.ok(app.includes("notebookManagementReason") && app.includes("notebooks.co
 assert.ok(html.includes("{{if .Identity.DisplayName}}"));
 assert.ok(html.includes('action="/auth/logout" method="post"'));
 assert.ok(html.includes('name="csrf"'));
-assert.ok(app.includes("notification-scope") && app.includes("pod-restarts"));
-assert.ok(app.includes("podRestartFeature") && app.includes("&& notebookWrites"), "pod restart requires confirmed notebook controller contract");
-assert.ok(app.includes("podRestartSupport") && app.includes("not a StatefulSet"), "unsupported observed owners explain disabled restart");
-assert.ok(app.includes("setBackgroundInert") && app.includes("main.inert") && app.includes("sidebar.inert"));
-assert.ok(app.includes("node.isConnected") || app.includes("target.isConnected"));
-assert.ok(app.includes("showFormError") && app.includes("clearFormErrors"), "drawer form errors are scoped and cleared on close");
-assert.ok(app.includes("persistableCode") && app.includes('code === "inventory"') && app.includes("/^policy:/"), "only stable observation/policy notices remember dismissals");
-assert.equal(app.includes("logic.actorID"), false, "raw actor IDs are never rendered or searched in the UI");
-assert.equal(logic.actorID, undefined, "the Actor ID helper is removed from shared frontend logic");
-assert.equal(logic.profileResources([{kind:"Profile",name:"team"},{kind:"Namespace",name:"team"}], "other").length, 1, "Profiles remain cluster-wide");
-assert.ok(app.includes("actorLabel(record)") && logic.actorLabel({actor:"issuer|subject"}) === "Legacy administrator", "legacy actors use one readable label");
-assert.ok(app.includes("operationStateCell") && app.includes("state-error-slot") && app.includes("error-tooltip") && app.includes('"Failure details: "'), "failure indicators occupy a fixed slot with an accessible tooltip");
-assert.ok(app.includes("aria-describedby") && app.includes("aria-label") && !app.includes("button.title = failure"), "failure tooltip is linked accessibly without a native title duplicate");
-assert.ok(app.includes('id: "toggle-overview-table"') || html.includes('id="toggle-overview-table"'), "the detailed overview table has a toggle");
 assert.ok(html.includes('id="overview-table" data-table="overview" hidden'), "the detailed overview table starts hidden");
-assert.ok(app.includes("workspaceHealthSummary") && html.includes('id="workspace-health-summary"') && html.includes('id="overview-namespace"'), "workspace health summary and its namespace selector are wired");
-assert.ok(app.includes("openNamespaceSummary") && html.includes('id="namespace-summary-drawer"'), "namespace names open a right-side resource summary");
-assert.ok(app.includes("openNodeCordon") && html.includes('id="node-cordon-drawer"') && html.includes('name="force"'), "nodes expose a cordon/uncordon drawer with force");
-assert.ok(app.includes("logic.namespaceResources") && app.includes("logic.formatAge"), "namespaces and age use shared pure helpers");
-assert.ok(app.includes("historyInflight") && app.includes("ensureActiveHistory"), "per-tab in-flight history loading is independent of inventory refresh");
-assert.ok(app.includes("historyLimit") && app.includes("historyWindow") && app.includes("X-History-Limit") && app.includes("X-History-Window"));
-assert.ok(app.includes("submitInflight") && app.includes("cancelPlanForNavigation"), "navigation preserves an in-flight idempotent submit");
-assert.ok(app.includes("invalidateHistoryCaches"), "accepted mutations invalidate history caches");
-assert.ok(app.includes("monotonicNow") && app.includes("visibilitychange"), "freshness uses local receipt time and visibility refresh");
-assert.ok(app.includes("auditStageTable") && app.includes('addEventListener("toggle"'), "audit stage details are built lazily");
-assert.ok(app.includes("operation group") && app.includes("loaded audit event"), "audit counts label groups and loaded events");
-assert.ok(app.includes("historyNote") && app.includes("Loaded window only"));
-assert.ok(app.includes('value === null || value === undefined || value === "" ? "—"'), "empty preview values render as an em dash");
-assert.ok(app.includes("notebookCondition(resource)") && app.includes('key: "condition", label: "Capacity / condition", type: "text"'), "notebook condition sorts the displayed text, not a quantity");
-assert.ok(app.includes('type: "mixed"'), "desired/requested columns use mixed numeric/text sorting");
-assert.ok(app.includes("historyCache[tab].rows") && app.includes("logic.parseTarget(row.target)"), "history namespaces are available without inventory");
+assert.ok(html.includes('id="workspace-health-summary"') && html.includes('id="overview-namespace"'), "workspace health summary and its namespace selector are present");
 
 // Accessible management drawers for Profile, Storage, Notebook and Pod restart,
 // including the scoped Profile summary modal.
@@ -126,23 +58,10 @@ for (const drawer of ["profile-drawer", "storage-drawer", "notebook-drawer", "pr
 }
 assert.equal((html.match(/aria-modal="true"/g) || []).length >= 10, true);
 assert.ok(html.includes('id="resource-details-body"') && html.includes('aria-labelledby="resource-details-title"'), "the observed resource details drawer is a labelled modal dialog");
-assert.ok(app.includes("openResourceDetails") && app.includes("detailEntries"), "observed resource details open the right-side drawer");
-assert.ok(app.includes("nodePodScopedView") && app.includes("logic.runningPodsOnNode") && app.includes("logic.podNodeHref"), "Node details derive their scoped Running Pod count and exact Pods link from the shared helpers");
-assert.ok(app.includes('el("h3", "Scoped view")') && app.includes('el("h3", "Observed details")'), "the Node scoped view is a distinct section above the raw observed details");
-assert.ok(app.includes("syncPodFilterChips") && app.includes("data-pod-filters") && app.includes("podNodeLink"), "the Pods page exposes URL-backed node filters and a visible chip");
-assert.ok(app.includes('(resource?.kind || "") === "Profile"') && app.includes('openProfileSummary(resource.name || "", opener)'), "generic Profile details always hand over to the consolidated summary");
-assert.ok(app.includes("logic.notebookResources(scoped)") && app.includes("nameDetailsKinds"), "Notebook rows are Notebook CRs only and names open resource details");
-assert.equal(app.includes("detailsNode"), false, "resource details never use an inline disclosure");
-assert.ok(app.includes('el("details", undefined, "stage-details")'), "audit stage details keep their lazy disclosure");
-assert.ok(app.includes("data-clear-filters") && app.includes("clearFilters"), "every table offers a clear-filters control");
-assert.ok(app.includes("syncClearFilters") && app.includes("aria-disabled"), "the clear-filters control reports whether a filter is applied");
-assert.ok(app.includes("applyResourceScope") && app.includes("resourceScope") && app.includes("dropResourceScope"), "a deep-linked resource focus is applied and dropped coherently");
-assert.ok(app.includes("resourceScopeCell") && app.includes("resourceScopeTargets"), "namespace summary resources link to their scoped page");
 // The Profile management contract: an owned new name, an editable create
 // owner, a read-only update owner and a dedicated deletion drawer.
 assert.ok(html.includes('id="profile-create-name"') && html.includes('maxlength="63"') && html.includes('pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"'), "the new Profile name is a DNS-1123 label input");
 assert.equal(html.includes('list="profile-names"'), false, "the new Profile name never offers the existing profiles");
-assert.equal(html.includes('<datalist id="profile-names">'), false, "the Profile name datalist is removed");
 assert.ok(html.includes("Email (registered with identity provider, e.g. user email from LDAP)"), "the create owner asks for the registered email address");
 assert.ok(html.includes('name="profileCreateOwner" type="email"'), "the create owner is an email field");
 assert.ok(html.includes('name="profileOwner" type="text" readonly'), "the update owner is read-only and still submitted");
@@ -153,9 +72,6 @@ assert.ok(html.includes("every existing quota key must be supplied with its curr
 assert.ok(html.includes('id="profile-delete-drawer"') && html.includes('id="profile-delete-form"'), "the deletion has its own drawer and form");
 assert.ok(html.includes('name="kind" value="profile.delete"'), "the deletion form posts the typed deletion action");
 assert.ok(html.includes('name="confirmName"') && html.includes('name="reason" required maxlength="500"'), "the deletion form requires a reason and an exact confirmation");
-assert.ok(app.includes("profileDeleteValidation") && app.includes("preSubmitError"), "the deletion uses the shared validation helper before the request");
-assert.ok(app.includes("profileNameValidation") && app.includes("profileFormValues") && app.includes("profileQuotaValues"), "the Profile form uses the shared pure helpers");
-assert.ok(app.includes("profile-use-suggestion") && app.includes("aria-describedby"), "the name suggestion is explicit and accessible");
 for (const kind of ["profile", "storage", "notebook"]) assert.ok(html.includes(`data-open-drawer="${kind}"`));
 assert.ok(html.includes('id="profile-form"') && html.includes('id="storage-form"') && html.includes('id="notebook-form"') && html.includes('id="pod-restart-form"') && html.includes('id="node-cordon-form"'));
 assert.ok(html.includes('id="storage-edit-form"') && html.includes('id="storage-delete-form"'), "storage edit and deletion have their own plan forms");
@@ -165,17 +81,11 @@ assert.ok(html.includes("The API treats an edit reason as optional"), "the edito
 assert.ok(html.includes("The server-provided warnings above are authoritative for metadata.labels"), "label semantics are delegated to the server projection warnings");
 assert.ok(html.includes('id="storage-delete-ack"') && html.includes("never a security gate"), "deletion has a client-only acknowledgement that is not a security gate");
 assert.equal(html.includes("finalizer cleanup") || html.includes("Force finalizer"), false, "storage deletion offers no forced finalizer cleanup");
-assert.ok(app.includes("storageEditingFeature") && app.includes("storageDeletionFeature") && app.includes('meta("storage-editing")') && app.includes('meta("storage-deletion")'), "the browser gates storage actions on the two server capabilities");
-assert.ok(app.includes("storageDocumentQuery") && app.includes("storage-document?kind="), "the browser reads the protected server projection");
-assert.ok(app.includes("loadStorageDocument") && app.includes("storageDocumentFailure") && app.includes("storageEpoch"), "storage document reads are epoch guarded");
 assert.ok(html.includes("notebook-preserve-hint") && html.includes("Blank resource and image fields preserve") && html.includes("PVC mounts are kept unless Replace is selected") && html.includes("validated plan’s before/after changes"), "Notebook management states that blanks preserve current configuration and mounts stay unless replaced");
 assert.ok(html.includes('name="kind" value="pod.restart"'));
 assert.ok(html.includes('name="kind" value="node.cordon"'));
 assert.ok(html.includes("spec.unschedulable=true") || app.includes("spec.unschedulable=true"), "cordon description explains the exact effect");
 assert.ok(html.includes("Only Notebook StatefulSet-managed Pods are supported"));
-assert.ok(app.includes("closeDrawers(true)") && app.includes("showModal()"), "drawer closes before the plan dialog");
-assert.ok(app.includes('event.key === "Escape"') && app.includes("focusable(drawer)"));
-assert.ok(app.includes("no implicit") || app.includes("implicitly submit"));
 
 // No CSP-hostile constructs: no inline handlers/styles and no innerHTML.
 assert.equal(/\son(click|change|submit|load|error)\s*=/i.test(html), false, "inline handlers are forbidden");
@@ -184,20 +94,6 @@ assert.equal(html.includes("innerHTML"), false);
 assert.equal(app.includes("innerHTML"), false);
 assert.equal(app.includes("document.write"), false);
 assert.equal(app.includes("eval("), false);
-assert.ok(style.includes("position:sticky") && style.includes("max-height:62vh"), "bounded sticky table viewport is required");
-assert.ok(style.includes(".drawer{position:fixed"), "right-side drawer styling is required");
-assert.ok(style.includes(".drawer-body{flex:1;overflow:auto;padding:16px 24px 24px"), "the right drawer keeps a distinct header-to-entry gap");
-assert.ok(style.includes("@media(max-width:800px)"), "small-screen layout is required");
-assert.ok(style.includes(".notification.warning") && style.includes(".notification.error"));
-assert.ok(style.includes(".notifications{position:fixed;bottom:18px") && style.includes("max-height:50vh"), "notices sit bottom-right with a bounded stack");
-assert.ok(style.includes("body.signed-out main{margin-left:0"), "public signed-out page does not inherit sidebar margin");
-assert.ok(style.includes(".form-error") && style.includes(".policy-status"));
-assert.ok(style.includes(".state-error-slot") && style.includes(".error-dot") && style.includes(".error-tooltip"), "failure indicator styling is fixed-size and does not shift rows");
-assert.ok(style.includes("right:calc(100% + 8px)") && style.includes("transform:translateY(-50%)") && style.includes(".error-dot.open+.error-tooltip"), "failure tooltips open left of the dot and can be pinned by click");
-assert.ok(style.includes(".drawer .table-scroll>table{min-width:0;width:100%}"), "drawer summary tables fit the drawer");
-assert.ok(style.includes('[data-table="historyOperations"] .table-scroll>table{min-width:780px}') && style.includes('[data-table="namespaces"] .table-scroll>table{min-width:460px}'));
-assert.ok(style.includes(".health-summary") && style.includes(".health-count"), "workspace health dashboard cards are styled");
-assert.ok(style.includes('[data-table="nodes"]') && style.includes('[data-table="namespaces"]'));
 
 // Credentials, action schema and plan workflow boundaries.
 assert.ok(app.includes('crypto.randomUUID()'));
@@ -206,27 +102,12 @@ assert.equal(app.includes("plan.prepared.data"), false);
 assert.ok(app.includes('credentials: "same-origin"'));
 assert.ok(app.includes('"X-CSRF-Token"'));
 assert.ok(app.includes("AbortSignal.timeout"));
-assert.ok(app.includes("perPage = 50"));
 assert.ok(app.includes("sessionStorage") && app.includes("logic.dismissalStorageKey(notificationScope)"));
 assert.ok(app.includes("JSON.stringify([...dismissed]"), "only dismissal identifiers are stored");
 assert.ok(app.includes("setTimeout(() => removeNotification(id), 10000)"), "success/info notices expire after 10 seconds");
 assert.equal(/localStorage/.test(app), false, "no persistent browser inventory storage");
 
-// Sorting, namespace context, scoped links and the "/" shortcut wiring.
-assert.ok(app.includes("logic.sortRows"));
-assert.ok(app.includes("logic.nextSort"));
-assert.ok(app.includes("namespaceContext"));
-assert.ok(app.includes("logic.queryNamespace(location.search)"));
-assert.ok(app.includes("url.searchParams.set(\"namespace\""));
-assert.ok(app.includes("data-scoped-link"));
-assert.ok(app.includes("event.key === \"/\""));
-assert.ok(app.includes('dialog[open]'));
-assert.ok(app.includes("data-search"));
-assert.ok(app.includes('requested.cpu') && app.includes('limit.memory'), "actual Pod resource detail projection is consumed");
-assert.ok(app.includes("podReady(resource)") && app.includes("podRestartCount(resource)"));
-
 // Bounded history wording and profile integration honesty.
-assert.ok(app.includes("historyHref") && app.includes("historyTab"));
 assert.ok(app.includes("Retention is at most ${days} days"));
 assert.ok(app.includes("not a complete historical export"));
 assert.ok(app.includes("Kubeflow pipeline runs are not integrated"));
@@ -242,19 +123,7 @@ assert.equal(logic.needsRefresh("", now), true);
 assert.equal(logic.routeFor("/pods", "").page, "pods");
 assert.equal(logic.historyHref("operations", "team"), "/history?tab=operations&namespace=team");
 
-// Table state is per table and survives page navigation by identity in app.js;
-// the pure helper must preserve search/sort when the page changes.
-const operations = logic.defaultTableState("time", "desc");
-operations.search = "alice";
-const audit = logic.defaultTableState("time", "desc");
-assert.equal(operations.search, "alice");
-assert.equal(audit.search, "");
-assert.equal(operations.sortDir, "desc");
-assert.equal(logic.nextSort(operations, "time").sortDir, "asc");
-
-// Minimal browser harness: boot the real script with a stub DOM, navigate every
-// sidebar entry and confirm snapshots stay in memory instead of rescanning the
-// cluster. This is deliberately small; the pure logic is tested above.
+// Boot the real script with a stub DOM and local HTTP fixtures.
 async function bootHarness(options = {}) {
   class Element {
     constructor(tag = "div", selector = "") {

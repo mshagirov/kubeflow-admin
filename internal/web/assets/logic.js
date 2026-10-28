@@ -23,9 +23,7 @@
   // the form (storage settings, a resource version, a stale confirmation) is
   // dropped before the request leaves the browser. A namespace is optional and
   // is only kept when it is consistent with the Profile name.
-  // Both quota paths are guarded the same way: the legacy alias keeps its
-  // deprecated kind, but it no longer bypasses the owner and precondition
-  // guard that profile.update requires.
+  // The legacy quota alias requires the same owner and precondition as profile.update.
   const guardedProfileKinds = new Set(["profile.update", "profile.quota.change"]);
   const profileActionFields = {
     "profile.update": ["kind", "name", "namespace", "owner", "quota", "baseConfigDigest", "reason"],
@@ -754,9 +752,7 @@
     { kind: "Notebook", label: "Notebooks", href: "/notebooks" },
     { kind: "Pod", label: "Pods", href: "/pods" },
     { kind: "PersistentVolumeClaim", label: "Persistent volume claims", href: "/storage" },
-    // StatefulSets no longer appear on the Notebooks page, which lists the
-    // Notebook custom resource only. Their aggregate observation stays on the
-    // Overview table, focused by its canonical kind.
+    // StatefulSets link to Overview; the Notebooks page lists only Notebook CRs.
     { kind: "StatefulSet", label: "StatefulSets", href: "/" },
     { kind: "ResourceQuota", label: "Resource quotas", href: "/" },
     { kind: "LimitRange", label: "Limit ranges", href: "" },

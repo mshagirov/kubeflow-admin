@@ -10,7 +10,7 @@ explicit operator opt-in:
 ```yaml
 database:
   path: /var/lib/kubeflow-admin/admin.db
-  journalMode: delete                  # BeeGFS only
+  journalMode: delete                  # Required for BeeGFS
   allowUnverifiedFilesystem: true      # deliberate acknowledgement, see below
 ```
 
@@ -77,9 +77,9 @@ verify the installed BeeGFS client's lock, cache and crash-durability semantics.
 
 ## Upgrade and backup
 
-The republished 0.1.0 image supports this feature. Pin the new digest from
-[deployment.md](deployment.md); the original image with that tag rejected `journalMode`.
-Stop the old application and back up the complete database directory before
+Pin a verified image digest that supports the configured journal mode; see
+[deployment](deployment.md) and [release evidence](verification-history.md).
+Stop the application and back up the complete database directory before
 changing journal mode. SQLite switches an existing WAL database to DELETE on open;
 never manually discard its WAL. Copy the entire stopped directory, including any
 `-journal`, `-wal` and `-shm` files. Existing PVC class/binding cannot be changed in
